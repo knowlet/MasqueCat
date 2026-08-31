@@ -5,7 +5,9 @@ package tailcat
 import (
 	crand "crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -14,18 +16,23 @@ import (
 )
 
 const (
-	masqueChallengeHeader      = "Masquecat-Challenge"
-	masqueVerifierHeader       = "Masquecat-Verifier"
-	masqueProofHeader          = "Masquecat-Proof"
-	masqueChallengeTTL         = 30 * time.Second
-	masqueMaxPendingChallenges = 1024
+	masqueChallengeHeader         = "Masquecat-Challenge"
+	masqueVerifierHeader          = "Masquecat-Verifier"
+	masqueProofHeader             = "Masquecat-Proof"
+	masqueChallengeTTL            = 30 * time.Second
+	masqueMaxPendingChallenges    = 1024
+	masqueMaxPendingPerSource     = 4
+	masqueMaxPendingPerRemoteAddr = 64
 )
 
+var errMasqueChallengeLimit = errors.New("MasqueCat authentication challenge limit reached")
+
 type masqueChallenge struct {
-	src     key.NodePublic
-	target  key.NodePublic
-	mode    string
-	expires time.Time
+	src      key.NodePublic
+	target   key.NodePublic
+	mode     string
+	clientID string
+	expires  time.Time
 }
 
 type masqueAuthenticator struct {
@@ -49,8 +56,13 @@ func (a *masqueAuthenticator) authorize(w http.ResponseWriter, r *http.Request, 
 	if proof := r.Header.Get(masqueProofHeader); proof != "" && a.verify(proof, src, target, mode) {
 		return true
 	}
-	challenge, err := a.issue(src, target, mode)
+	challenge, err := a.issue(src, target, mode, masqueChallengeClientID(r))
 	if err != nil {
+		if errors.Is(err, errMasqueChallengeLimit) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "too many pending MasqueCat authentication challenges", http.StatusTooManyRequests)
+			return false
+		}
 		http.Error(w, "failed to create MasqueCat authentication challenge", http.StatusInternalServerError)
 		return false
 	}
@@ -60,32 +72,65 @@ func (a *masqueAuthenticator) authorize(w http.ResponseWriter, r *http.Request, 
 	return false
 }
 
-func (a *masqueAuthenticator) issue(src, target key.NodePublic, mode string) (string, error) {
+func masqueChallengeClientID(r *http.Request) string {
+	if r == nil || r.RemoteAddr == "" {
+		return "<unknown>"
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func (a *masqueAuthenticator) issue(src, target key.NodePublic, mode, clientID string) (string, error) {
+	now := time.Now()
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	var sourcePending, addressPending int
+	for token, challenge := range a.pending {
+		if !challenge.expires.After(now) {
+			delete(a.pending, token)
+			continue
+		}
+		if challenge.src == src && challenge.target == target && challenge.mode == mode && challenge.clientID == clientID {
+			// Reuse the outstanding challenge for an identical unauthenticated
+			// request instead of letting retries consume additional capacity.
+			return token, nil
+		}
+		if challenge.src == src {
+			sourcePending++
+		}
+		if challenge.clientID == clientID {
+			addressPending++
+		}
+	}
+	if sourcePending >= masqueMaxPendingPerSource ||
+		addressPending >= masqueMaxPendingPerRemoteAddr ||
+		len(a.pending) >= masqueMaxPendingChallenges {
+		// Never evict a live challenge to make room for an unauthenticated
+		// request. The caller can retry after outstanding challenges expire.
+		return "", errMasqueChallengeLimit
+	}
+
 	var nonce [32]byte
 	if _, err := crand.Read(nonce[:]); err != nil {
 		return "", fmt.Errorf("generate MasqueCat challenge: %w", err)
 	}
 	token := base64.RawURLEncoding.EncodeToString(nonce[:])
-	now := time.Now()
-
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for k, v := range a.pending {
-		if !v.expires.After(now) {
-			delete(a.pending, k)
-		}
-	}
-	if len(a.pending) >= masqueMaxPendingChallenges {
-		for k := range a.pending {
-			delete(a.pending, k)
-			break
-		}
+	if _, exists := a.pending[token]; exists {
+		// A 256-bit random collision is not expected in practice; fail closed
+		// rather than overwrite an unrelated live challenge.
+		return "", errors.New("generated duplicate MasqueCat challenge")
 	}
 	a.pending[token] = masqueChallenge{
-		src:     src,
-		target:  target,
-		mode:    mode,
-		expires: now.Add(masqueChallengeTTL),
+		src:      src,
+		target:   target,
+		mode:     mode,
+		clientID: clientID,
+		expires:  now.Add(masqueChallengeTTL),
 	}
 	return token, nil
 }
