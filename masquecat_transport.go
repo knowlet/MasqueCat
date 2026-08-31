@@ -118,19 +118,28 @@ func parseMasqueSource(r *http.Request) (key.NodePublic, error) {
 	return k, nil
 }
 
-func masqueTemplateFor(rawBaseURL string) (*uritemplate.Template, error) {
+func masqueTemplateURL(rawBaseURL string) (string, error) {
 	u, err := url.Parse(rawBaseURL)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if u.Scheme != "https" || u.Host == "" {
-		return nil, fmt.Errorf("MASQUE endpoint must be an https URL with a host")
+		return "", fmt.Errorf("MASQUE endpoint must be an https URL with a host")
 	}
-	u.Path = masquePathTemplate
+	basePath := strings.TrimSuffix(u.Path, "/")
+	u.Path = basePath + masquePathTemplate
 	u.RawPath = ""
 	u.RawQuery = ""
 	u.Fragment = ""
-	return uritemplate.New(u.String())
+	return u.String(), nil
+}
+
+func masqueTemplateFor(rawBaseURL string) (*uritemplate.Template, error) {
+	templateURL, err := masqueTemplateURL(rawBaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return uritemplate.New(templateURL)
 }
 
 func masqueProofForChallenge(local key.NodePrivate, challenge, verifierText string, requestTarget key.NodePublic, mode string) (string, error) {
