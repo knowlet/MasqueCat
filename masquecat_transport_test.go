@@ -12,15 +12,14 @@ import (
 	"testing"
 
 	"github.com/quic-go/quic-go/quicvarint"
-	"tailscale.com/disco"
 	"tailscale.com/types/key"
 )
 
 type fakeMasqueDatagramStream struct {
-	mu       sync.Mutex
-	recv     chan fakeMasqueRecv
-	sent     [][]byte
-	closed   int
+	mu     sync.Mutex
+	recv   chan fakeMasqueRecv
+	sent   [][]byte
+	closed int
 }
 
 type fakeMasqueRecv struct {
@@ -32,7 +31,7 @@ func newFakeMasqueDatagramStream() *fakeMasqueDatagramStream {
 	return &fakeMasqueDatagramStream{recv: make(chan fakeMasqueRecv, 16)}
 }
 
-func (f *fakeMasqueDatagramStream) Read([]byte) (int, error)  { return 0, io.EOF }
+func (f *fakeMasqueDatagramStream) Read([]byte) (int, error)    { return 0, io.EOF }
 func (f *fakeMasqueDatagramStream) Write(p []byte) (int, error) { return len(p), nil }
 func (f *fakeMasqueDatagramStream) Close() error {
 	f.mu.Lock()
@@ -225,7 +224,7 @@ func TestStreamForwarderFramesPacket(t *testing.T) {
 func TestStreamForwarderDropsDisco(t *testing.T) {
 	f := newFakeMasqueDatagramStream()
 	forwarder := &streamForwarder{str: f}
-	payload := append(append([]byte(nil), disco.Magic...), []byte("should-not-leave-process")...)
+	payload := append(append([]byte(nil), discoMagicBytes...), []byte("should-not-leave-process")...)
 	if err := forwarder.ForwardPacket(key.NewNode().Public(), key.NewNode().Public(), payload); err != nil {
 		t.Fatal(err)
 	}
