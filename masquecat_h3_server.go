@@ -148,22 +148,27 @@ func (r *MasqueRelay) Handler() http.Handler {
 		if !r.authenticator().authorize(w, req, src, registeredKey, masqueModeRelay) {
 			return
 		}
-		if r.lookup(registeredKey) != nil {
+
+		// Reserve the node key before acceptMasqueStream writes the 200 response.
+		// That makes same-key races fail with 409 before either client can mistake
+		// an immediately closed stream for a successful registration.
+		peer, ok := r.reserve(registeredKey)
+		if !ok {
 			http.Error(w, "MasqueCat peer is already registered", http.StatusConflict)
 			return
 		}
+		defer r.unregister(peer)
+
 		str, err := acceptMasqueStream(w)
 		if err != nil {
 			logf("accept relay MASQUE stream: %v", err)
 			return
 		}
 		defer func() { _ = str.Close() }()
-		peer := &relayPeer{key: registeredKey, fwd: &streamForwarder{str: str}}
-		if !r.register(peer) {
-			logf("MASQUE relay duplicate registration rejected: %v", peer.key.ShortString())
+		if !r.activate(peer, &streamForwarder{str: str}) {
+			logf("MASQUE relay reservation disappeared before activation: %v", peer.key.ShortString())
 			return
 		}
-		defer r.unregister(peer)
 		logf("MASQUE relay peer registered: %v", peer.key.ShortString())
 
 		ctx := req.Context()
@@ -198,9 +203,43 @@ func (r *MasqueRelay) Handler() http.Handler {
 	})
 }
 
+// reserve atomically claims a node key without making it routable yet. The
+// caller must unregister the returned peer if stream acceptance fails.
+func (r *MasqueRelay) reserve(k key.NodePublic) (*relayPeer, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.peers == nil {
+		r.peers = make(map[key.NodePublic]*relayPeer)
+	}
+	if r.peers[k] != nil {
+		return nil, false
+	}
+	p := &relayPeer{key: k}
+	r.peers[k] = p
+	return p, true
+}
+
+// activate publishes a successfully accepted stream for a previously reserved
+// peer. Reserved peers with a nil forwarder remain invisible to lookup.
+func (r *MasqueRelay) activate(p *relayPeer, fwd *streamForwarder) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if p == nil || fwd == nil || r.peers[p.key] != p || p.fwd != nil {
+		return false
+	}
+	p.fwd = fwd
+	return true
+}
+
+// register is retained as a small atomic helper for registry-level tests and
+// callers that already have an accepted forwarder. Production registration in
+// Handler uses reserve -> accept -> activate so success is not sent too early.
 func (r *MasqueRelay) register(p *relayPeer) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if p == nil || p.fwd == nil {
+		return false
+	}
 	if r.peers == nil {
 		r.peers = make(map[key.NodePublic]*relayPeer)
 	}
@@ -212,6 +251,9 @@ func (r *MasqueRelay) register(p *relayPeer) bool {
 }
 
 func (r *MasqueRelay) unregister(p *relayPeer) {
+	if p == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.peers[p.key] == p {
@@ -222,7 +264,11 @@ func (r *MasqueRelay) unregister(p *relayPeer) {
 func (r *MasqueRelay) lookup(k key.NodePublic) *relayPeer {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.peers[k]
+	p := r.peers[k]
+	if p == nil || p.fwd == nil {
+		return nil
+	}
+	return p
 }
 
 // ServeMasqueHTTP3 serves handler over HTTP/3 with CONNECT-UDP datagrams.
