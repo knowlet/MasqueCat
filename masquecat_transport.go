@@ -187,10 +187,6 @@ type masquePath struct {
 	writeMu sync.Mutex
 }
 
-func newMasquePath(ctx context.Context, rawURL string, requestTarget key.NodePublic, local key.NodePrivate, mode string, logf logger.Logf) (*masquePath, error) {
-	return newMasquePathWithTLS(ctx, rawURL, requestTarget, local, mode, false, logf)
-}
-
 func newMasquePathWithTLS(ctx context.Context, rawURL string, requestTarget key.NodePublic, local key.NodePrivate, mode string, insecureSkipVerify bool, logf logger.Logf) (*masquePath, error) {
 	tmpl, err := masqueTemplateFor(rawURL)
 	if err != nil {
