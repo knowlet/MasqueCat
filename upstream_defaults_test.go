@@ -31,8 +31,9 @@ func TestNoImplicitDERPMapService(t *testing.T) {
 
 // TestNoLegacyServiceDomainHardcodes prevents hosted upstream infrastructure
 // from being reintroduced as a runtime/configuration default. Go import specs
-// for the reused upstream networking module are intentionally excluded here;
-// eliminating that compile-time module is a separate engine migration.
+// and go.mod/go.sum are intentionally excluded for the reused upstream
+// networking module; eliminating that compile-time module is a separate engine
+// migration.
 func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 	hostedDomain := "tailcat" + ".dev"
 	upstreamModuleDomain := "tailscale" + ".com"
@@ -48,7 +49,7 @@ func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 			}
 			return nil
 		}
-		if path == "upstream_defaults_test.go" {
+		if path == "upstream_defaults_test.go" || path == "go.mod" || path == "go.sum" {
 			return nil
 		}
 
@@ -59,8 +60,11 @@ func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if strings.Contains(string(b), hostedDomain) {
-				return errors.New(path + " contains forbidden hosted-service domain " + hostedDomain)
+			text := string(b)
+			for _, needle := range []string{hostedDomain, upstreamModuleDomain} {
+				if strings.Contains(text, needle) {
+					return errors.New(path + " contains forbidden upstream service domain " + needle)
+				}
 			}
 		case ".go":
 			fset := token.NewFileSet()
