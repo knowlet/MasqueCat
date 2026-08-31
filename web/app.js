@@ -7,26 +7,10 @@ const KEY_STORAGE = "tailcat-web-key";
 const params = new URLSearchParams(location.search);
 const verbose = params.has("verbose");
 
-// pickDERPMapURL returns the explicitly configured DERP map URL, or a
-// same-origin map served by cmd/tailcat-web / an embedding application.
-// There is intentionally no hosted-service fallback.
-async function pickDERPMapURL() {
-  if (params.get("derpmap")) {
-    return new URL(params.get("derpmap"), location.href).toString();
-  }
-  const sameOrigin = new URL("derpmap.json", location.href).toString();
-  try {
-    const resp = await fetch(sameOrigin, { method: "HEAD" });
-    if (resp.ok) {
-      return sameOrigin;
-    }
-  } catch (e) {}
-  throw new Error("No DERP map configured; provide ?derpmap=https://... or serve /derpmap.json on the same origin");
-}
-const derpMapURL = await pickDERPMapURL();
-
 // tcTest is the state surface polled by the headless-browser
-// integration test (web/wasm_test.go).
+// integration test (web/wasm_test.go). Install it before any async startup work
+// so configuration failures are observable instead of becoming invisible
+// top-level module rejections.
 window.tcTest = {
   ready: false,
   listenAddr: null,
@@ -43,6 +27,46 @@ window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(S
 
 const $ = (id) => document.getElementById(id);
 const setStatus = (msg) => { $("status").textContent = msg; };
+
+// pickDERPMapURL returns the explicitly configured DERP map URL, or a
+// same-origin map served by cmd/tailcat-web / an embedding application.
+// There is intentionally no hosted-service fallback.
+async function pickDERPMapURL() {
+  if (params.get("derpmap")) {
+    return new URL(params.get("derpmap"), location.href).toString();
+  }
+  const sameOrigin = new URL("derpmap.json", location.href).toString();
+  try {
+    // Probe with GET, not HEAD: embedding applications commonly expose a
+    // GET-only JSON route. Cancel the probe body once the route is confirmed;
+    // the Go client will fetch and validate the map when it is actually used.
+    const resp = await fetch(sameOrigin, { method: "GET" });
+    if (resp.ok) {
+      if (resp.body) {
+        await resp.body.cancel();
+      }
+      return sameOrigin;
+    }
+  } catch (e) {}
+  throw new Error("No DERP map configured; provide ?derpmap=https://... or serve /derpmap.json on the same origin");
+}
+
+let derpMapURL = null;
+let derpMapError = null;
+try {
+  derpMapURL = await pickDERPMapURL();
+} catch (err) {
+  derpMapError = err instanceof Error ? err : new Error(String(err));
+  window.tcTest.errors.push(String(derpMapError));
+  setStatus("Configuration error: " + derpMapError.message);
+}
+
+function configuredDERPMapURL() {
+  if (derpMapURL) {
+    return derpMapURL;
+  }
+  throw derpMapError || new Error("No DERP map configured");
+}
 
 async function hex(digest) {
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
@@ -107,18 +131,34 @@ async function fetchWasm() {
   return new Response(counted, { headers: { "Content-Type": "application/wasm" } });
 }
 
-// Boot the wasm module.
+// Boot the wasm module even if DERP-map discovery failed. That keeps the UI
+// alive and lets button handlers surface the configuration error explicitly.
 const ready = new Promise((resolve) => { globalThis.onTailcatReady = resolve; });
 const go = new Go();
-WebAssembly.instantiateStreaming(fetchWasm(), go.importObject)
-  .then(({ instance }) => go.run(instance));
-await ready;
-window.tcTest.ready = true;
-$("load-progress").remove();
-setStatus("Ready.");
-$("listen-btn").disabled = false;
-$("send-btn").disabled = false;
-$("send-text-btn").disabled = false;
+let wasmReady = false;
+try {
+  const { instance } = await WebAssembly.instantiateStreaming(fetchWasm(), go.importObject);
+  go.run(instance);
+  await ready;
+  wasmReady = true;
+} catch (err) {
+  const startupError = err instanceof Error ? err : new Error(String(err));
+  window.tcTest.errors.push(String(startupError));
+  setStatus("Startup failed: " + startupError.message);
+}
+
+if (wasmReady) {
+  window.tcTest.ready = true;
+  $("load-progress").remove();
+  if (derpMapError) {
+    setStatus("Configuration error: " + derpMapError.message);
+  } else {
+    setStatus("Ready.");
+  }
+  $("listen-btn").disabled = false;
+  $("send-btn").disabled = false;
+  $("send-text-btn").disabled = false;
+}
 
 // --- Receive side ---
 
@@ -128,7 +168,7 @@ async function startListener() {
   const persist = $("persist-key").checked;
   const privateKey = persist ? (localStorage.getItem(KEY_STORAGE) || "") : "";
   try {
-    const ln = await tailcatListen({ derpMapURL, privateKey, verbose, onConnection });
+    const ln = await tailcatListen({ derpMapURL: configuredDERPMapURL(), privateKey, verbose, onConnection });
     if (persist) {
       localStorage.setItem(KEY_STORAGE, ln.privateKeyJSON);
     }
@@ -251,7 +291,7 @@ $("copy-addr").onclick = () => navigator.clipboard.writeText($("listen-addr").te
 // --- Send side ---
 
 async function sendStream(addr, size, readChunk, progressEl) {
-  const conn = await tailcatDial({ addr, derpMapURL, verbose });
+  const conn = await tailcatDial({ addr, derpMapURL: configuredDERPMapURL(), verbose });
   let off = 0;
   while (off < size) {
     const chunk = await readChunk(off, Math.min(CHUNK, size - off));
