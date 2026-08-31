@@ -124,12 +124,13 @@ In relay-only mode the protected machine does not need an inbound Internet
 port; both the client and server only initiate outbound QUIC connections to the
 relay.
 
-> [!WARNING]
-> The current relay registration path does not yet cryptographically prove that
-> a connecting client possesses the private node key corresponding to the
-> advertised public node key. Until proof-of-possession and relay resource
-> controls are implemented, treat `masquecat-relay` as experimental and do not
-> expose it as an unrestricted public production service.
+> [!IMPORTANT]
+> Relay and direct registration use a one-time proof-of-possession challenge
+> bound to source key, target key, and path mode. A live relay registration is
+> not replaced by a duplicate node-key connection. The relay is still
+> experimental because general bandwidth/connection quotas, metrics, health
+> endpoints, abuse controls, live certificate reload, and horizontal shared
+> state are not implemented yet.
 
 ## Direct deployment
 
@@ -225,10 +226,12 @@ already encrypted WireGuard payloads. A relay can still observe connection
 source addresses, registered peer keys used for routing, packet sizes, timing,
 and traffic volume.
 
-The current relay registration layer still trusts the node identity advertised
-by the connecting client at the MASQUE request layer. It does **not** yet prove
-possession of the corresponding private node key. This is a production blocker,
-along with resource quotas, abuse controls, metrics, and operational hardening.
+The registration layer requires a one-time cryptographic proof of possession of
+the advertised node key before a direct or relay CONNECT-UDP stream is accepted.
+The challenge is short-lived and bound to source key, target key, and path mode.
+Relay registration is fail-closed: a duplicate live node key receives a conflict
+instead of evicting the existing peer. General relay resource quotas, abuse
+controls, metrics, and operational hardening remain separate production work.
 
 ## What MasqueCat is not
 
@@ -245,21 +248,22 @@ Implemented in this branch:
 - HTTP/3 CONNECT-UDP transport with QUIC DATAGRAM
 - direct MASQUE peer path
 - paired MasqueCat relay
+- proof-of-possession for direct/relay node-key registration
+- fail-closed duplicate relay registration
 - direct-first, relay-fallback startup selection
 - end-to-end WireGuard carried inside MASQUE
 - loopback-only compatibility bridge for the reused userspace networking engine
 - suppression of the reused engine's external STUN/UDP discovery in MasqueCat mode
 - dropping legacy disco/CallMeMaybe packets at the MASQUE boundary
 
-Still required before merge-ready / production-ready:
+Still required before production-ready:
 
-- cryptographic proof-of-possession for relay/direct registration
 - complete `mc...` CLI integration (`serve`, `ssh`, `ping`, `parse`, saved keys)
 - direct and relay WireGuard/TCP/SSH E2E tests
 - reconnect and runtime direct-to-relay failover
 - MTU / fragmentation validation
 - relay limits, health endpoint, structured metrics, and abuse protection
-- Linux/macOS/Windows build and test validation
+- production deployment validation beyond CI platform builds/tests
 
 ## Upstream code reuse
 
