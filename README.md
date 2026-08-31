@@ -77,9 +77,11 @@ No alternate peer addresses are discovered or probed.
 | Direct-only | reachable QUIC/UDP endpoint with a valid TLS certificate | client connects directly with HTTP/3 CONNECT-UDP |
 | Direct + relay | direct endpoint plus outbound relay access | client tries the configured direct endpoint, then uses the relay if startup fails |
 
-For the detailed architecture, TLS requirements, firewall rules, systemd relay
-example, Go API examples, trust boundaries, and current limitations, see
-[`docs/masquecat.md`](./docs/masquecat.md).
+For the overall architecture and Go API, see
+[`docs/masquecat.md`](./docs/masquecat.md). For relay-specific deployment,
+including DNS, TLS, UDP/443, systemd, containers, load balancers,
+troubleshooting, and current security limitations, see
+[`docs/masquecat-relay-deployment.md`](./docs/masquecat-relay-deployment.md).
 
 ## Build
 
@@ -100,6 +102,11 @@ server/client data path is exposed through the Go API (`MasqueServer` and
 
 ## Relay deployment
 
+Quick command documentation is in
+[`cmd/masquecat-relay/README.md`](./cmd/masquecat-relay/README.md). The full
+operator guide is
+[`docs/masquecat-relay-deployment.md`](./docs/masquecat-relay-deployment.md).
+
 A relay terminates HTTP/3 itself. Give it a public DNS name, a trusted TLS
 certificate, and inbound UDP/443.
 
@@ -116,6 +123,13 @@ QUIC/UDP-capable pass-through load balancer is fine.
 In relay-only mode the protected machine does not need an inbound Internet
 port; both the client and server only initiate outbound QUIC connections to the
 relay.
+
+> [!WARNING]
+> The current relay registration path does not yet cryptographically prove that
+> a connecting client possesses the private node key corresponding to the
+> advertised public node key. Until proof-of-possession and relay resource
+> controls are implemented, treat `masquecat-relay` as experimental and do not
+> expose it as an unrestricted public production service.
 
 ## Direct deployment
 
@@ -211,11 +225,10 @@ already encrypted WireGuard payloads. A relay can still observe connection
 source addresses, registered peer keys used for routing, packet sizes, timing,
 and traffic volume.
 
-The relay registration layer now requires a one-time cryptographic
-proof of possession of the advertised Tailcat node key before a stream can be
-registered. A live registration is never replaced by an unverified duplicate.
-The relay is still **not yet production hardened**: resource quotas, abuse
-controls, production metrics, and operational hardening remain required.
+The current relay registration layer still trusts the node identity advertised
+by the connecting client at the MASQUE request layer. It does **not** yet prove
+possession of the corresponding private node key. This is a production blocker,
+along with resource quotas, abuse controls, metrics, and operational hardening.
 
 ## What MasqueCat is not
 
@@ -240,6 +253,7 @@ Implemented in this branch:
 
 Still required before merge-ready / production-ready:
 
+- cryptographic proof-of-possession for relay/direct registration
 - complete `mc...` CLI integration (`serve`, `ssh`, `ping`, `parse`, saved keys)
 - direct and relay WireGuard/TCP/SSH E2E tests
 - reconnect and runtime direct-to-relay failover
