@@ -91,6 +91,9 @@ metadata, while the inner WireGuard payload remains end-to-end encrypted.
 > `MasqueClient`. The existing `tailcat` CLI has **not yet been fully taught to
 > consume `mc...` tokens** for every command, so examples such as
 > `tailcat ssh mc...` should not be assumed to work until that integration lands.
+> The first-cut relay also does not yet cryptographically prove possession of a
+> declared node key when registering the HTTP/3 session; WireGuard still
+> authenticates the inner tunnel, but public relay hardening is not complete.
 
 For the full architecture, trust boundaries, token format, direct/relay path
 selection, TLS and firewall requirements, systemd relay deployment, Go examples,
