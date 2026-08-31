@@ -54,6 +54,11 @@ type MasqueServer struct {
 	// RelayURL, when set, is a MasqueCat relay reached over HTTP/3 CONNECT-UDP.
 	RelayURL string
 
+	// InsecureSkipVerify disables TLS certificate and hostname verification for
+	// outbound MASQUE connections. It is intended only for development with
+	// explicitly trusted self-signed endpoints and is false by default.
+	InsecureSkipVerify bool
+
 	mu         sync.Mutex
 	bridge     *localDERPBridge
 	relayPath  *masquePath
@@ -163,7 +168,7 @@ func (s *MasqueServer) Start() error {
 	}
 
 	if s.RelayURL != "" {
-		path, err := newMasquePath(ctx, s.RelayURL, local, priv, masqueModeRelay, logf)
+		path, err := newMasquePathWithTLS(ctx, s.RelayURL, local, priv, masqueModeRelay, s.InsecureSkipVerify, logf)
 		if err != nil {
 			cleanup()
 			return fmt.Errorf("connect MASQUE relay: %w", err)
@@ -403,6 +408,11 @@ type MasqueClient struct {
 	Key    key.NodePrivate
 	Logf   logger.Logf
 
+	// InsecureSkipVerify disables TLS certificate and hostname verification for
+	// direct and relay MASQUE connections. It is false by default and should
+	// only be used for explicitly trusted development endpoints.
+	InsecureSkipVerify bool
+
 	mu           sync.Mutex
 	activeOps    sync.WaitGroup
 	base         *Client
@@ -506,7 +516,7 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 			return nil, err
 		}
 		dialCtx, finishDial := masqueDialContext(childCtx, ctx)
-		p, err := newMasquePath(dialCtx, rawURL, target, priv, mode, logf)
+		p, err := newMasquePathWithTLS(dialCtx, rawURL, target, priv, mode, c.InsecureSkipVerify, logf)
 		operationActive := finishDial(err == nil)
 		if !operationActive {
 			if p != nil {

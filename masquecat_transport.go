@@ -142,6 +142,22 @@ func masqueTemplateFor(rawBaseURL string) (*uritemplate.Template, error) {
 	return uritemplate.New(templateURL)
 }
 
+func masqueTLSClientConfig(rawURL string, insecureSkipVerify bool) (*tls.Config, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse MASQUE endpoint URL: %w", err)
+	}
+	if u.Scheme != "https" || u.Hostname() == "" {
+		return nil, errors.New("MASQUE endpoint must be an https URL with a hostname")
+	}
+	return &tls.Config{
+		MinVersion:         tls.VersionTLS13,
+		ServerName:         u.Hostname(),
+		NextProtos:         []string{http3.NextProtoH3},
+		InsecureSkipVerify: insecureSkipVerify, //nolint:gosec // Explicit development opt-in exposed by MasqueCat.
+	}, nil
+}
+
 func masqueProofForChallenge(local key.NodePrivate, challenge, verifierText string, requestTarget key.NodePublic, mode string) (string, error) {
 	if challenge == "" || verifierText == "" {
 		return "", errors.New("MASQUE endpoint requested authentication without a challenge")
@@ -172,6 +188,10 @@ type masquePath struct {
 }
 
 func newMasquePath(ctx context.Context, rawURL string, requestTarget key.NodePublic, local key.NodePrivate, mode string, logf logger.Logf) (*masquePath, error) {
+	return newMasquePathWithTLS(ctx, rawURL, requestTarget, local, mode, false, logf)
+}
+
+func newMasquePathWithTLS(ctx context.Context, rawURL string, requestTarget key.NodePublic, local key.NodePrivate, mode string, insecureSkipVerify bool, logf logger.Logf) (*masquePath, error) {
 	tmpl, err := masqueTemplateFor(rawURL)
 	if err != nil {
 		return nil, err
@@ -194,14 +214,16 @@ func newMasquePath(ctx context.Context, rawURL string, requestTarget key.NodePub
 	if err != nil {
 		return nil, err
 	}
-	u, _ := url.Parse(rawURL)
+	tlsConfig, err := masqueTLSClientConfig(rawURL, insecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
+	if insecureSkipVerify {
+		logf("WARNING: InsecureSkipVerify enabled for MASQUE endpoint %s; TLS certificate and hostname verification are disabled", rawURL)
+	}
 	tr := &masque.Transport{
-		TLSClientConfig: &tls.Config{
-			MinVersion: tls.VersionTLS13,
-			ServerName: u.Hostname(),
-			NextProtos: []string{http3.NextProtoH3},
-		},
-		QUICConfig: &quic.Config{EnableDatagrams: true},
+		TLSClientConfig: tlsConfig,
+		QUICConfig:      &quic.Config{EnableDatagrams: true},
 	}
 	conn, resp, err := tr.Dial(req)
 	// masque-go v0.4 returns both resp and a non-nil error for non-2xx
