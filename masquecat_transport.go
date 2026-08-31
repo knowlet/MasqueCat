@@ -39,7 +39,10 @@ const (
 	masquePeerSuffix    = ".peer.masquecat.invalid"
 )
 
-var contextIDZero = quicvarint.Append(nil, 0)
+var (
+	contextIDZero  = quicvarint.Append(nil, 0)
+	discoMagicBytes = []byte(disco.Magic)
+)
 
 type masqueDatagramStream interface {
 	io.ReadWriteCloser
@@ -186,7 +189,7 @@ func newMasquePath(ctx context.Context, rawURL string, requestTarget, local key.
 }
 
 func (p *masquePath) ForwardPacket(src, dst key.NodePublic, payload []byte) error {
-	if bytes.HasPrefix(payload, disco.Magic) {
+	if bytes.HasPrefix(payload, discoMagicBytes) {
 		// This is the invariant that keeps Tailcat's legacy CallMeMaybe/disco
 		// machinery inside the compatibility layer. MasqueCat never forwards
 		// those packets to the network.
@@ -223,7 +226,7 @@ func (p *masquePath) run(ctx context.Context, local key.NodePublic, onPacket fun
 			p.logf("dropping MASQUE datagram for unexpected destination %v", pkt.dst.ShortString())
 			continue
 		}
-		if bytes.HasPrefix(pkt.payload, disco.Magic) {
+		if bytes.HasPrefix(pkt.payload, discoMagicBytes) {
 			continue
 		}
 		if err := onPacket(pkt.src, pkt.payload); err != nil {
@@ -240,7 +243,7 @@ type streamForwarder struct {
 }
 
 func (f *streamForwarder) ForwardPacket(src, dst key.NodePublic, payload []byte) error {
-	if bytes.HasPrefix(payload, disco.Magic) {
+	if bytes.HasPrefix(payload, discoMagicBytes) {
 		return nil
 	}
 	packet := encodeMasquePacket(src, dst, payload)
