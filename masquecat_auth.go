@@ -53,6 +53,13 @@ func newMasqueAuthenticator(priv key.NodePrivate) *masqueAuthenticator {
 }
 
 func (a *masqueAuthenticator) authorize(w http.ResponseWriter, r *http.Request, src, target key.NodePublic, mode string) bool {
+	// Tailscale's NodePrivate.OpenFrom panics for a zero peer public key. Zero
+	// source/target identities are never valid MasqueCat peers, so reject them
+	// before challenge allocation or proof verification.
+	if src.IsZero() || target.IsZero() {
+		http.Error(w, "invalid MasqueCat node identity", http.StatusUnauthorized)
+		return false
+	}
 	if proof := r.Header.Get(masqueProofHeader); proof != "" && a.verify(proof, src, target, mode) {
 		return true
 	}
@@ -136,6 +143,9 @@ func (a *masqueAuthenticator) issue(src, target key.NodePublic, mode, clientID s
 }
 
 func (a *masqueAuthenticator) verify(encodedProof string, src, target key.NodePublic, mode string) bool {
+	if src.IsZero() || target.IsZero() {
+		return false
+	}
 	proof, err := base64.RawURLEncoding.DecodeString(encodedProof)
 	if err != nil {
 		return false
