@@ -132,6 +132,24 @@ relay.
 > endpoints, abuse controls, live certificate reload, and horizontal shared
 > state are not implemented yet.
 
+### Local TLS development mode
+
+When `masquecat-relay` is started interactively without `-cert` and `-key`, it
+asks whether to generate an ephemeral 24-hour self-signed certificate for that
+run. The generated private key remains in memory and is not written to disk.
+Non-interactive launches still fail closed when certificate paths are missing.
+
+For an explicitly trusted development endpoint, outbound MASQUE clients can opt
+in to:
+
+```go
+InsecureSkipVerify: true
+```
+
+on either `MasqueClient` or `MasqueServer`. The default is `false`.
+`InsecureSkipVerify` disables TLS certificate-chain and hostname verification,
+so it must not be used for normal Internet-facing production connections.
+
 ## Direct deployment
 
 A server with a reachable UDP endpoint can advertise a direct MASQUE listener.
@@ -250,6 +268,8 @@ Implemented in this branch:
 - paired MasqueCat relay
 - proof-of-possession for direct/relay node-key registration
 - fail-closed duplicate relay registration
+- explicit development-only `InsecureSkipVerify` for outbound MASQUE TLS
+- interactive ephemeral self-signed TLS for `masquecat-relay`
 - direct-first, relay-fallback startup selection
 - end-to-end WireGuard carried inside MASQUE
 - loopback-only compatibility bridge for the reused userspace networking engine
