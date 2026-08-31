@@ -3,8 +3,12 @@ package tailcat
 import (
 	"context"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -25,17 +29,15 @@ func TestNoImplicitDERPMapService(t *testing.T) {
 	}
 }
 
-// TestNoLegacyServiceDomainHardcodes prevents the old hosted infrastructure
-// from being reintroduced as a runtime/configuration default. Source-level Go
-// imports of the upstream networking module are intentionally excluded here;
+// TestNoLegacyServiceDomainHardcodes prevents hosted upstream infrastructure
+// from being reintroduced as a runtime/configuration default. Go import specs
+// for the reused upstream networking module are intentionally excluded here;
 // eliminating that compile-time module is a separate engine migration.
 func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
-	forbidden := []string{
-		"tailcat" + ".dev",
-	}
+	hostedDomain := "tailcat" + ".dev"
+	upstreamModuleDomain := "tailscale" + ".com"
 
-	root := "."
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -49,20 +51,49 @@ func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 		if path == "upstream_defaults_test.go" {
 			return nil
 		}
+
 		ext := strings.ToLower(filepath.Ext(path))
 		switch ext {
-		case ".go", ".md", ".yaml", ".yml", ".json", ".nix", ".toml":
-		default:
-			return nil
-		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		text := string(b)
-		for _, needle := range forbidden {
-			if strings.Contains(text, needle) {
-				return errors.New(path + " contains forbidden hosted-service domain " + needle)
+		case ".md", ".yaml", ".yml", ".json", ".nix", ".toml":
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if strings.Contains(string(b), hostedDomain) {
+				return errors.New(path + " contains forbidden hosted-service domain " + hostedDomain)
+			}
+		case ".go":
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			if err != nil {
+				return err
+			}
+			imports := map[*ast.BasicLit]bool{}
+			for _, imp := range f.Imports {
+				imports[imp.Path] = true
+			}
+			var violation error
+			ast.Inspect(f, func(n ast.Node) bool {
+				lit, ok := n.(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING || imports[lit] {
+					return true
+				}
+				s, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					return true
+				}
+				switch {
+				case strings.Contains(s, hostedDomain):
+					violation = errors.New(path + " contains forbidden hosted-service domain " + hostedDomain)
+					return false
+				case strings.Contains(s, upstreamModuleDomain):
+					violation = errors.New(path + " contains upstream domain in a non-import runtime string")
+					return false
+				}
+				return true
+			})
+			if violation != nil {
+				return violation
 			}
 		}
 		return nil
