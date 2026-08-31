@@ -9,6 +9,14 @@ import (
 	"tailscale.com/types/key"
 )
 
+var (
+	benchmarkPacketBytes []byte
+	benchmarkPacket      masquePacket
+	benchmarkPeerKey     key.NodePublic
+	benchmarkConnBlob    MasqueConnBlob
+	benchmarkConnInfo    MasqueConnInfo
+)
+
 func BenchmarkEncodeMasquePacket(b *testing.B) {
 	src := key.NewNode().Public()
 	dst := key.NewNode().Public()
@@ -18,7 +26,7 @@ func BenchmarkEncodeMasquePacket(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(size))
 			for b.Loop() {
-				_ = encodeMasquePacket(src, dst, payload)
+				benchmarkPacketBytes = encodeMasquePacket(src, dst, payload)
 			}
 		})
 	}
@@ -33,9 +41,11 @@ func BenchmarkDecodeMasquePacket(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(int64(size))
 			for b.Loop() {
-				if _, err := decodeMasquePacket(packet); err != nil {
+				got, err := decodeMasquePacket(packet)
+				if err != nil {
 					b.Fatal(err)
 				}
+				benchmarkPacket = got
 			}
 		})
 	}
@@ -46,9 +56,11 @@ func BenchmarkMasqueTargetRoundTrip(b *testing.B) {
 	target := masqueTarget(k)
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := parseMasqueTarget(target); err != nil {
+		got, err := parseMasqueTarget(target)
+		if err != nil {
 			b.Fatal(err)
 		}
+		benchmarkPeerKey = got
 	}
 }
 
@@ -67,8 +79,11 @@ func BenchmarkMasqueConnBlobRoundTrip(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		if _, err := ParseMasqueConnBlob(blob); err != nil {
+		got, err := ParseMasqueConnBlob(blob)
+		if err != nil {
 			b.Fatal(err)
 		}
+		benchmarkConnBlob = blob
+		benchmarkConnInfo = got
 	}
 }
