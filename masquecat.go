@@ -68,7 +68,7 @@ type MasqueServer struct {
 func (s *MasqueServer) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.Server.lb != nil || s.bridge != nil {
+	if s.lb != nil || s.bridge != nil {
 		return errors.New("masquecat: MasqueServer.Start called twice")
 	}
 	if s.DirectURL == "" && s.RelayURL == "" {
@@ -111,18 +111,18 @@ func (s *MasqueServer) Start() error {
 			s.cancel()
 		}
 		if s.directHTTP != nil {
-			s.directHTTP.Close()
+			_ = s.directHTTP.Close()
 		}
 		if s.directPC != nil {
-			s.directPC.Close()
+			_ = s.directPC.Close()
 		}
 		if s.relayPath != nil {
-			s.relayPath.Close()
+			_ = s.relayPath.Close()
 		}
-		if s.Server.lb != nil {
-			s.Server.Close()
+		if s.lb != nil {
+			_ = s.Server.Close()
 		}
-		bridge.Close()
+		_ = bridge.Close()
 		s.bridge = nil
 	}
 
@@ -217,7 +217,7 @@ func (s *MasqueServer) Close() error {
 		errs = append(errs, s.relayPath.Close())
 		s.relayPath = nil
 	}
-	if s.Server.lb != nil {
+	if s.lb != nil {
 		errs = append(errs, s.Server.Close())
 	}
 	if s.bridge != nil {
@@ -246,7 +246,7 @@ func (s *MasqueServer) startTailcatCore(priv key.NodePrivate, reg *tailcfg.DERPR
 	sys.Set(health.NewTracker(bus))
 	netMon, err := netmon.New(bus, func(format string, args ...any) { logf(format, args...) })
 	if err != nil {
-		lb.Close()
+		_ = lb.Close()
 		return fmt.Errorf("netmon.New: %w", err)
 	}
 	sys.Set(netMon)
@@ -267,7 +267,9 @@ func (s *MasqueServer) startTailcatCore(priv key.NodePrivate, reg *tailcfg.DERPR
 			mc := lb.sys.MagicSock.Get()
 			go func() {
 				if lb.onMasqueMeow(src, discoPub) {
-					mc.SendDERPPacketTo(src, regionID, EncodeMeowed())
+					if _, err := mc.SendDERPPacketTo(src, regionID, EncodeMeowed()); err != nil {
+						logf("send MasqueCat meowed response to %v: %v", src.ShortString(), err)
+					}
 				}
 			}()
 			return true
@@ -276,7 +278,7 @@ func (s *MasqueServer) startTailcatCore(priv key.NodePrivate, reg *tailcfg.DERPR
 	}
 
 	if err := createEngine(logf, lb); err != nil {
-		lb.Close()
+		_ = lb.Close()
 		return fmt.Errorf("createEngine: %w", err)
 	}
 	// This switch applies only to magicsock. MasqueCat's QUIC sockets are
@@ -285,7 +287,7 @@ func (s *MasqueServer) startTailcatCore(priv key.NodePrivate, reg *tailcfg.DERPR
 
 	ns, err := newNetstack(logf, sys)
 	if err != nil {
-		lb.Close()
+		_ = lb.Close()
 		return fmt.Errorf("newNetstack: %w", err)
 	}
 	ns.ProcessLocalIPs = true
@@ -322,11 +324,11 @@ func (s *MasqueServer) startTailcatCore(priv key.NodePrivate, reg *tailcfg.DERPR
 	}
 	sys.Tun.Get().Start()
 
-	s.Server.lb = lb
-	sys.Engine.Get().SetFilter(s.Server.buildFilter())
+	s.lb = lb
+	sys.Engine.Get().SetFilter(s.buildFilter())
 	if err := lb.Start(); err != nil {
-		s.Server.lb = nil
-		lb.Close()
+		s.lb = nil
+		_ = lb.Close()
 		return err
 	}
 	return nil
@@ -438,7 +440,7 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	base.startMu.Lock()
 	if err := base.initLocked(); err != nil {
 		base.startMu.Unlock()
-		bridge.Close()
+		_ = bridge.Close()
 		return err
 	}
 	base.lb.sys.MagicSock.Get().SetOnlyTCP443(true)
@@ -447,8 +449,8 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	}
 	if err := base.lb.Start(); err != nil {
 		base.startMu.Unlock()
-		base.Close()
-		bridge.Close()
+		_ = base.Close()
+		_ = bridge.Close()
 		return err
 	}
 	base.started = true
@@ -469,8 +471,8 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 		path, err = newMasquePath(ctx, ci.RelayURL, local, local, masqueModeRelay, logf)
 		if err != nil {
 			cancel()
-			base.Close()
-			bridge.Close()
+			_ = base.Close()
+			_ = bridge.Close()
 			if directErr != nil {
 				return errors.Join(fmt.Errorf("direct MASQUE: %w", directErr), fmt.Errorf("relay MASQUE: %w", err))
 			}
@@ -480,8 +482,8 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	}
 	if path == nil {
 		cancel()
-		base.Close()
-		bridge.Close()
+		_ = base.Close()
+		_ = bridge.Close()
 		if directErr != nil {
 			return fmt.Errorf("direct MASQUE: %w", directErr)
 		}

@@ -80,16 +80,16 @@ func newLocalDERPBridge(logf logger.Logf) (*localDERPBridge, error) {
 		derp.AppName("masquecat-mesh"),
 	)
 	if err != nil {
-		clientPipe.Close()
+		_ = clientPipe.Close()
 		return nil, fmt.Errorf("create local DERP mesh client: %w", err)
 	}
 	msg, err := meshClient.Recv()
 	if err != nil {
-		clientPipe.Close()
+		_ = clientPipe.Close()
 		return nil, fmt.Errorf("complete local DERP mesh handshake: %w", err)
 	}
 	if _, ok := msg.(derp.ServerInfoMessage); !ok {
-		clientPipe.Close()
+		_ = clientPipe.Close()
 		return nil, fmt.Errorf("unexpected local DERP handshake message %T", msg)
 	}
 	b.mesh = meshClient
@@ -103,17 +103,17 @@ func newLocalDERPBridge(logf logger.Logf) (*localDERPBridge, error) {
 
 	_, portStr, err := net.SplitHostPort(ts.Listener.Addr().String())
 	if err != nil {
-		b.Close()
+		_ = b.Close()
 		return nil, fmt.Errorf("parse local DERP listener: %w", err)
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		b.Close()
+		_ = b.Close()
 		return nil, fmt.Errorf("parse local DERP port: %w", err)
 	}
 	cert := ts.Certificate()
 	if cert == nil {
-		b.Close()
+		_ = b.Close()
 		return nil, errors.New("local DERP TLS server has no certificate")
 	}
 	certHash := sha256.Sum256(cert.Raw)

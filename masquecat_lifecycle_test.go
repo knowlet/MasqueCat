@@ -79,7 +79,7 @@ func TestMasqueClientCloseBeforeStart(t *testing.T) {
 
 func TestMasqueClientRejectsInvalidTokenBeforeNetworking(t *testing.T) {
 	c := NewMasqueClient("not-a-token")
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	_, err := c.DialTCPPort(context.Background(), 22)
 	if err == nil || !strings.Contains(err.Error(), "doesn't start") {
 		t.Fatalf("DialTCPPort error = %v, want token validation error", err)
