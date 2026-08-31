@@ -6,25 +6,25 @@ This document describes how to deploy the current experimental
 For the broader MasqueCat architecture, direct-vs-relay path selection, and Go
 API usage, see [`masquecat.md`](./masquecat.md).
 
-> [!WARNING]
-> The current relay implementation is **not production hardened**. In
-> particular, node-key registration is not yet protected by cryptographic proof
-> of possession. A client currently supplies the advertised source node key in
-> the request, so an untrusted client must not be allowed to treat possession of
-> a public node key as authentication. Until registration authentication and
-> resource controls are implemented, deploy this relay only in a trusted test
-> environment or behind an external admission boundary.
+> [!IMPORTANT]
+> Relay registration is cryptographically authenticated with a one-time
+> proof-of-possession challenge bound to the advertised node key, target key,
+> and path mode. Duplicate live registrations are rejected rather than silently
+> replacing an existing peer. The relay is still **not production hardened**:
+> bandwidth/connection quotas, general abuse controls, metrics, health probes,
+> live certificate reload, and horizontal shared state are not implemented yet.
 
 ## 1. What the relay does
 
 `masquecat-relay` terminates HTTP/3 / QUIC and forwards MasqueCat datagrams
-between connected peer identities.
+between authenticated peer identities.
 
 ```text
 peer A
   |
   | QUIC / TLS 1.3
   | HTTP/3 CONNECT-UDP
+  | node-key proof
   v
 +------------------+
 | masquecat-relay  |
@@ -32,6 +32,7 @@ peer A
   ^
   | QUIC / TLS 1.3
   | HTTP/3 CONNECT-UDP
+  | node-key proof
   |
 peer B
 ```
@@ -68,8 +69,8 @@ Current flags:
 | `-key` | empty | yes | private-key PEM file |
 
 There are currently no CLI flags for quotas, metrics, authentication policy,
-certificate reload, or health endpoints because those features do not yet
-exist in the binary.
+certificate reload, or health endpoints. Node-key proof authentication is part
+of the relay protocol rather than a command-line option.
 
 ## 3. DNS
 
@@ -102,7 +103,7 @@ https://relay.example.com:8443
 The relay requires a certificate and private key at startup. The binary loads
 them with `tls.LoadX509KeyPair`.
 
-Recommended production-like test setup:
+Recommended deployment layout:
 
 ```text
 /etc/masquecat/tls/fullchain.pem
@@ -364,23 +365,31 @@ The relay can observe:
 It should not be able to read the inner WireGuard application payload merely by
 terminating the outer QUIC connection.
 
-### Current authentication warning
+### Registration authentication
 
-The current branch still trusts the node public key supplied by a connecting
-client at the MASQUE request layer. That means the relay registration step is
-not yet a proof that the connecting client possesses the corresponding private
-key.
+Relay registration is a two-request challenge flow:
 
-Until proof-of-possession registration is implemented:
+1. The peer sends CONNECT-UDP with its advertised source key and target.
+2. The relay returns HTTP 401 with a random `Masquecat-Challenge` and a
+   `Masquecat-Verifier` public key.
+3. The peer seals the challenge to the verifier using its node private key and
+   retries with `Masquecat-Proof`.
+4. The relay opens the proof using the advertised source public key and accepts
+   it only if the pending challenge matches source, target, and mode and has not
+   expired.
 
-- do not expose the relay as an unrestricted public production service;
-- use a trusted test network, VPN perimeter, firewall allowlist, or another
-  external admission layer if testing over the Internet;
-- do not treat a public node key as a secret credential.
+The challenge lifetime is 30 seconds. Pending challenge allocation is capped at
+1024 globally, 4 per source node key, and 64 per remote address. An identical
+unauthenticated retry reuses the outstanding challenge instead of consuming a
+new slot.
 
-The inner WireGuard handshake still provides its own end-to-end cryptographic
-identity, but that does not prevent an unauthenticated client from attacking the
-relay's routing/registration state.
+A successfully validated duplicate node-key registration does not evict the
+existing live registration: the relay reserves node keys atomically and returns
+HTTP 409 when the key is already active.
+
+This prevents the original unauthenticated node-key slot hijack / routing
+impersonation problem. It does not provide general service admission policy or
+bandwidth abuse control.
 
 ## 12. Current observability
 
@@ -403,17 +412,19 @@ peer-registry contents.
 
 ## 13. Resource and abuse controls
 
-The current implementation does not yet expose configurable:
+Authentication challenge allocation has bounded pending-state limits, but the
+current implementation does not yet expose configurable general service limits
+for:
 
-- maximum peers;
-- maximum connections per node key;
+- maximum active peers;
+- maximum active connections;
 - maximum datagram rate;
 - maximum bandwidth;
-- per-IP connection rate limits;
-- idle timeout policy beyond underlying transport behavior;
-- admission ACLs.
+- general per-IP connection/bandwidth limits;
+- explicit idle timeout policy beyond underlying transport behavior;
+- operator-defined admission ACLs.
 
-These are blockers for an Internet-scale public relay.
+These are important blockers for an Internet-scale public relay.
 
 ## 14. Troubleshooting
 
@@ -455,15 +466,25 @@ QUIC/UDP.
 The current peer registry is process-local. There is no cross-instance shared
 state or federation.
 
+### Duplicate peer receives HTTP 409
+
+This is intentional. A live node-key registration is not replaced by a second
+connection using the same identity. Close the old peer cleanly or wait until it
+is unregistered before reconnecting with that key.
+
+### Authentication retry receives HTTP 401 again
+
+The proof is single-use and challenge-bound. Common causes include an expired
+challenge, mismatched source/target/mode, or retrying an already consumed proof.
+The client transport normally performs the challenge retry automatically.
+
 ## 15. Production-readiness checklist
 
 Before calling a relay deployment production-ready, at minimum require:
 
-- cryptographic proof of possession for peer registration;
-- duplicate-registration policy that cannot be abused for unauthenticated
-  eviction;
+- security review of the node-key challenge/proof protocol and replay limits;
 - connection and bandwidth quotas;
-- rate limiting / abuse controls;
+- rate limiting / abuse controls beyond challenge allocation;
 - explicit idle and maximum-session lifetime policies;
 - health/readiness endpoints;
 - metrics and alerting;
