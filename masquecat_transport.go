@@ -126,12 +126,12 @@ func masqueTemplateURL(rawBaseURL string) (string, error) {
 	if u.Scheme != "https" || u.Host == "" {
 		return "", fmt.Errorf("MASQUE endpoint must be an https URL with a host")
 	}
-	basePath := strings.TrimSuffix(u.Path, "/")
-	u.Path = basePath + masquePathTemplate
-	u.RawPath = ""
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String(), nil
+	// Build the template string around an already escaped base path instead of
+	// assigning the URI-template variables to url.URL.Path. URL.String escapes
+	// braces in Path, which would turn {target_host}/{target_port} into literal
+	// %7B...%7D segments and leave masque-go with no variables to expand/match.
+	basePath := strings.TrimSuffix(u.EscapedPath(), "/")
+	return u.Scheme + "://" + u.Host + basePath + masquePathTemplate, nil
 }
 
 func masqueTemplateFor(rawBaseURL string) (*uritemplate.Template, error) {
@@ -368,16 +368,13 @@ func masqueTemplateForRequest(r *http.Request) (*uritemplate.Template, error) {
 		return nil, errors.New("invalid MASQUE request URL")
 	}
 	const fixedPrefix = "/.well-known/masque/udp/"
-	idx := strings.LastIndex(r.URL.Path, fixedPrefix)
+	escapedPath := r.URL.EscapedPath()
+	idx := strings.LastIndex(escapedPath, fixedPrefix)
 	if idx < 0 {
 		return nil, fmt.Errorf("MASQUE request path %q has no CONNECT-UDP template", r.URL.Path)
 	}
-	base := &url.URL{
-		Scheme: "https",
-		Host:   r.Host,
-		Path:   strings.TrimSuffix(r.URL.Path[:idx], "/"),
-	}
-	return masqueTemplateFor(base.String())
+	baseURL := "https://" + r.Host + strings.TrimSuffix(escapedPath[:idx], "/")
+	return masqueTemplateFor(baseURL)
 }
 
 func parseConnectUDPRequest(w http.ResponseWriter, r *http.Request, tmpl *uritemplate.Template) (*masque.ProxyRequest, bool) {
