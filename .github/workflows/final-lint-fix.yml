@@ -1,0 +1,47 @@
+name: Final cleanup lint fix
+
+on:
+  push:
+    branches: [feat/masquecat-masque-transport]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: feat/masquecat-masque-transport
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: fix the two remaining errcheck findings
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('tailcat.go')
+          s = p.read_text()
+          pattern = r'(?m)^(\s*)lb\.Close\(\)$'
+          matches = list(re.finditer(pattern, s))
+          if len(matches) != 2:
+              raise SystemExit(f'expected exactly 2 standalone lb.Close() calls, found {len(matches)}')
+          s = re.sub(pattern, r'\1_ = lb.Close()', s)
+          p.write_text(s)
+          PY
+          gofmt -w tailcat.go
+          git diff --check
+          git diff -- tailcat.go
+      - name: commit fix and remove this temporary workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/final-lint-fix.yml
+          git add tailcat.go
+          git commit -m "fix: handle remaining backend cleanup errors"
+          git push origin HEAD:feat/masquecat-masque-transport
