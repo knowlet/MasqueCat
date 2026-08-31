@@ -2,7 +2,6 @@ name: Test
 
 on:
   push:
-    branches: [main]
   pull_request:
     branches: [main]
 
@@ -14,15 +13,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825a76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - run: go build ./...
-      # The cmd/tailcat e2e tests build a child tailcat binary with
-      # the release build tags, which shares no build cache with the
-      # untagged build above and takes about a minute cold, hence the
-      # long timeout. actions/setup-go's caches keep warm runs fast.
       - run: go test -count=1 -timeout 600s ./...
       - run: go vet ./...
   tidy:
@@ -39,15 +34,10 @@ jobs:
   release-tags:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825a76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # Cross-build every GoReleaser release target with the release
-      # build tags, using build-tags.txt the same way third-party
-      # packagers do. (A test keeps that file in sync with
-      # internal/buildtags.ReleaseTags; darwin builds are covered by
-      # the macOS test job, whose e2e tests build a tagged binary.)
       - name: cross-build cmd/tailcat with release build tags
         run: |
           tags=$(cat build-tags.txt)
@@ -60,7 +50,7 @@ jobs:
   wasm:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825a76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
