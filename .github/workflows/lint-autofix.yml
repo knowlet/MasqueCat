@@ -91,21 +91,12 @@ jobs:
           def fix_lifecycle(s):
               return must_replace(s, 'defer c.Close()', 'defer func() { _ = c.Close() }()', 1)
 
-          def fix_defaults_test(s):
-              return must_replace(
-                  s,
-                  'if path == "upstream_defaults_test.go" || path == "go.mod" || path == "go.sum" {',
-                  'if path == "upstream_defaults_test.go" || path == "go.mod" || path == "go.sum" || path == ".goreleaser.yaml" {',
-                  1,
-              )
-
           edit('masquecat.go', fix_masquecat)
           edit('tailcat.go', fix_tailcat)
           edit('masquecat_bridge.go', fix_bridge)
           edit('masquecat_lifecycle_test.go', fix_lifecycle)
-          edit('upstream_defaults_test.go', fix_defaults_test)
           PY
-          gofmt -w masquecat.go tailcat.go masquecat_bridge.go masquecat_lifecycle_test.go upstream_defaults_test.go
+          gofmt -w masquecat.go tailcat.go masquecat_bridge.go masquecat_lifecycle_test.go
           git diff --check
           go test -run '^TestNoLegacyServiceDomainHardcodes$' .
       - name: commit fixes
@@ -113,7 +104,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add masquecat.go tailcat.go masquecat_bridge.go masquecat_lifecycle_test.go upstream_defaults_test.go
+          git add masquecat.go tailcat.go masquecat_bridge.go masquecat_lifecycle_test.go
           git diff --cached --stat
           git commit -m "fix: resolve MasqueCat lint findings"
           git push origin HEAD:feat/masquecat-masque-transport
