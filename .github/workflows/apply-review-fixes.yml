@@ -1,0 +1,39 @@
+name: Apply review fixes
+
+on:
+  push:
+    branches: [feat/masquecat-masque-transport]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: feat/masquecat-masque-transport
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: apply fail-closed review fixes
+        run: python3 .github/scripts/apply-review-fixes.py
+      - name: format and validate focused changes
+        shell: bash
+        run: |
+          gofmt -w masquecat_auth.go masquecat_auth_test.go masquecat_h3_server.go masquecat_transport.go masquecat.go masquecat_token.go masquecat_fuzz_test.go masquecat_transport_test.go masquecat_lifecycle_test.go masquecat_token_edge_test.go upstream_defaults_test.go cmd/tailcat-web/tailcat-web.go tailcat.go
+          git diff --check
+          go test -count=1 ./...
+          go vet ./...
+          go test -race -count=1 -timeout 900s .
+      - name: commit verified fixes and remove temporary runner
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .github/workflows/apply-review-fixes.yml .github/scripts/apply-review-fixes.py
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: address MasqueCat review findings"
+          git push origin HEAD:feat/masquecat-masque-transport
