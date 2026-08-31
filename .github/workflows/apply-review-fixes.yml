@@ -17,6 +17,23 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      - name: repair escaped literals in temporary runner
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('.github/scripts/apply-review-fixes.py')
+          s = p.read_text()
+          fixes = {
+              r'f.Fatalf("canonical packet encoding changed:\n got %x\nwant %x", got, groundTruth)': r'f.Fatalf("canonical packet encoding changed:\\n got %x\\nwant %x", got, groundTruth)',
+              r'f.Fatalf("canonical token encoding changed:\n got %s\nwant %s", canonical, canonicalToken)': r'f.Fatalf("canonical token encoding changed:\\n got %s\\nwant %s", canonical, canonicalToken)',
+          }
+          for old, new in fixes.items():
+              if s.count(old) != 1:
+                  raise SystemExit(f'expected exactly one escape repair match: {old!r}')
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
       - name: apply fail-closed review fixes
         run: python3 .github/scripts/apply-review-fixes.py
       - name: format and validate focused changes
