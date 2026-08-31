@@ -118,12 +118,12 @@ func newLocalDERPBridge(logf logger.Logf) (*localDERPBridge, error) {
 	}
 	certHash := sha256.Sum256(cert.Raw)
 	b.region = &tailcfg.DERPRegion{
-		RegionID:   int(localDERPRegionID),
+		RegionID:   localDERPRegionID,
 		RegionCode: "mc-local",
 		RegionName: "MasqueCat loopback bridge",
 		Nodes: []*tailcfg.DERPNode{{
 			Name:     "mc-local-1",
-			RegionID: int(localDERPRegionID),
+			RegionID: localDERPRegionID,
 			HostName: "masquecat-loopback.invalid",
 			CertName: "sha256-raw:" + hex.EncodeToString(certHash[:]),
 			IPv4:     "127.0.0.1",
