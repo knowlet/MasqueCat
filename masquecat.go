@@ -403,13 +403,15 @@ type MasqueClient struct {
 	Key    key.NodePrivate
 	Logf   logger.Logf
 
-	mu       sync.Mutex
-	base     *Client
-	bridge   *localDERPBridge
-	path     *masquePath
-	pathType MasquePathType
-	cancel   context.CancelFunc
-	started  bool
+	mu           sync.Mutex
+	activeOps    sync.WaitGroup
+	base         *Client
+	bridge       *localDERPBridge
+	path         *masquePath
+	pathType     MasquePathType
+	lifecycleCtx context.Context
+	cancel       context.CancelFunc
+	started      bool
 }
 
 func NewMasqueClient(server MasqueConnBlob) *MasqueClient { return &MasqueClient{Server: server} }
@@ -433,6 +435,18 @@ func masqueDialContext(lifecycleCtx, operationCtx context.Context) (context.Cont
 			cancelDial()
 		}
 		return operationActive
+	}
+}
+
+// masqueOperationContext combines a caller's operation context with the
+// client's lifecycle. The returned context is canceled by either source. The
+// stop function detaches the lifecycle callback and releases local resources.
+func masqueOperationContext(operationCtx, lifecycleCtx context.Context) (context.Context, func()) {
+	opCtx, cancel := context.WithCancel(operationCtx)
+	stopLifecycleCancel := context.AfterFunc(lifecycleCtx, cancel)
+	return opCtx, func() {
+		stopLifecycleCancel()
+		cancel()
 	}
 }
 
@@ -540,6 +554,7 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 		return errors.New("no usable MASQUE path")
 	}
 
+	c.lifecycleCtx = childCtx
 	c.cancel = cancel
 	c.base, c.bridge, c.path, c.pathType = base, bridge, path, pathType
 	bridge.AddForwarder(ci.ServerPublic, path)
@@ -571,80 +586,114 @@ func (c *MasqueClient) PublicKey() key.NodePublic {
 	return c.Key.Public()
 }
 
-func (c *MasqueClient) lockBase(ctx context.Context) (*Client, error) {
+// acquireBase takes a lifecycle lease while holding c.mu, then releases the
+// mutex before any potentially blocking base operation. Close holds c.mu while
+// it cancels the lifecycle and waits for all leases, so base teardown cannot
+// race with an operation that already captured the pointer.
+func (c *MasqueClient) acquireBase(ctx context.Context) (*Client, context.Context, func(), error) {
 	c.mu.Lock()
 	if err := c.ensureStartedLocked(ctx); err != nil {
 		c.mu.Unlock()
-		return nil, err
+		return nil, nil, nil, err
 	}
-	if c.base == nil {
+	if c.base == nil || c.lifecycleCtx == nil {
 		c.mu.Unlock()
-		return nil, errors.New("masquecat: client closed during startup")
+		return nil, nil, nil, errors.New("masquecat: client closed during startup")
 	}
-	return c.base, nil
+	base := c.base
+	lifecycleCtx := c.lifecycleCtx
+	c.activeOps.Add(1)
+	c.mu.Unlock()
+
+	opCtx, stopContext := masqueOperationContext(ctx, lifecycleCtx)
+	release := func() {
+		stopContext()
+		c.activeOps.Done()
+	}
+	return base, opCtx, release, nil
 }
 
 func (c *MasqueClient) Ping(ctx context.Context) (PingResult, error) {
-	base, err := c.lockBase(ctx)
+	base, opCtx, release, err := c.acquireBase(ctx)
 	if err != nil {
 		return PingResult{}, err
 	}
-	defer c.mu.Unlock()
-	return base.Ping(ctx)
+	defer release()
+	return base.Ping(opCtx)
 }
 
 func (c *MasqueClient) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	base, err := c.lockBase(ctx)
+	base, opCtx, release, err := c.acquireBase(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer c.mu.Unlock()
-	return base.Dial(ctx, network, addr)
+	defer release()
+	return base.Dial(opCtx, network, addr)
 }
 
 func (c *MasqueClient) DialTCPPort(ctx context.Context, port uint16) (net.Conn, error) {
-	base, err := c.lockBase(ctx)
+	base, opCtx, release, err := c.acquireBase(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer c.mu.Unlock()
-	return base.DialTCPPort(ctx, port)
+	defer release()
+	return base.DialTCPPort(opCtx, port)
 }
 
 func (c *MasqueClient) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-	base, err := c.lockBase(ctx)
+	base, opCtx, release, err := c.acquireBase(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer c.mu.Unlock()
-	return base.DialTCP(ctx, dst)
+	defer release()
+	return base.DialTCP(opCtx, dst)
 }
 
 func (c *MasqueClient) DrainTCP(ctx context.Context) error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.base == nil {
+	if c.base == nil || c.lifecycleCtx == nil {
+		c.mu.Unlock()
 		return nil
 	}
-	return c.base.DrainTCP(ctx)
+	base := c.base
+	lifecycleCtx := c.lifecycleCtx
+	c.activeOps.Add(1)
+	c.mu.Unlock()
+
+	opCtx, stopContext := masqueOperationContext(ctx, lifecycleCtx)
+	defer func() {
+		stopContext()
+		c.activeOps.Done()
+	}()
+	return base.DrainTCP(opCtx)
 }
 
 func (c *MasqueClient) Status() *ipnstate.Status {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if c.base == nil || c.base.lb == nil {
+		c.mu.Unlock()
 		return nil
 	}
-	return c.base.lb.Status()
+	base := c.base
+	c.activeOps.Add(1)
+	c.mu.Unlock()
+	defer c.activeOps.Done()
+	return base.lb.Status()
 }
 
 func (c *MasqueClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// No new operation can acquire a lease while c.mu is held. Cancel first so
+	// blocking base calls receive context cancellation, then wait for every
+	// already-acquired lease before tearing down base/path/bridge pointers.
 	if c.cancel != nil {
 		c.cancel()
 		c.cancel = nil
 	}
+	c.activeOps.Wait()
+
 	var errs []error
 	if c.path != nil {
 		errs = append(errs, c.path.Close())
@@ -658,6 +707,7 @@ func (c *MasqueClient) Close() error {
 		errs = append(errs, c.bridge.Close())
 		c.bridge = nil
 	}
+	c.lifecycleCtx = nil
 	c.pathType = ""
 	c.started = false
 	return errors.Join(errs...)
