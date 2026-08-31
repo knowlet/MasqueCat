@@ -99,12 +99,13 @@ jobs:
           gofmt -w masquecat.go tailcat.go masquecat_bridge.go masquecat_lifecycle_test.go
           git diff --check
           go test -run '^TestNoLegacyServiceDomainHardcodes$' .
-      - name: commit fixes
+      - name: commit fixes and remove this temporary workflow
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add masquecat.go tailcat.go masquecat_bridge.go masquecat_lifecycle_test.go
+          git rm .github/workflows/lint-autofix.yml
+          git add -A
           git diff --cached --stat
           git commit -m "fix: resolve MasqueCat lint findings"
           git push origin HEAD:feat/masquecat-masque-transport

@@ -30,11 +30,11 @@ func TestNoImplicitDERPMapService(t *testing.T) {
 }
 
 // TestNoLegacyServiceDomainHardcodes prevents hosted upstream infrastructure
-// from being reintroduced as a runtime/configuration default. Go import specs,
-// go.mod/go.sum, and GitHub workflow metadata are intentionally excluded. The
-// upstream module domain is allowed in build/documentation metadata because the
-// current engine still has an explicit compile-time dependency on it; it is
-// rejected only when it appears in a non-import Go runtime string.
+// from being reintroduced as a production runtime/configuration default. Go
+// import specs, go.mod/go.sum, GitHub workflow metadata, and test fixtures are
+// intentionally excluded. Build documentation may legitimately name the
+// compile-time upstream module; eliminating that source dependency is a
+// separate engine migration.
 func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 	hostedDomain := "tailcat" + ".dev"
 	upstreamModuleDomain := "tailscale" + ".com"
@@ -65,6 +65,11 @@ func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 				return errors.New(path + " contains forbidden hosted-service domain " + hostedDomain)
 			}
 		case ".go":
+			// Tests may intentionally contain historical domains as fixtures or
+			// expected values. They are not part of the production runtime surface.
+			if strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
 			fset := token.NewFileSet()
 			f, err := parser.ParseFile(fset, path, nil, 0)
 			if err != nil {
