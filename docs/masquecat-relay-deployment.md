@@ -65,8 +65,8 @@ Current flags:
 | Flag | Default | Required | Description |
 | --- | --- | --- | --- |
 | `-listen` | `:443` | no | UDP listen address used by HTTP/3 / QUIC |
-| `-cert` | empty | yes | certificate PEM file |
-| `-key` | empty | yes | private-key PEM file |
+| `-cert` | empty | together with `-key` for non-interactive/production use | certificate PEM file |
+| `-key` | empty | together with `-cert` for non-interactive/production use | private-key PEM file |
 
 There are currently no CLI flags for quotas, metrics, authentication policy,
 certificate reload, or health endpoints. Node-key proof authentication is part
@@ -100,8 +100,19 @@ https://relay.example.com:8443
 
 ## 4. TLS certificate
 
-The relay requires a certificate and private key at startup. The binary loads
-them with `tls.LoadX509KeyPair`.
+For non-interactive and production deployments, provide both `-cert` and `-key`.
+The binary loads them with `tls.LoadX509KeyPair`. Supplying only one of the two
+fails startup.
+
+When neither flag is supplied and stdin is an interactive terminal, the relay
+asks whether it should generate an ephemeral self-signed certificate for that
+process invocation. Answering `y` or `yes` creates an Ed25519-backed certificate
+in memory with a 24-hour lifetime and SANs for `localhost`, the local hostname,
+`127.0.0.1`, and `::1`. It is not written to disk and is regenerated on restart.
+
+In non-interactive environments such as systemd, CI, or normal container
+launches, missing certificate flags remain a hard error; there is no silent
+security downgrade.
 
 Recommended deployment layout:
 
@@ -118,10 +129,16 @@ Accepted trust models:
 - internal CA already installed in the peer operating-system trust store.
 
 An arbitrary self-signed certificate will fail normal hostname verification
-unless the corresponding CA is installed on every peer.
+unless the corresponding CA is installed on every peer. For explicit local
+development, `MasqueClient.InsecureSkipVerify` and
+`MasqueServer.InsecureSkipVerify` can disable verification for outbound MASQUE
+connections. This is an opt-in development escape hatch and should not be used
+for normal Internet-facing deployments because it permits man-in-the-middle
+attacks.
 
 The current relay does not reload certificates dynamically. Restart it after
-certificate renewal.
+certificate renewal. The interactive ephemeral certificate is regenerated on
+every restart.
 
 ## 5. Firewall requirements
 

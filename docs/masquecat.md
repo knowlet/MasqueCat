@@ -255,7 +255,7 @@ or UDP/443.
 
 MasqueCat's external transport is HTTP/3, so TLS 1.3 is used by QUIC.
 
-The current client uses the operating system's normal root trust and verifies
+By default, MasqueCat uses the operating system's normal root trust and verifies
 the endpoint hostname from `DirectURL` / `RelayURL`. Consequently:
 
 - a publicly trusted certificate is the easiest production setup;
@@ -263,6 +263,28 @@ the endpoint hostname from `DirectURL` / `RelayURL`. Consequently:
 - an arbitrary self-signed certificate will fail verification unless its CA is
   installed in the host trust store;
 - an IP-literal URL needs a certificate whose SAN matches that IP.
+
+For deliberate local-development use, `MasqueClient` and the outbound relay
+side of `MasqueServer` expose `InsecureSkipVerify`. The field is `false` by
+default. Setting it to `true` disables both certificate-chain and hostname
+verification for outbound MASQUE TLS connections and logs an explicit warning.
+
+```go
+c := tailcat.NewMasqueClient(token)
+c.InsecureSkipVerify = true // development only
+```
+
+The same opt-in is available on a server that connects to a self-signed relay:
+
+```go
+s.InsecureSkipVerify = true // outbound RelayURL only
+```
+
+> [!WARNING]
+> `InsecureSkipVerify` removes TLS server authentication and permits active
+> man-in-the-middle attacks. It is intended only for explicitly trusted test
+> environments. Normal Internet-facing deployments should use a trusted
+> certificate instead.
 
 Custom per-client root CA configuration is not exposed by the first-cut
 `MasqueClient` API yet.
@@ -540,7 +562,6 @@ and explicit path-failover telemetry are not implemented in this first slice.
 The first implementation intentionally keeps scope narrow. Before calling it a
 production transport, at least the following should be addressed:
 
-- cryptographic proof of possession for relay registration;
 - automatic reconnect and direct/relay failover after startup;
 - end-to-end direct and relay tests with real WireGuard/TCP traffic;
 - complete `mc...` integration into the `tailcat` CLI, including SSH, serve,
