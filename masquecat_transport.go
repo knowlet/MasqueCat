@@ -133,6 +133,23 @@ func masqueTemplateFor(rawBaseURL string) (*uritemplate.Template, error) {
 	return uritemplate.New(u.String())
 }
 
+func masqueProofForChallenge(local key.NodePrivate, challenge, verifierText string, requestTarget key.NodePublic, mode string) (string, error) {
+	if challenge == "" || verifierText == "" {
+		return "", errors.New("MASQUE endpoint requested authentication without a challenge")
+	}
+	var verifier key.NodePublic
+	if err := verifier.UnmarshalText([]byte(verifierText)); err != nil {
+		return "", fmt.Errorf("parse MASQUE authentication verifier: %w", err)
+	}
+	if verifier.IsZero() {
+		return "", errors.New("MASQUE authentication verifier is zero")
+	}
+	if mode == masqueModeDirect && verifier != requestTarget {
+		return "", errors.New("direct MASQUE authentication verifier does not match target node key")
+	}
+	return base64.RawURLEncoding.EncodeToString(local.SealTo(verifier, []byte(challenge))), nil
+}
+
 // masquePath is the external MASQUE transport used by the loopback DERP
 // compatibility bridge. It deliberately drops Tailscale disco packets: MASQUE
 // paths are explicit, so CallMeMaybe/disco path discovery must never leave the
@@ -178,24 +195,24 @@ func newMasquePath(ctx context.Context, rawURL string, requestTarget key.NodePub
 		QUICConfig: &quic.Config{EnableDatagrams: true},
 	}
 	conn, resp, err := tr.Dial(req)
-	if err != nil && resp != nil && resp.StatusCode == http.StatusUnauthorized {
+	// masque-go v0.4 returns both resp and a non-nil error for non-2xx
+	// responses. Key the authentication retry off the response itself so this
+	// remains correct if that transport detail changes in a future version.
+	if resp != nil && resp.StatusCode == http.StatusUnauthorized {
 		if conn != nil {
 			_ = conn.Close()
 			conn = nil
 		}
-		challenge := resp.Header.Get(masqueChallengeHeader)
-		verifierText := resp.Header.Get(masqueVerifierHeader)
-		if challenge == "" || verifierText == "" {
-			return nil, errors.New("MASQUE endpoint requested authentication without a challenge")
+		proof, proofErr := masqueProofForChallenge(
+			local,
+			resp.Header.Get(masqueChallengeHeader),
+			resp.Header.Get(masqueVerifierHeader),
+			requestTarget,
+			mode,
+		)
+		if proofErr != nil {
+			return nil, proofErr
 		}
-		var verifier key.NodePublic
-		if err := verifier.UnmarshalText([]byte(verifierText)); err != nil {
-			return nil, fmt.Errorf("parse MASQUE authentication verifier: %w", err)
-		}
-		if mode == masqueModeDirect && verifier != requestTarget {
-			return nil, errors.New("direct MASQUE authentication verifier does not match target node key")
-		}
-		proof := base64.RawURLEncoding.EncodeToString(local.SealTo(verifier, []byte(challenge)))
 		req, err = newRequest(proof)
 		if err != nil {
 			return nil, err
