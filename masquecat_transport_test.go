@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -108,7 +109,7 @@ func TestMasqueTargetRoundTrip(t *testing.T) {
 
 func TestParseMasqueTargetRejectsInvalidTargets(t *testing.T) {
 	k := key.NewNode().Public()
-	hexKey := k.UntypedHexString()
+	hexKey := strings.TrimPrefix(k.String(), nodePublicTextPrefix)
 	tests := []string{
 		"missing-port",
 		hexKey + masquePeerSuffix + ":2",

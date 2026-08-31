@@ -16,22 +16,6 @@ import (
 	"tailscale.com/types/logger"
 )
 
-func requestMasqueTemplate(r *http.Request) (*masqueRequestTemplate, error) {
-	t, err := masqueTemplateFor("https://" + r.Host)
-	if err != nil {
-		return nil, err
-	}
-	return &masqueRequestTemplate{template: t}, nil
-}
-
-type masqueRequestTemplate struct {
-	template interfaceTemplate
-}
-
-// interfaceTemplate exists only to keep construction localized; the concrete
-// URI-template value is unwrapped immediately by the handlers below.
-type interfaceTemplate interface{}
-
 func directMasqueHandler(local key.NodePublic, bridge *localDERPBridge, logf logger.Logf) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tmpl, err := masqueTemplateFor("https://" + r.Host)
@@ -62,7 +46,7 @@ func directMasqueHandler(local key.NodePublic, bridge *localDERPBridge, logf log
 			logf("accept direct MASQUE stream: %v", err)
 			return
 		}
-		defer str.Close()
+		defer func() { _ = str.Close() }()
 		fwd := &streamForwarder{str: str}
 		bridge.AddForwarder(src, fwd)
 		defer bridge.RemoveForwarder(src, fwd)
@@ -151,7 +135,7 @@ func (r *MasqueRelay) Handler() http.Handler {
 			logf("accept relay MASQUE stream: %v", err)
 			return
 		}
-		defer str.Close()
+		defer func() { _ = str.Close() }()
 		peer := &relayPeer{key: registeredKey, fwd: &streamForwarder{str: str}}
 		r.register(peer)
 		defer r.unregister(peer)
@@ -196,7 +180,7 @@ func (r *MasqueRelay) register(p *relayPeer) {
 		r.peers = make(map[key.NodePublic]*relayPeer)
 	}
 	if old := r.peers[p.key]; old != nil && old != p {
-		old.fwd.str.Close()
+		_ = old.fwd.str.Close()
 	}
 	r.peers[p.key] = p
 }

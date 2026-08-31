@@ -30,10 +30,11 @@ func TestNoImplicitDERPMapService(t *testing.T) {
 }
 
 // TestNoLegacyServiceDomainHardcodes prevents hosted upstream infrastructure
-// from being reintroduced as a runtime/configuration default. Go import specs
-// and go.mod/go.sum are intentionally excluded for the reused upstream
-// networking module; eliminating that compile-time module is a separate engine
-// migration.
+// from being reintroduced as a runtime/configuration default. Go import specs,
+// go.mod/go.sum, and GitHub workflow metadata are intentionally excluded. The
+// workflow directory may legitimately contain project-site deployment names;
+// those are not runtime network defaults. Eliminating the compile-time upstream
+// module is a separate engine migration.
 func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 	hostedDomain := "tailcat" + ".dev"
 	upstreamModuleDomain := "tailscale" + ".com"
@@ -44,7 +45,7 @@ func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 		}
 		if d.IsDir() {
 			switch d.Name() {
-			case ".git", "vendor":
+			case ".git", ".github", "vendor":
 				return filepath.SkipDir
 			}
 			return nil

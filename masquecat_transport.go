@@ -37,10 +37,11 @@ const (
 	masquePacketVersion = byte(1)
 	masqueVirtualPort   = "1"
 	masquePeerSuffix    = ".peer.masquecat.invalid"
+	nodePublicTextPrefix = "nodekey:"
 )
 
 var (
-	contextIDZero  = quicvarint.Append(nil, 0)
+	contextIDZero   = quicvarint.Append(nil, 0)
 	discoMagicBytes = []byte(disco.Magic)
 )
 
@@ -81,7 +82,8 @@ func decodeMasquePacket(b []byte) (masquePacket, error) {
 }
 
 func masqueTarget(k key.NodePublic) string {
-	return k.UntypedHexString() + masquePeerSuffix + ":" + masqueVirtualPort
+	keyText := strings.TrimPrefix(k.String(), nodePublicTextPrefix)
+	return keyText + masquePeerSuffix + ":" + masqueVirtualPort
 }
 
 func parseMasqueTarget(target string) (key.NodePublic, error) {
@@ -96,8 +98,8 @@ func parseMasqueTarget(target string) (key.NodePublic, error) {
 	if !ok {
 		return key.NodePublic{}, fmt.Errorf("unexpected MASQUE target host %q", host)
 	}
-	k, err := key.ParseNodePublicUntyped(mem.S(hexKey))
-	if err != nil {
+	var k key.NodePublic
+	if err := k.UnmarshalText([]byte(nodePublicTextPrefix + hexKey)); err != nil {
 		return key.NodePublic{}, fmt.Errorf("parse MASQUE peer key: %w", err)
 	}
 	return k, nil
@@ -128,18 +130,6 @@ func masqueTemplateFor(rawBaseURL string) (*uritemplate.Template, error) {
 	u.RawQuery = ""
 	u.Fragment = ""
 	return uritemplate.New(u.String())
-}
-
-func masqueServePath(rawBaseURL string) (string, *uritemplate.Template, error) {
-	t, err := masqueTemplateFor(rawBaseURL)
-	if err != nil {
-		return "", nil, err
-	}
-	u, err := url.Parse(t.Raw())
-	if err != nil {
-		return "", nil, err
-	}
-	return u.Path, t, nil
 }
 
 // masquePath is the external MASQUE transport used by the loopback DERP
@@ -179,7 +169,7 @@ func newMasquePath(ctx context.Context, rawURL string, requestTarget, local key.
 		return nil, fmt.Errorf("dial MASQUE endpoint %s: %w", rawURL, err)
 	}
 	if resp == nil || resp.StatusCode != http.StatusOK {
-		conn.Close()
+		_ = conn.Close()
 		if resp == nil {
 			return nil, errors.New("MASQUE endpoint returned no HTTP response")
 		}
@@ -299,7 +289,9 @@ func acceptMasqueStream(w http.ResponseWriter) (masqueDatagramStream, error) {
 		return nil, errors.New("HTTP/3 response writer has no stream")
 	}
 	str := hs.HTTPStream()
-	go io.Copy(io.Discard, str)
+	go func() {
+		_, _ = io.Copy(io.Discard, str)
+	}()
 	return str, nil
 }
 

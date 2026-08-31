@@ -45,13 +45,7 @@ func (ci MasqueConnInfo) ConnBlob() (MasqueConnBlob, error) {
 	if err := ci.validate(); err != nil {
 		return "", err
 	}
-	w := masqueWireConnInfo{
-		Version:           ci.Version,
-		ServerPublic:      ci.ServerPublic,
-		ServerDiscoPublic: ci.ServerDiscoPublic,
-		DirectURL:         ci.DirectURL,
-		RelayURL:          ci.RelayURL,
-	}
+	w := masqueWireConnInfo(ci)
 	b, err := json.Marshal(w)
 	if err != nil {
 		return "", fmt.Errorf("marshal MasqueCat connection info: %w", err)
@@ -77,13 +71,7 @@ func ParseMasqueConnBlob(blob MasqueConnBlob) (MasqueConnInfo, error) {
 	if err := json.Unmarshal(b, &w); err != nil {
 		return zero, fmt.Errorf("decode MasqueCat connection info: %w", err)
 	}
-	ci := MasqueConnInfo{
-		Version:           w.Version,
-		ServerPublic:      w.ServerPublic,
-		ServerDiscoPublic: w.ServerDiscoPublic,
-		DirectURL:         w.DirectURL,
-		RelayURL:          w.RelayURL,
-	}
+	ci := MasqueConnInfo(w)
 	if err := ci.validate(); err != nil {
 		return zero, err
 	}
