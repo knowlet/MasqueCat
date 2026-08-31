@@ -67,3 +67,5 @@ jobs:
           git diff --cached --check
           git commit -m "fix: address MasqueCat review findings"
           git push origin HEAD:feat/masquecat-masque-transport
+
+# triggered by ChatGPT review-fix verification
