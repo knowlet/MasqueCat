@@ -363,8 +363,35 @@ func acceptMasqueStream(w http.ResponseWriter) (masqueDatagramStream, error) {
 	return str, nil
 }
 
+func masqueTemplateForRequest(r *http.Request) (*uritemplate.Template, error) {
+	if r == nil || r.URL == nil || r.Host == "" {
+		return nil, errors.New("invalid MASQUE request URL")
+	}
+	const fixedPrefix = "/.well-known/masque/udp/"
+	idx := strings.LastIndex(r.URL.Path, fixedPrefix)
+	if idx < 0 {
+		return nil, fmt.Errorf("MASQUE request path %q has no CONNECT-UDP template", r.URL.Path)
+	}
+	base := &url.URL{
+		Scheme: "https",
+		Host:   r.Host,
+		Path:   strings.TrimSuffix(r.URL.Path[:idx], "/"),
+	}
+	return masqueTemplateFor(base.String())
+}
+
 func parseConnectUDPRequest(w http.ResponseWriter, r *http.Request, tmpl *uritemplate.Template) (*masque.ProxyRequest, bool) {
 	req, err := masque.ParseProxyRequest(r, tmpl)
+	if err != nil {
+		// The client template preserves an explicitly configured endpoint path.
+		// Built-in handlers don't otherwise know that public path, so derive the
+		// same base prefix from the received CONNECT-UDP path and retry parsing.
+		// ParseProxyRequest still validates method, protocol, authority and the
+		// target_host/target_port expansion; this only aligns the URI prefix.
+		if requestTmpl, templateErr := masqueTemplateForRequest(r); templateErr == nil {
+			req, err = masque.ParseProxyRequest(r, requestTmpl)
+		}
+	}
 	if err == nil {
 		return req, true
 	}
