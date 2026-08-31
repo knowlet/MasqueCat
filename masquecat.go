@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/netip"
 	"slices"
 	"sync"
@@ -106,6 +107,9 @@ func (s *MasqueServer) Start() error {
 	}
 	s.bridge = bridge
 	cleanup := func() {
+		if s.cancel != nil {
+			s.cancel()
+		}
 		if s.directHTTP != nil {
 			s.directHTTP.Close()
 		}
@@ -146,7 +150,7 @@ func (s *MasqueServer) Start() error {
 		}
 		s.directPC, s.directHTTP = pc, h3
 		go func() {
-			if err := h3.Serve(pc); err != nil && !errors.Is(err, http3.ErrServerClosed) && ctx.Err() == nil {
+			if err := h3.Serve(pc); err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
 				logf("direct MASQUE listener stopped: %v", err)
 			}
 		}()
@@ -422,15 +426,6 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("start loopback DERP compatibility bridge: %w", err)
 	}
-	cleanup := func() {
-		if c.path != nil {
-			c.path.Close()
-		}
-		if c.base != nil {
-			c.base.Close()
-		}
-		bridge.Close()
-	}
 
 	internalBlob := (&ConnInfo{
 		ServerPublic:      NodePublic{ci.ServerPublic},
@@ -460,35 +455,41 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	base.startMu.Unlock()
 
 	childCtx, cancel := context.WithCancel(context.Background())
-	c.cancel = cancel
 	local := priv.Public()
 	var directErr error
 	var path *masquePath
+	var pathType MasquePathType
 	if ci.DirectURL != "" {
 		path, directErr = newMasquePath(ctx, ci.DirectURL, ci.ServerPublic, local, masqueModeDirect, logf)
 		if directErr == nil {
-			c.pathType = MasquePathDirect
+			pathType = MasquePathDirect
 		}
 	}
 	if path == nil && ci.RelayURL != "" {
 		path, err = newMasquePath(ctx, ci.RelayURL, local, local, masqueModeRelay, logf)
 		if err != nil {
-			cleanup()
+			cancel()
+			base.Close()
+			bridge.Close()
 			if directErr != nil {
 				return errors.Join(fmt.Errorf("direct MASQUE: %w", directErr), fmt.Errorf("relay MASQUE: %w", err))
 			}
 			return fmt.Errorf("relay MASQUE: %w", err)
 		}
-		c.pathType = MasquePathRelay
+		pathType = MasquePathRelay
 	}
 	if path == nil {
-		cleanup()
+		cancel()
+		base.Close()
+		bridge.Close()
 		if directErr != nil {
 			return fmt.Errorf("direct MASQUE: %w", directErr)
 		}
 		return errors.New("no usable MASQUE path")
 	}
-	c.base, c.bridge, c.path = base, bridge, path
+
+	c.cancel = cancel
+	c.base, c.bridge, c.path, c.pathType = base, bridge, path, pathType
 	bridge.AddForwarder(ci.ServerPublic, path)
 	go func() {
 		err := path.run(childCtx, local, func(src key.NodePublic, payload []byte) error {
