@@ -22,16 +22,23 @@ jobs:
         run: |
           python3 <<'PY'
           from pathlib import Path
-          import re
 
           p = Path('tailcat.go')
           s = p.read_text()
-          pattern = r'(?m)^(\s*)lb\.Close\(\)$'
-          matches = list(re.finditer(pattern, s))
-          if len(matches) != 2:
-              raise SystemExit(f'expected exactly 2 standalone lb.Close() calls, found {len(matches)}')
-          s = re.sub(pattern, r'\1_ = lb.Close()', s)
-          p.write_text(s)
+          old = '''netMon, err := netmon.New(bus, func(format string, args ...any) { logf(format, args...) })
+          if err != nil {
+                  lb.Close()
+                  return fmt.Errorf("netmon.New: %w", err)
+          }'''
+          new = '''netMon, err := netmon.New(bus, func(format string, args ...any) { logf(format, args...) })
+          if err != nil {
+                  _ = lb.Close()
+                  return fmt.Errorf("netmon.New: %w", err)
+          }'''
+          count = s.count(old)
+          if count != 2:
+              raise SystemExit(f'expected exactly 2 target netmon cleanup blocks, found {count}')
+          p.write_text(s.replace(old, new))
           PY
           gofmt -w tailcat.go
           git diff --check
