@@ -11,7 +11,10 @@ import (
 	"tailscale.com/types/key"
 )
 
-const masqueConnBlobPrefix = "mc"
+const (
+	masqueConnBlobPrefix = "mc"
+	maxMasqueConnBlobLen = 8 << 10
+)
 
 // MasqueConnBlob is a self-contained MasqueCat server address.
 // It carries the server's WireGuard identity and the explicitly configured
@@ -50,12 +53,19 @@ func (ci MasqueConnInfo) ConnBlob() (MasqueConnBlob, error) {
 	if err != nil {
 		return "", fmt.Errorf("marshal MasqueCat connection info: %w", err)
 	}
-	return MasqueConnBlob(masqueConnBlobPrefix + base64.RawURLEncoding.EncodeToString(b)), nil
+	blob := MasqueConnBlob(masqueConnBlobPrefix + base64.RawURLEncoding.EncodeToString(b))
+	if len(blob) > maxMasqueConnBlobLen {
+		return "", fmt.Errorf("MasqueCat token exceeds %d-byte limit", maxMasqueConnBlobLen)
+	}
+	return blob, nil
 }
 
 // ParseMasqueConnBlob parses a MasqueCat connection token.
 func ParseMasqueConnBlob(blob MasqueConnBlob) (MasqueConnInfo, error) {
 	var zero MasqueConnInfo
+	if len(blob) > maxMasqueConnBlobLen {
+		return zero, fmt.Errorf("MasqueCat token exceeds %d-byte limit", maxMasqueConnBlobLen)
+	}
 	rest, ok := strings.CutPrefix(string(blob), masqueConnBlobPrefix)
 	if !ok {
 		if strings.HasPrefix(string(blob), "tc") {
@@ -112,8 +122,8 @@ func validateMasqueURL(kind, raw string) error {
 	if u.Scheme != "https" {
 		return fmt.Errorf("%s MASQUE URL must use https", kind)
 	}
-	if u.Host == "" {
-		return fmt.Errorf("%s MASQUE URL has no host", kind)
+	if u.Host == "" || u.Hostname() == "" {
+		return fmt.Errorf("%s MASQUE URL has no hostname", kind)
 	}
 	if u.User != nil {
 		return fmt.Errorf("%s MASQUE URL must not contain userinfo", kind)

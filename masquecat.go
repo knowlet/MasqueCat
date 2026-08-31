@@ -123,7 +123,13 @@ func (s *MasqueServer) Start() error {
 			_ = s.Server.Close()
 		}
 		_ = bridge.Close()
+		s.cancel = nil
+		s.directHTTP = nil
+		s.directPC = nil
+		s.relayPath = nil
 		s.bridge = nil
+		s.lb = nil
+		s.blob = ""
 	}
 
 	if err := s.startTailcatCore(priv, bridge.Region(), logf); err != nil {
@@ -145,7 +151,7 @@ func (s *MasqueServer) Start() error {
 		conf.MinVersion = tls.VersionTLS13
 		h3 := &http3.Server{
 			TLSConfig:       conf,
-			Handler:         directMasqueHandler(local, bridge, logf),
+			Handler:         directMasqueHandler(priv, bridge, logf),
 			EnableDatagrams: true,
 		}
 		s.directPC, s.directHTTP = pc, h3
@@ -157,7 +163,7 @@ func (s *MasqueServer) Start() error {
 	}
 
 	if s.RelayURL != "" {
-		path, err := newMasquePath(ctx, s.RelayURL, local, local, masqueModeRelay, logf)
+		path, err := newMasquePath(ctx, s.RelayURL, local, priv, masqueModeRelay, logf)
 		if err != nil {
 			cleanup()
 			return fmt.Errorf("connect MASQUE relay: %w", err)
@@ -203,6 +209,7 @@ func (s *MasqueServer) Close() error {
 	defer s.mu.Unlock()
 	if s.cancel != nil {
 		s.cancel()
+		s.cancel = nil
 	}
 	var errs []error
 	if s.directHTTP != nil {
@@ -219,11 +226,13 @@ func (s *MasqueServer) Close() error {
 	}
 	if s.lb != nil {
 		errs = append(errs, s.Server.Close())
+		s.lb = nil
 	}
 	if s.bridge != nil {
 		errs = append(errs, s.bridge.Close())
 		s.bridge = nil
 	}
+	s.blob = ""
 	return errors.Join(errs...)
 }
 
@@ -408,6 +417,10 @@ func NewMasqueClient(server MasqueConnBlob) *MasqueClient { return &MasqueClient
 func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.ensureStartedLocked(ctx)
+}
+
+func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 	if c.started {
 		return nil
 	}
@@ -462,13 +475,13 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	var path *masquePath
 	var pathType MasquePathType
 	if ci.DirectURL != "" {
-		path, directErr = newMasquePath(ctx, ci.DirectURL, ci.ServerPublic, local, masqueModeDirect, logf)
+		path, directErr = newMasquePath(childCtx, ci.DirectURL, ci.ServerPublic, priv, masqueModeDirect, logf)
 		if directErr == nil {
 			pathType = MasquePathDirect
 		}
 	}
 	if path == nil && ci.RelayURL != "" {
-		path, err = newMasquePath(ctx, ci.RelayURL, local, local, masqueModeRelay, logf)
+		path, err = newMasquePath(childCtx, ci.RelayURL, local, priv, masqueModeRelay, logf)
 		if err != nil {
 			cancel()
 			_ = base.Close()
@@ -521,52 +534,71 @@ func (c *MasqueClient) PublicKey() key.NodePublic {
 	return c.Key.Public()
 }
 
+func (c *MasqueClient) lockBase(ctx context.Context) (*Client, error) {
+	c.mu.Lock()
+	if err := c.ensureStartedLocked(ctx); err != nil {
+		c.mu.Unlock()
+		return nil, err
+	}
+	if c.base == nil {
+		c.mu.Unlock()
+		return nil, errors.New("masquecat: client closed during startup")
+	}
+	return c.base, nil
+}
+
 func (c *MasqueClient) Ping(ctx context.Context) (PingResult, error) {
-	if err := c.ensureStarted(ctx); err != nil {
+	base, err := c.lockBase(ctx)
+	if err != nil {
 		return PingResult{}, err
 	}
-	return c.base.Ping(ctx)
+	defer c.mu.Unlock()
+	return base.Ping(ctx)
 }
 
 func (c *MasqueClient) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	if err := c.ensureStarted(ctx); err != nil {
+	base, err := c.lockBase(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return c.base.Dial(ctx, network, addr)
+	defer c.mu.Unlock()
+	return base.Dial(ctx, network, addr)
 }
 
 func (c *MasqueClient) DialTCPPort(ctx context.Context, port uint16) (net.Conn, error) {
-	if err := c.ensureStarted(ctx); err != nil {
+	base, err := c.lockBase(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return c.base.DialTCPPort(ctx, port)
+	defer c.mu.Unlock()
+	return base.DialTCPPort(ctx, port)
 }
 
 func (c *MasqueClient) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-	if err := c.ensureStarted(ctx); err != nil {
+	base, err := c.lockBase(ctx)
+	if err != nil {
 		return nil, err
 	}
-	return c.base.DialTCP(ctx, dst)
+	defer c.mu.Unlock()
+	return base.DialTCP(ctx, dst)
 }
 
 func (c *MasqueClient) DrainTCP(ctx context.Context) error {
 	c.mu.Lock()
-	base := c.base
-	c.mu.Unlock()
-	if base == nil {
+	defer c.mu.Unlock()
+	if c.base == nil {
 		return nil
 	}
-	return base.DrainTCP(ctx)
+	return c.base.DrainTCP(ctx)
 }
 
 func (c *MasqueClient) Status() *ipnstate.Status {
 	c.mu.Lock()
-	base := c.base
-	c.mu.Unlock()
-	if base == nil || base.lb == nil {
+	defer c.mu.Unlock()
+	if c.base == nil || c.base.lb == nil {
 		return nil
 	}
-	return base.lb.Status()
+	return c.base.lb.Status()
 }
 
 func (c *MasqueClient) Close() error {
@@ -574,6 +606,7 @@ func (c *MasqueClient) Close() error {
 	defer c.mu.Unlock()
 	if c.cancel != nil {
 		c.cancel()
+		c.cancel = nil
 	}
 	var errs []error
 	if c.path != nil {
@@ -588,6 +621,7 @@ func (c *MasqueClient) Close() error {
 		errs = append(errs, c.bridge.Close())
 		c.bridge = nil
 	}
+	c.pathType = ""
 	c.started = false
 	return errors.Join(errs...)
 }

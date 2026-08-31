@@ -211,10 +211,11 @@ already encrypted WireGuard payloads. A relay can still observe connection
 source addresses, registered peer keys used for routing, packet sizes, timing,
 and traffic volume.
 
-The first relay implementation is **not yet production hardened**. In
-particular, transport-level peer registration still needs cryptographic
-proof-of-possession, resource quotas, abuse controls, and production metrics.
-WireGuard still authenticates the inner peer session.
+The relay registration layer now requires a one-time cryptographic
+proof of possession of the advertised Tailcat node key before a stream can be
+registered. A live registration is never replaced by an unverified duplicate.
+The relay is still **not yet production hardened**: resource quotas, abuse
+controls, production metrics, and operational hardening remain required.
 
 ## What MasqueCat is not
 
@@ -240,7 +241,6 @@ Implemented in this branch:
 Still required before merge-ready / production-ready:
 
 - complete `mc...` CLI integration (`serve`, `ssh`, `ping`, `parse`, saved keys)
-- relay registration proof-of-possession
 - direct and relay WireGuard/TCP/SSH E2E tests
 - reconnect and runtime direct-to-relay failover
 - MTU / fragmentation validation

@@ -16,7 +16,9 @@ import (
 	"tailscale.com/types/logger"
 )
 
-func directMasqueHandler(local key.NodePublic, bridge *localDERPBridge, logf logger.Logf) http.Handler {
+func directMasqueHandler(localPriv key.NodePrivate, bridge *localDERPBridge, logf logger.Logf) http.Handler {
+	local := localPriv.Public()
+	auth := newMasqueAuthenticator(localPriv)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tmpl, err := masqueTemplateFor("https://" + r.Host)
 		if err != nil {
@@ -39,6 +41,9 @@ func directMasqueHandler(local key.NodePublic, bridge *localDERPBridge, logf log
 		src, err := parseMasqueSource(r)
 		if err != nil || src.IsZero() {
 			http.Error(w, "invalid MasqueCat source", http.StatusUnauthorized)
+			return
+		}
+		if !auth.authorize(w, r, src, target, masqueModeDirect) {
 			return
 		}
 		str, err := acceptMasqueStream(w)
@@ -89,6 +94,9 @@ type MasqueRelay struct {
 
 	mu    sync.Mutex
 	peers map[key.NodePublic]*relayPeer
+
+	authOnce sync.Once
+	auth     *masqueAuthenticator
 }
 
 type relayPeer struct {
@@ -101,6 +109,13 @@ func (r *MasqueRelay) logf() logger.Logf {
 		return r.Logf
 	}
 	return func(format string, args ...any) {}
+}
+
+func (r *MasqueRelay) authenticator() *masqueAuthenticator {
+	r.authOnce.Do(func() {
+		r.auth = newMasqueAuthenticator(key.NewNode())
+	})
+	return r.auth
 }
 
 // Handler returns the HTTP/3 handler for a MasqueCat relay.
@@ -130,6 +145,13 @@ func (r *MasqueRelay) Handler() http.Handler {
 			http.Error(w, "MasqueCat source does not match registered target", http.StatusUnauthorized)
 			return
 		}
+		if !r.authenticator().authorize(w, req, src, registeredKey, masqueModeRelay) {
+			return
+		}
+		if r.lookup(registeredKey) != nil {
+			http.Error(w, "MasqueCat peer is already registered", http.StatusConflict)
+			return
+		}
 		str, err := acceptMasqueStream(w)
 		if err != nil {
 			logf("accept relay MASQUE stream: %v", err)
@@ -137,7 +159,10 @@ func (r *MasqueRelay) Handler() http.Handler {
 		}
 		defer func() { _ = str.Close() }()
 		peer := &relayPeer{key: registeredKey, fwd: &streamForwarder{str: str}}
-		r.register(peer)
+		if !r.register(peer) {
+			logf("MASQUE relay duplicate registration rejected: %v", peer.key.ShortString())
+			return
+		}
 		defer r.unregister(peer)
 		logf("MASQUE relay peer registered: %v", peer.key.ShortString())
 
@@ -173,16 +198,17 @@ func (r *MasqueRelay) Handler() http.Handler {
 	})
 }
 
-func (r *MasqueRelay) register(p *relayPeer) {
+func (r *MasqueRelay) register(p *relayPeer) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.peers == nil {
 		r.peers = make(map[key.NodePublic]*relayPeer)
 	}
 	if old := r.peers[p.key]; old != nil && old != p {
-		_ = old.fwd.str.Close()
+		return false
 	}
 	r.peers[p.key] = p
+	return true
 }
 
 func (r *MasqueRelay) unregister(p *relayPeer) {

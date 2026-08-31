@@ -46,7 +46,8 @@ func TestMasqueConnInfoValidationFailures(t *testing.T) {
 		{name: "missing disco key", edit: func(ci *MasqueConnInfo) { ci.ServerDiscoPublic = key.DiscoPublic{} }, want: "no server disco key"},
 		{name: "no paths", edit: func(ci *MasqueConnInfo) { ci.DirectURL, ci.RelayURL = "", "" }, want: "neither"},
 		{name: "direct http", edit: func(ci *MasqueConnInfo) { ci.DirectURL = "http://peer.example" }, want: "must use https"},
-		{name: "relay no host", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https:///path" }, want: "no host"},
+		{name: "relay no host", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https:///path" }, want: "no hostname"},
+		{name: "relay empty hostname", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://:443" }, want: "no hostname"},
 		{name: "userinfo", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://user:pass@relay.example" }, want: "userinfo"},
 		{name: "query", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://relay.example?q=1" }, want: "query or fragment"},
 		{name: "fragment", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://relay.example/#x" }, want: "query or fragment"},
@@ -64,6 +65,10 @@ func TestMasqueConnInfoValidationFailures(t *testing.T) {
 }
 
 func TestParseMasqueConnBlobMalformed(t *testing.T) {
+	if _, err := ParseMasqueConnBlob(MasqueConnBlob("mc" + strings.Repeat("A", maxMasqueConnBlobLen))); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("oversized token error = %v, want size-limit rejection", err)
+	}
+
 	valid := validMasqueConnInfoForTest()
 	blob, err := valid.ConnBlob()
 	if err != nil {

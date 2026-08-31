@@ -4,6 +4,8 @@ package tailcat
 
 import (
 	"context"
+	"crypto/tls"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -40,6 +42,31 @@ func TestMasqueServerRejectsInvalidRelayURLBeforeNetworking(t *testing.T) {
 	err := s.Start()
 	if err == nil || !strings.Contains(err.Error(), "must use https") {
 		t.Fatalf("Start error = %v, want https validation error", err)
+	}
+}
+
+func TestMasqueServerStartCanRetryAfterPostCoreFailure(t *testing.T) {
+	tlsServer := httptest.NewTLSServer(nil)
+	cert := tlsServer.Certificate()
+	tlsServer.Close()
+	s := &MasqueServer{
+		DirectURL:    "https://127.0.0.1:443",
+		DirectListen: "bad-listen-address",
+		DirectTLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{{
+				Certificate: [][]byte{cert.Raw},
+			}},
+		},
+	}
+	if err := s.Start(); err == nil || !strings.Contains(err.Error(), "listen for direct MASQUE") {
+		t.Fatalf("first Start error = %v, want direct listen failure", err)
+	}
+	s.DirectListen = "127.0.0.1:0"
+	if err := s.Start(); err != nil {
+		t.Fatalf("second Start after cleanup: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close after retry: %v", err)
 	}
 }
 

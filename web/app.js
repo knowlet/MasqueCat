@@ -7,23 +7,12 @@ const KEY_STORAGE = "tailcat-web-key";
 const params = new URLSearchParams(location.search);
 const verbose = params.has("verbose");
 
-// canonicalDERPMapURL is the public tailcat DERP map, which allows
-// cross-origin fetches with CORS headers.
-const canonicalDERPMapURL = "https://tailcat.dev/derpmap.json";
-
-// pickDERPMapURL returns the DERP map URL to hand to
-// tailcatListen/tailcatDial: the ?derpmap= query parameter if given,
-// and the canonical public map when hosted on GitHub Pages, which
-// serves no map of its own. Anywhere else (cmd/tailcat-web, the
-// integration tests, or this page copied onto some other site), it
-// prefers a same-origin derpmap.json if the host serves one and
-// otherwise falls back to the canonical map.
+// pickDERPMapURL returns the explicitly configured DERP map URL, or a
+// same-origin map served by cmd/tailcat-web / an embedding application.
+// There is intentionally no hosted-service fallback.
 async function pickDERPMapURL() {
   if (params.get("derpmap")) {
     return new URL(params.get("derpmap"), location.href).toString();
-  }
-  if (location.hostname.endsWith(".github.io")) {
-    return canonicalDERPMapURL;
   }
   const sameOrigin = new URL("derpmap.json", location.href).toString();
   try {
@@ -32,7 +21,7 @@ async function pickDERPMapURL() {
       return sameOrigin;
     }
   } catch (e) {}
-  return canonicalDERPMapURL;
+  throw new Error("No DERP map configured; provide ?derpmap=https://... or serve /derpmap.json on the same origin");
 }
 const derpMapURL = await pickDERPMapURL();
 

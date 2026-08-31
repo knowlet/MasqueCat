@@ -268,7 +268,7 @@ func TestStreamForwarderConcurrentSendsAreIndependent(t *testing.T) {
 	}
 }
 
-func TestMasqueRelayRegistryReplacement(t *testing.T) {
+func TestMasqueRelayRegistryRejectsDuplicate(t *testing.T) {
 	r := new(MasqueRelay)
 	k := key.NewNode().Public()
 	oldStream := newFakeMasqueDatagramStream()
@@ -276,27 +276,30 @@ func TestMasqueRelayRegistryReplacement(t *testing.T) {
 	oldPeer := &relayPeer{key: k, fwd: &streamForwarder{str: oldStream}}
 	newPeer := &relayPeer{key: k, fwd: &streamForwarder{str: newStream}}
 
-	r.register(oldPeer)
+	if !r.register(oldPeer) {
+		t.Fatal("first registration rejected")
+	}
 	if got := r.lookup(k); got != oldPeer {
 		t.Fatalf("lookup after first register = %p, want %p", got, oldPeer)
 	}
-	r.register(newPeer)
-	if got := r.lookup(k); got != newPeer {
-		t.Fatalf("lookup after replacement = %p, want %p", got, newPeer)
+	if r.register(newPeer) {
+		t.Fatal("duplicate live registration unexpectedly replaced existing peer")
+	}
+	if got := r.lookup(k); got != oldPeer {
+		t.Fatalf("lookup after duplicate = %p, want original %p", got, oldPeer)
 	}
 	oldStream.mu.Lock()
 	closed := oldStream.closed
 	oldStream.mu.Unlock()
-	if closed != 1 {
-		t.Fatalf("old stream close count = %d, want 1", closed)
+	if closed != 0 {
+		t.Fatalf("original stream close count = %d, want 0", closed)
 	}
 
-	// Unregistering a stale peer must not remove its replacement.
-	r.unregister(oldPeer)
-	if got := r.lookup(k); got != newPeer {
-		t.Fatalf("stale unregister removed replacement: got %p, want %p", got, newPeer)
-	}
 	r.unregister(newPeer)
+	if got := r.lookup(k); got != oldPeer {
+		t.Fatalf("stale unregister removed original: got %p, want %p", got, oldPeer)
+	}
+	r.unregister(oldPeer)
 	if got := r.lookup(k); got != nil {
 		t.Fatalf("lookup after unregister = %p, want nil", got)
 	}

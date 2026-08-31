@@ -2,12 +2,12 @@ package tailcat
 
 import (
 	"context"
-	"errors"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -29,15 +29,23 @@ func TestNoImplicitDERPMapService(t *testing.T) {
 	}
 }
 
-// TestNoLegacyServiceDomainHardcodes prevents hosted upstream infrastructure
-// from being reintroduced as a production runtime/configuration default. Go
-// import specs, go.mod/go.sum, GitHub workflow metadata, and test fixtures are
-// intentionally excluded. Build documentation may legitimately name the
-// compile-time upstream module; eliminating that source dependency is a
-// separate engine migration.
+// TestNoLegacyServiceDomainHardcodes guards only the runtime surfaces that can
+// supply DERP-map defaults. It deliberately does not ban ordinary mentions of
+// the upstream Go module and does not scan documentation or test fixtures.
 func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 	hostedDomain := "tailcat" + ".dev"
-	upstreamModuleDomain := "tailscale" + ".com"
+	var violations []string
+
+	isRuntimeSurface := func(path string) bool {
+		path = filepath.ToSlash(path)
+		switch path {
+		case "tailcat.go", "pickregion.go", "pickregion_js.go":
+			return true
+		}
+		return strings.HasPrefix(path, "cmd/") ||
+			strings.HasPrefix(path, "web/") ||
+			strings.HasPrefix(path, "webdemo/")
+	}
 
 	err := filepath.WalkDir(".", func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -50,26 +58,20 @@ func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 			}
 			return nil
 		}
-		if path == "upstream_defaults_test.go" || path == "go.mod" || path == "go.sum" {
+		if !isRuntimeSurface(path) || strings.HasSuffix(path, "_test.go") {
 			return nil
 		}
 
-		ext := strings.ToLower(filepath.Ext(path))
-		switch ext {
-		case ".md", ".yaml", ".yml", ".json", ".nix", ".toml":
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".js", ".html", ".json", ".yaml", ".yml", ".toml", ".nix":
 			b, err := os.ReadFile(path)
 			if err != nil {
 				return err
 			}
 			if strings.Contains(string(b), hostedDomain) {
-				return errors.New(path + " contains forbidden hosted-service domain " + hostedDomain)
+				violations = append(violations, path+" contains forbidden hosted-service domain "+hostedDomain)
 			}
 		case ".go":
-			// Tests may intentionally contain historical domains as fixtures or
-			// expected values. They are not part of the production runtime surface.
-			if strings.HasSuffix(path, "_test.go") {
-				return nil
-			}
 			fset := token.NewFileSet()
 			f, err := parser.ParseFile(fset, path, nil, 0)
 			if err != nil {
@@ -79,33 +81,26 @@ func TestNoLegacyServiceDomainHardcodes(t *testing.T) {
 			for _, imp := range f.Imports {
 				imports[imp.Path] = true
 			}
-			var violation error
 			ast.Inspect(f, func(n ast.Node) bool {
 				lit, ok := n.(*ast.BasicLit)
 				if !ok || lit.Kind != token.STRING || imports[lit] {
 					return true
 				}
 				s, err := strconv.Unquote(lit.Value)
-				if err != nil {
-					return true
-				}
-				switch {
-				case strings.Contains(s, hostedDomain):
-					violation = errors.New(path + " contains forbidden hosted-service domain " + hostedDomain)
-					return false
-				case strings.Contains(s, upstreamModuleDomain):
-					violation = errors.New(path + " contains upstream domain in a non-import runtime string")
-					return false
+				if err == nil && strings.Contains(s, hostedDomain) {
+					pos := fset.Position(lit.Pos())
+					violations = append(violations, pos.String()+" contains forbidden hosted-service domain "+hostedDomain)
 				}
 				return true
 			})
-			if violation != nil {
-				return violation
-			}
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(violations) != 0 {
+		sort.Strings(violations)
+		t.Fatalf("hosted-service runtime defaults found:\n%s", strings.Join(violations, "\n"))
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -34,9 +35,9 @@ const (
 	masqueModeDirect = "direct"
 	masqueModeRelay  = "relay"
 
-	masquePacketVersion = byte(1)
-	masqueVirtualPort   = "1"
-	masquePeerSuffix    = ".peer.masquecat.invalid"
+	masquePacketVersion  = byte(1)
+	masqueVirtualPort    = "1"
+	masquePeerSuffix     = ".peer.masquecat.invalid"
 	nodePublicTextPrefix = "nodekey:"
 )
 
@@ -144,38 +145,79 @@ type masquePath struct {
 	writeMu sync.Mutex
 }
 
-func newMasquePath(ctx context.Context, rawURL string, requestTarget, local key.NodePublic, mode string, logf logger.Logf) (*masquePath, error) {
+func newMasquePath(ctx context.Context, rawURL string, requestTarget key.NodePublic, local key.NodePrivate, mode string, logf logger.Logf) (*masquePath, error) {
 	tmpl, err := masqueTemplateFor(rawURL)
 	if err != nil {
 		return nil, err
 	}
-	req, err := masque.NewRequest(ctx, tmpl, masqueTarget(requestTarget))
-	if err != nil {
-		return nil, fmt.Errorf("create CONNECT-UDP request: %w", err)
+	localPublic := local.Public()
+	newRequest := func(proof string) (*masque.Request, error) {
+		req, err := masque.NewRequest(ctx, tmpl, masqueTarget(requestTarget))
+		if err != nil {
+			return nil, fmt.Errorf("create CONNECT-UDP request: %w", err)
+		}
+		req.Header().Set(masqueSourceHeader, localPublic.String())
+		req.Header().Set(masqueModeHeader, mode)
+		if proof != "" {
+			req.Header().Set(masqueProofHeader, proof)
+		}
+		return req, nil
 	}
-	req.Header().Set(masqueSourceHeader, local.String())
-	req.Header().Set(masqueModeHeader, mode)
 
+	req, err := newRequest("")
+	if err != nil {
+		return nil, err
+	}
 	u, _ := url.Parse(rawURL)
 	tr := &masque.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS13,
 			ServerName: u.Hostname(),
+			NextProtos: []string{http3.NextProtoH3},
 		},
 		QUICConfig: &quic.Config{EnableDatagrams: true},
 	}
 	conn, resp, err := tr.Dial(req)
+	if err != nil && resp != nil && resp.StatusCode == http.StatusUnauthorized {
+		if conn != nil {
+			_ = conn.Close()
+			conn = nil
+		}
+		challenge := resp.Header.Get(masqueChallengeHeader)
+		verifierText := resp.Header.Get(masqueVerifierHeader)
+		if challenge == "" || verifierText == "" {
+			return nil, errors.New("MASQUE endpoint requested authentication without a challenge")
+		}
+		var verifier key.NodePublic
+		if err := verifier.UnmarshalText([]byte(verifierText)); err != nil {
+			return nil, fmt.Errorf("parse MASQUE authentication verifier: %w", err)
+		}
+		if mode == masqueModeDirect && verifier != requestTarget {
+			return nil, errors.New("direct MASQUE authentication verifier does not match target node key")
+		}
+		proof := base64.RawURLEncoding.EncodeToString(local.SealTo(verifier, []byte(challenge)))
+		req, err = newRequest(proof)
+		if err != nil {
+			return nil, err
+		}
+		conn, resp, err = tr.Dial(req)
+	}
 	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return nil, fmt.Errorf("dial MASQUE endpoint %s: %w", rawURL, err)
 	}
 	if resp == nil || resp.StatusCode != http.StatusOK {
-		_ = conn.Close()
+		if conn != nil {
+			_ = conn.Close()
+		}
 		if resp == nil {
 			return nil, errors.New("MASQUE endpoint returned no HTTP response")
 		}
 		return nil, fmt.Errorf("MASQUE endpoint returned %s", resp.Status)
 	}
-	return &masquePath{local: local, pc: conn, logf: logf}, nil
+	return &masquePath{local: localPublic, pc: conn, logf: logf}, nil
 }
 
 func (p *masquePath) ForwardPacket(src, dst key.NodePublic, payload []byte) error {

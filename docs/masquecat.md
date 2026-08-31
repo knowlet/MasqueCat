@@ -117,14 +117,14 @@ observe, at minimum:
 It cannot recover application plaintext from those datagrams without also
 breaking the end-to-end WireGuard session.
 
-> [!WARNING]
-> The current first-cut relay registration checks that the declared source key
-> matches the key in the CONNECT-UDP target/header, but it does **not yet perform
-> a cryptographic proof-of-possession challenge for that node key at the MASQUE
-> registration layer**. WireGuard still authenticates the actual tunnel, but a
-> hardened public relay should add registration PoP to prevent node-key slot
-> hijacking / denial-of-service. Treat `cmd/masquecat-relay` as experimental
-> until that is implemented.
+> [!NOTE]
+> Direct and relay registrations now use a one-time server-issued challenge.
+> The claimant proves possession of the advertised Tailcat node private key
+> before the CONNECT-UDP stream is registered; the challenge is bound to the
+> source key, target key, and mode, expires quickly, and cannot replace an
+> existing live registration. This prevents unauthenticated node-key slot
+> hijacking, but it does not replace relay resource quotas, abuse controls, or
+> other production hardening.
 
 ## Connection tokens
 
