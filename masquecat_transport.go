@@ -243,8 +243,13 @@ func (f *streamForwarder) ForwardPacket(src, dst key.NodePublic, payload []byte)
 	if bytes.HasPrefix(payload, disco.Magic) {
 		return nil
 	}
-	b := encodeMasquePacket(src, dst, payload)
-	b = append(contextIDZero, b...)
+	packet := encodeMasquePacket(src, dst, payload)
+	// HTTP/3 datagrams carry a QUIC varint context ID before the application
+	// payload. Build a fresh slice for every send: contextIDZero is immutable
+	// shared state and must never be used as append's destination backing array.
+	b := make([]byte, 0, len(contextIDZero)+len(packet))
+	b = append(b, contextIDZero...)
+	b = append(b, packet...)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.str.SendDatagram(b)
