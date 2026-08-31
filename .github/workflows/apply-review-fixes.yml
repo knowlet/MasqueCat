@@ -17,7 +17,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: repair escaped literals in temporary runner
+      - name: repair temporary runner literals
         shell: bash
         run: |
           python3 <<'PY'
@@ -36,6 +36,19 @@ jobs:
           PY
       - name: apply fail-closed review fixes
         run: python3 .github/scripts/apply-review-fixes.py
+      - name: repair fuzz seed variable reuse
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path('masquecat_fuzz_test.go')
+          s = p.read_text()
+          old = '\tsrc = key.NewNode().Public()\n\tdst := key.NewNode().Public()'
+          new = '\tsrc = key.NewNode().Public()\n\tdst = key.NewNode().Public()'
+          if s.count(old) != 1:
+              raise SystemExit(f'expected exactly one fuzz seed reuse match, found {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+          PY
       - name: format and validate focused changes
         shell: bash
         run: |
