@@ -586,17 +586,18 @@ func (c *MasqueClient) PublicKey() key.NodePublic {
 	return c.Key.Public()
 }
 
-// acquireBase takes a lifecycle lease while holding c.mu, then releases the
-// mutex before any potentially blocking base operation. Close holds c.mu while
-// it cancels the lifecycle and waits for all leases, so base teardown cannot
-// race with an operation that already captured the pointer.
+// acquireBase ensures startup first, then takes a lifecycle lease under c.mu
+// and releases the mutex before any potentially blocking base operation. Close
+// holds c.mu while canceling the lifecycle and waiting for existing leases, so
+// teardown cannot race a captured base pointer. If Close wins between startup
+// and lease acquisition, the nil/lifecycle check fails closed.
 func (c *MasqueClient) acquireBase(ctx context.Context) (*Client, context.Context, func(), error) {
-	c.mu.Lock()
-	if err := c.ensureStartedLocked(ctx); err != nil {
-		c.mu.Unlock()
+	if err := c.ensureStarted(ctx); err != nil {
 		return nil, nil, nil, err
 	}
-	if c.base == nil || c.lifecycleCtx == nil {
+
+	c.mu.Lock()
+	if c.base == nil || c.lifecycleCtx == nil || !c.started {
 		c.mu.Unlock()
 		return nil, nil, nil, errors.New("masquecat: client closed during startup")
 	}
