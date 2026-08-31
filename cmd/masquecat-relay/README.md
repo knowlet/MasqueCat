@@ -8,13 +8,17 @@ framed datagrams between connected peer identities. The inner WireGuard tunnel
 remains end-to-end between the MasqueCat peers; the relay does not receive a
 WireGuard private key and is not intended to decrypt application traffic.
 
-> [!WARNING]
-> This relay is still experimental. The current branch does **not yet provide
-> cryptographic proof of possession for the node key advertised in the
-> `Masquecat-Source` request header**, and it does not yet implement production
-> resource quotas, abuse protection, metrics, or a health endpoint. Do not
-> expose the current relay to untrusted Internet clients as a production
-> service until the registration-authentication work is complete.
+> [!IMPORTANT]
+> Peer registration uses a one-time proof-of-possession challenge. The relay
+> issues a 30-second challenge bound to source key, target key, and path mode;
+> the client proves possession of the advertised node private key before the
+> CONNECT-UDP stream is registered. A live registration is fail-closed: a
+> duplicate registration for the same node key is rejected instead of replacing
+> the existing peer.
+>
+> The relay is still experimental. Production resource quotas, abuse controls,
+> metrics, a health endpoint, live certificate reload, and horizontal shared
+> state are not implemented yet.
 
 ## Architecture
 
@@ -30,9 +34,10 @@ MasqueCat client                         MasqueCat server
                   +------------------+
                   | masquecat-relay  |
                   |                  |
-                  | routes opaque    |
-                  | WG datagrams by  |
-                  | peer node key    |
+                  | authenticates    |
+                  | node ownership   |
+                  | then routes      |
+                  | opaque WG data   |
                   +------------------+
 ```
 
@@ -42,6 +47,37 @@ not need an inbound Internet port in relay-only mode.
 The relay is **not** a generic UDP proxy. CONNECT-UDP requests use a synthetic
 MasqueCat peer target, and the relay forwards only between peer identities that
 are currently registered with the relay.
+
+## Registration authentication
+
+The first CONNECT-UDP request is intentionally unauthenticated. The relay
+responds with HTTP 401 plus:
+
+- `Masquecat-Challenge` — a random one-time challenge;
+- `Masquecat-Verifier` — the relay authentication public key.
+
+The client encrypts/seals the challenge using its node private key and the
+verifier public key, then retries with `Masquecat-Proof`.
+
+The relay accepts the retry only when the proof opens successfully and matches
+the pending challenge tuple:
+
+```text
+source node key + target node key + mode
+```
+
+Current challenge controls include:
+
+- 30-second challenge lifetime;
+- at most 1024 pending challenges globally;
+- at most 4 pending challenges per source node key;
+- at most 64 pending challenges per remote address;
+- identical unauthenticated retries reuse an existing pending challenge;
+- successful/attempted proof verification consumes the challenge;
+- an existing live node-key registration cannot be replaced by a duplicate.
+
+These controls authenticate the routing identity, but they are not a substitute
+for production bandwidth quotas, admission policy, or abuse prevention.
 
 ## Build
 
@@ -160,19 +196,18 @@ The application payload is still protected by the inner WireGuard session.
 
 The current relay has no built-in:
 
-- proof-of-possession registration authentication;
 - HTTP health endpoint;
 - Prometheus metrics;
 - per-peer bandwidth quota;
 - connection-count quota;
-- rate limiting / abuse controls;
+- configurable admission ACL;
+- general per-IP request/bandwidth rate limiting beyond authentication challenge caps;
 - live TLS certificate reload;
 - multi-relay federation or shared registry;
 - automatic horizontal state synchronization.
 
-These limitations matter for production deployment. In particular, until node
-registration is cryptographically authenticated, run the relay only in a
-trusted test environment or behind an external admission boundary.
+These limitations still matter for production deployment even though peer
+routing identities are authenticated.
 
 ## Full deployment guide
 
