@@ -82,6 +82,40 @@ func TestMasqueServerCloseBeforeStart(t *testing.T) {
 	}
 }
 
+func TestMasqueDialContextDetachesOperationAfterSuccess(t *testing.T) {
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	opCtx, cancelOperation := context.WithCancel(context.Background())
+	dialCtx, finishDial := masqueDialContext(lifecycleCtx, opCtx)
+	if !finishDial(true) {
+		t.Fatal("finishDial reported an operation cancellation before success")
+	}
+
+	cancelOperation()
+	if err := dialCtx.Err(); err != nil {
+		t.Fatalf("operation cancellation leaked into established transport: %v", err)
+	}
+
+	cancelLifecycle()
+	if err := dialCtx.Err(); err == nil {
+		t.Fatal("lifecycle cancellation did not stop established transport context")
+	}
+}
+
+func TestMasqueDialContextHonorsOperationCancellationDuringDial(t *testing.T) {
+	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
+	defer cancelLifecycle()
+	opCtx, cancelOperation := context.WithCancel(context.Background())
+	dialCtx, finishDial := masqueDialContext(lifecycleCtx, opCtx)
+
+	cancelOperation()
+	if finishDial(true) {
+		t.Fatal("finishDial detached an operation that was already canceled")
+	}
+	if err := dialCtx.Err(); err == nil {
+		t.Fatal("operation cancellation did not cancel in-flight dial context")
+	}
+}
+
 func TestMasqueClientPublicKeyStable(t *testing.T) {
 	c := NewMasqueClient("")
 	first := c.PublicKey()

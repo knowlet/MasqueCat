@@ -420,6 +420,22 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	return c.ensureStartedLocked(ctx)
 }
 
+// masqueDialContext makes an in-flight CONNECT-UDP establishment
+// cancelable by the caller without letting that one-shot operation context
+// own the established transport. Calling finish(true) is the detach point:
+// after it succeeds, only lifecycleCtx can cancel the returned context.
+func masqueDialContext(lifecycleCtx, operationCtx context.Context) (context.Context, func(bool) bool) {
+	dialCtx, cancelDial := context.WithCancel(lifecycleCtx)
+	stopOperationCancel := context.AfterFunc(operationCtx, cancelDial)
+	return dialCtx, func(keep bool) bool {
+		operationActive := stopOperationCancel()
+		if !keep || !operationActive {
+			cancelDial()
+		}
+		return operationActive
+	}
+}
+
 func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 	if c.started {
 		return nil
@@ -471,17 +487,38 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 
 	childCtx, cancel := context.WithCancel(context.Background())
 	local := priv.Public()
+	dialPath := func(rawURL string, target key.NodePublic, mode string) (*masquePath, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		dialCtx, finishDial := masqueDialContext(childCtx, ctx)
+		p, err := newMasquePath(dialCtx, rawURL, target, priv, mode, logf)
+		operationActive := finishDial(err == nil)
+		if !operationActive {
+			if p != nil {
+				_ = p.Close()
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			if err == nil {
+				return nil, context.Canceled
+			}
+		}
+		return p, err
+	}
+
 	var directErr error
 	var path *masquePath
 	var pathType MasquePathType
 	if ci.DirectURL != "" {
-		path, directErr = newMasquePath(childCtx, ci.DirectURL, ci.ServerPublic, priv, masqueModeDirect, logf)
+		path, directErr = dialPath(ci.DirectURL, ci.ServerPublic, masqueModeDirect)
 		if directErr == nil {
 			pathType = MasquePathDirect
 		}
 	}
 	if path == nil && ci.RelayURL != "" {
-		path, err = newMasquePath(childCtx, ci.RelayURL, local, priv, masqueModeRelay, logf)
+		path, err = dialPath(ci.RelayURL, local, masqueModeRelay)
 		if err != nil {
 			cancel()
 			_ = base.Close()
