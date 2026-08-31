@@ -1,0 +1,41 @@
+name: Remove unused MASQUE wrapper
+
+on:
+  push:
+    branches: [feat/masquecat-masque-transport]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Remove exact dead wrapper
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('masquecat_transport.go')
+          s = p.read_text()
+          old = '''func newMasquePath(ctx context.Context, rawURL string, requestTarget key.NodePublic, local key.NodePrivate, mode string, logf logger.Logf) (*masquePath, error) {
+          \treturn newMasquePathWithTLS(ctx, rawURL, requestTarget, local, mode, false, logf)
+          }
+
+          '''
+          if s.count(old) != 1:
+              raise SystemExit(f'wrapper matches: {s.count(old)}')
+          p.write_text(s.replace(old, '', 1))
+          PY
+          gofmt -w masquecat_transport.go
+          git diff --check
+      - name: Remove one-shot workflow
+        run: rm .github/workflows/remove-unused-masque-wrapper.yml
+      - name: Commit
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add masquecat_transport.go .github/workflows/remove-unused-masque-wrapper.yml
+          git commit -m 'fix: remove unused MASQUE TLS wrapper'
+          git push
