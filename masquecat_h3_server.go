@@ -12,7 +12,6 @@ import (
 	"sync"
 
 	"github.com/quic-go/quic-go/http3"
-	"tailscale.com/disco"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -87,7 +86,7 @@ func directMasqueHandler(local key.NodePublic, bridge *localDERPBridge, logf log
 				logf("dropping direct MASQUE datagram with mismatched peer identity")
 				continue
 			}
-			if bytes.HasPrefix(pkt.payload, disco.Magic) {
+			if bytes.HasPrefix(pkt.payload, discoMagicBytes) {
 				continue
 			}
 			if err := bridge.Inject(pkt.src, pkt.dst, pkt.payload); err != nil {
@@ -176,7 +175,7 @@ func (r *MasqueRelay) Handler() http.Handler {
 				logf("dropping relay datagram with spoofed source %v", pkt.src.ShortString())
 				continue
 			}
-			if bytes.HasPrefix(pkt.payload, disco.Magic) {
+			if bytes.HasPrefix(pkt.payload, discoMagicBytes) {
 				continue
 			}
 			dst := r.lookup(pkt.dst)
