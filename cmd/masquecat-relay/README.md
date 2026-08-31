@@ -93,15 +93,13 @@ go build -o masquecat-relay ./cmd/masquecat-relay
 
 ## Command-line flags
 
-The current binary intentionally has only three flags:
-
 | Flag | Default | Required | Meaning |
 | --- | --- | --- | --- |
 | `-listen` | `:443` | no | UDP listen address for HTTP/3 / QUIC |
-| `-cert` | empty | yes | TLS certificate PEM file |
-| `-key` | empty | yes | TLS private-key PEM file |
+| `-cert` | empty | together with `-key` for non-interactive/production use | TLS certificate PEM file |
+| `-key` | empty | together with `-cert` for non-interactive/production use | TLS private-key PEM file |
 
-Example:
+Production-style example:
 
 ```sh
 ./masquecat-relay \
@@ -122,14 +120,61 @@ For an unprivileged development port:
 Peers must then use a relay URL containing that port, for example
 `https://relay.example.com:8443`.
 
+## Interactive self-signed certificate mode
+
+If **neither** `-cert` nor `-key` is supplied and stdin is an interactive
+terminal, the relay asks:
+
+```text
+No TLS certificate configured. Generate an ephemeral self-signed certificate for this run? [y/N]
+```
+
+Answering `y` or `yes` generates an Ed25519-backed self-signed certificate in
+memory. The generated certificate:
+
+- is valid for 24 hours;
+- is not written to disk;
+- contains SANs for `localhost`, the machine hostname when available,
+  `127.0.0.1`, and `::1`;
+- is regenerated on every process start.
+
+This mode is intended for local development and trusted test environments.
+Because the certificate is self-signed, a normal MasqueCat client will reject
+it unless the CA/certificate is explicitly trusted. For deliberate development
+use, both `MasqueClient` and `MasqueServer` expose:
+
+```go
+InsecureSkipVerify: true
+```
+
+which disables TLS certificate and hostname verification for their outbound
+MASQUE connections.
+
+> [!WARNING]
+> `InsecureSkipVerify` disables server authentication and makes a connection
+> vulnerable to man-in-the-middle attacks. It is false by default. Do not use it
+> for normal Internet-facing production deployments.
+
+Fail-closed behavior is intentional:
+
+- if only one of `-cert` / `-key` is supplied, startup fails;
+- if no certificate is supplied in a non-interactive environment (systemd,
+  most containers, CI), startup fails instead of silently creating a self-signed
+  certificate;
+- declining the prompt fails startup.
+
 ## Network requirements
 
-The relay needs:
+For a normal production-like deployment the relay needs:
 
 - a stable DNS name, for example `relay.example.com`;
 - a certificate valid for that DNS name;
 - inbound **UDP** on the configured listen port, normally UDP/443;
 - return traffic allowed for established QUIC sessions.
+
+For local self-signed testing, a public DNS name is not required, but clients
+must either trust the generated certificate or explicitly opt into
+`InsecureSkipVerify`.
 
 There is no TCP listener in the current relay. A conventional HTTP/1.1 or
 HTTP/2 reverse proxy in front of the process is therefore not sufficient.
@@ -140,9 +185,9 @@ for the current implementation.
 
 ## TLS
 
-The binary loads the PEM certificate and private key at startup using
-`tls.LoadX509KeyPair`. Clients verify the relay hostname using the operating
-system trust store.
+When PEM paths are supplied, the binary loads the certificate and private key at
+startup using `tls.LoadX509KeyPair`. By default, MasqueCat clients verify the
+relay hostname using the operating-system trust store.
 
 Use a publicly trusted certificate for Internet-facing deployments, or an
 internal CA that is already trusted by every MasqueCat peer.
@@ -172,12 +217,16 @@ the host firewall.
 
 A minimal hardened unit is documented in
 [`docs/masquecat-relay-deployment.md`](../../docs/masquecat-relay-deployment.md).
+System services are non-interactive, so explicitly configure `-cert` and `-key`.
 
 ## Container deployment
 
 The repository does not currently ship a dedicated relay container image or a
 relay-specific Dockerfile. A container can run the binary, but the deployment
-must publish the port as **UDP**, not TCP, and mount the certificate/key files.
+must publish the port as **UDP**, not TCP, and should mount certificate/key
+files. Most container launches are non-interactive, so the automatic
+self-signed prompt is intentionally unavailable there.
+
 See the deployment guide for a reproducible multi-stage example.
 
 ## What the relay can observe
