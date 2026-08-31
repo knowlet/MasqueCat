@@ -40,6 +40,95 @@ receive files or text, interoperating with the CLI. Browser traffic is
 relayed over DERP only, with no direct connections until WebRTC
 support ([#4](https://github.com/tailscale/tailcat/issues/4)).
 
+## Experimental: MasqueCat transport
+
+This fork also contains an experimental transport mode called **MasqueCat**.
+MasqueCat keeps Tailcat's userspace WireGuard and gVisor netstack, but replaces
+its externally visible DERP/STUN/disco/raw-peer-UDP transport with explicit
+HTTP/3 [MASQUE CONNECT-UDP](https://www.rfc-editor.org/rfc/rfc9298) sessions.
+MasqueCat tokens use a separate `mc...` prefix.
+
+```text
+application / SSH / forwarded TCP
+              |
+        gVisor netstack
+              |
+     WireGuard end-to-end
+              |
+      wgengine / magicsock
+              |
+  loopback-only DERP compatibility bridge
+              |
+      HTTP/3 CONNECT-UDP
+              |
+        QUIC / UDP 443
+        /           \
+ direct MASQUE     MasqueCat relay
+ endpoint          endpoint
+```
+
+The internal DERP server in this diagram is a **loopback compatibility adapter**
+only. It exists so the current Tailcat `wgengine` can be reused; it is not
+published in the `mc...` token and is not intended to leave the machine.
+Tailscale disco/CallMeMaybe packets are dropped at the MASQUE boundary.
+
+MasqueCat currently supports three deployment patterns:
+
+| Mode | Server inbound requirement | Client behavior |
+| --- | --- | --- |
+| Relay-only | none | both peers make outbound QUIC/UDP 443 connections to a relay |
+| Direct-only | reachable QUIC/UDP endpoint with a valid TLS certificate | client connects directly with HTTP/3 CONNECT-UDP |
+| Direct + relay | direct endpoint plus outbound access to relay | client tries direct once, then falls back to relay at startup |
+
+This is a transport-shaping design, not an anonymity or traffic-analysis
+resistance guarantee. A passive observer can still identify QUIC/UDP traffic,
+destination IPs, timing, and sizes; the relay can see peer node keys and traffic
+metadata, while the inner WireGuard payload remains end-to-end encrypted.
+
+> [!IMPORTANT]
+> MasqueCat is still a PR-stage experiment. `cmd/masquecat-relay` is runnable,
+> and the server/client path is available through `MasqueServer` and
+> `MasqueClient`. The existing `tailcat` CLI has **not yet been fully taught to
+> consume `mc...` tokens** for every command, so examples such as
+> `tailcat ssh mc...` should not be assumed to work until that integration lands.
+
+For the full architecture, trust boundaries, token format, direct/relay path
+selection, TLS and firewall requirements, systemd relay deployment, Go examples,
+and current security/reliability limitations, see
+[docs/masquecat.md](./docs/masquecat.md).
+
+### Build the MasqueCat relay from this branch
+
+MasqueCat is not in an existing Tailcat release artifact yet. Build the PR branch
+from source:
+
+```sh
+git clone https://github.com/knowlet/tailcat.git
+cd tailcat
+git checkout feat/masquecat-masque-transport
+
+go build ./cmd/masquecat-relay
+```
+
+A relay terminates HTTP/3 itself, so the simplest deployment gives the process a
+public DNS name, a trusted TLS certificate, and inbound **UDP/443**. Do not put it
+behind a TCP-only HTTP/1.1 or HTTP/2 reverse proxy and expect CONNECT-UDP
+Datagrams to survive. A UDP/QUIC-capable pass-through load balancer is fine.
+
+Example:
+
+```sh
+sudo ./masquecat-relay \
+  -listen :443 \
+  -cert /etc/masquecat/tls/fullchain.pem \
+  -key /etc/masquecat/tls/privkey.pem
+```
+
+For relay-only mode, the MasqueCat server itself needs no inbound Internet port:
+both server and client only need outbound UDP/443 to the relay. See the
+[deployment guide](./docs/masquecat.md#deployment-patterns) for complete
+examples.
+
 ## Install
 
 Prebuilt binaries are on the
@@ -103,6 +192,10 @@ $ go build -tags "$(cat build-tags.txt)" -ldflags "-s -w" ./cmd/tailcat
 See [build-tags.md](./build-tags.md) for the details.
 
 ## Usage
+
+The commands in this section describe the original Tailcat `tc...` transport.
+For the experimental `mc...` MasqueCat API and relay deployment, see
+[docs/masquecat.md](./docs/masquecat.md).
 
 ### Pipe stdin/stdout between two machines
 
@@ -441,6 +534,11 @@ server or relays, and the only rate limits are yours. Alternatively,
 if you run a whole fleet of relays, serve your own DERP map JSON and
 point both sides at it with `--derpmap-url`.
 
+MasqueCat uses a different relay design: `cmd/masquecat-relay` is a paired
+HTTP/3 CONNECT-UDP relay keyed by MasqueCat node identities and is deliberately
+not a general-purpose UDP proxy. See [docs/masquecat.md](./docs/masquecat.md)
+for that deployment instead of configuring DERP.
+
 ### Go library
 
 A minimal server that answers any TCP port through the tunnel and
@@ -510,7 +608,15 @@ $ ./client tcomFwWCAWf933BLELdzd3RkHiOufJ...
 hello from port 80
 ```
 
-## How it works
+The equivalent experimental MasqueCat API is `MasqueServer` /
+`NewMasqueClient`; complete examples are in
+[docs/masquecat.md](./docs/masquecat.md#run-a-masquecat-server-with-the-go-api).
+
+## How Tailcat works
+
+The following describes the original `tc...` Tailcat path. MasqueCat keeps the
+WireGuard/netstack pieces but substitutes the external carrier; see
+[MasqueCat architecture and deployment](./docs/masquecat.md).
 
 ### Connection tokens
 
@@ -526,6 +632,10 @@ followed by base64-encoded [CBOR](https://cbor.io/) containing:
 
 A typical token with just an integer region ID is around 95 bytes. With embedded
 DERP node details it's longer but self-contained.
+
+MasqueCat instead uses `mc...` tokens containing the server node identity plus
+explicit direct and/or relay HTTPS URLs, with no DERP region or discovered NAT
+candidate list.
 
 ### Network stack
 
@@ -544,6 +654,10 @@ without the control plane.
 - **DERP relay** -- Tailscale's encrypted relay protocol, used as a
   rendezvous channel and as a fallback data path when direct
   connectivity isn't possible.
+
+MasqueCat reuses the same WireGuard and netstack. Its magicsock-facing DERP is
+loopback-only, while external WireGuard datagrams are carried by explicit
+HTTP/3 CONNECT-UDP paths.
 
 ### Connection flow
 
@@ -584,6 +698,11 @@ without the control plane.
    dispatched to a handler based on the port: forwarding to localhost,
    piping to stdout, running an SSH session, etc.
 
+MasqueCat changes steps 1-5 at the carrier layer: peers connect to explicitly
+configured direct/relay MASQUE endpoints, external STUN and hole punching are
+not used, and direct mode requires an already reachable QUIC endpoint.
+WireGuard and application data transfer remain end-to-end.
+
 ### Addressing
 
 Each peer currently derives a deterministic IPv6 address from its WireGuard
@@ -600,6 +719,11 @@ SLAs or throughput targets, and we may revoke access to them at any
 time, for any reason. Everything is provided best effort, without a
 contractual relationship (e.g. dedicated DERP relays and/or support)
 saying otherwise.
+
+MasqueCat is even earlier-stage: its `mc...` wire format, relay behavior, path
+selection, and API should be treated as experimental until the items listed in
+[docs/masquecat.md#current-limitations](./docs/masquecat.md#current-limitations)
+are addressed.
 
 ## Contact Sales?
 
