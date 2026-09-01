@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 jobs:
-  integrate:
+  compatibility-fixes:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch
@@ -21,74 +21,47 @@ jobs:
           ref: feat/masquecat-masque-transport
           fetch-depth: 0
 
-      - name: Patch upstream tailcat command tree
+      - name: Apply compatibility fixes
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
 
-          p = Path("cmd/tailcat/tailcat.go")
-          s = p.read_text()
-
-          def replace_once(old, new):
-              global s
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
               n = s.count(old)
               if n != 1:
-                  raise SystemExit(f"expected exactly one match, got {n}: {old[:120]!r}")
-              s = s.replace(old, new, 1)
+                  raise SystemExit(f"{path}: expected exactly one match, got {n}: {old!r}")
+              p.write_text(s.replace(old, new, 1))
 
           replace_once(
-              '\tflagDERPMapURL = rootFS.StringLong("derpmap-url", tailcat.DefaultDERPMapURL, "URL of the JSON DERP map used to resolve or auto-select a DERP region")\n',
-              '\tflagDERPMapURL = rootFS.StringLong("derpmap-url", tailcat.DefaultDERPMapURL, "URL of the JSON DERP map used to resolve or auto-select a DERP region (legacy DERP mode)")\n\tregisterMasqueCLIFlags(rootFS)\n',
+              "cmd/tailcat/masquecat_cli.go",
+              'return usagef("genkey --client with --key=default is probably a mistake; client modes automatically load client-default")',
+              'return usagef("genkey --client with --key=default is probably a mistake; use --key=client-default for the automatic client key")',
           )
+
           replace_once(
-              '\t\tShortHelp: "securely pipe or serve network connections over Tailscale\'s data plane (WireGuard®, NAT traversal), without Tailscale\'s control plane (central server, accounts)",\n',
-              '\t\tShortHelp: "securely pipe or serve network connections over end-to-end WireGuard carried by explicit HTTP/3 MASQUE paths",\n',
+              "cmd/tailcat/e2e_test.go",
+              'args := append([]string{"--key=new", "--derpmap-url=" + e.derpMapURL}, extraFlags...)',
+              'args := append([]string{"--legacy-derp", "--key=new", "--derpmap-url=" + e.derpMapURL}, extraFlags...)',
           )
+
           replace_once(
-              '\t\t\t\tShortHelp: "ping a server, reporting DERP or direct paths",\n',
-              '\t\t\t\tShortHelp: "ping a server, reporting MASQUE direct/relay or legacy DERP paths",\n',
+              "tailcat_ssh.go",
+              '\t\t\ts.lb.logf("SSH host keys: %v", err)\n',
+              '\t\t\tlogf := s.Logf\n\t\t\tif logf == nil && s.lb != nil {\n\t\t\t\tlogf = s.lb.logf\n\t\t\t}\n\t\t\tif logf != nil {\n\t\t\t\tlogf("SSH host keys: %v", err)\n\t\t\t}\n',
           )
-          replace_once(
-              '\t\t\treturn clientMode(getLogf(), string(addrBlobArg(args[0])), dst)\n',
-              '\t\t\tblob := string(addrBlobArg(args[0]))\n\t\t\tif isMasqueBlob(blob) {\n\t\t\t\treturn masqueClientMode(getLogf(), blob, dst)\n\t\t\t}\n\t\t\treturn clientMode(getLogf(), blob, dst)\n',
-          )
-          replace_once(
-              '\tif !strings.HasPrefix(arg, "tc") {\n\t\tlog.Fatalf("argument %q is neither a \\"tc\\"-prefixed address blob nor a DNS name", arg)\n\t}\n',
-              '\tif !strings.HasPrefix(arg, "tc") && !strings.HasPrefix(arg, "mc") {\n\t\tlog.Fatalf("argument %q is neither a \\"tc\\"/\\"mc\\"-prefixed address blob nor a DNS name", arg)\n\t}\n',
-          )
-          replace_once(
-              '\tcl := newClient(logf, addrBlobArg(args[0]), clientKey())\n\tdefer cl.Close()\n',
-              '\tblob := addrBlobArg(args[0])\n\tif isMasqueBlob(string(blob)) {\n\t\treturn masqueClientPingMode(logf, untilDirect, timeout, string(blob))\n\t}\n\tcl := newClient(logf, blob, clientKey())\n\tdefer cl.Close()\n',
-          )
-          replace_once(
-              'func clientParseMode(args []string) error {\n\tif len(args) != 1 {\n\t\treturn usagef("parse requires one <addrblob> argument")\n\t}\n\tv, err := tailcat.ParseConnBlobRaw(tailcat.ConnBlob(args[0]))\n',
-              'func clientParseMode(args []string) error {\n\tif len(args) != 1 {\n\t\treturn usagef("parse requires one <addrblob> argument")\n\t}\n\tif isMasqueBlob(args[0]) {\n\t\treturn masqueClientParseMode(args[0])\n\t}\n\tv, err := tailcat.ParseConnBlobRaw(tailcat.ConnBlob(args[0]))\n',
-          )
-          replace_once(
-              'func clientResolveMode(args []string) error {\n\tif len(args) != 1 {\n\t\treturn usagef("resolve requires one <addrblob> argument")\n\t}\n\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n',
-              'func clientResolveMode(args []string) error {\n\tif len(args) != 1 {\n\t\treturn usagef("resolve requires one <addrblob> argument")\n\t}\n\tif isMasqueBlob(args[0]) {\n\t\treturn masqueClientResolveMode(args[0])\n\t}\n\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n',
-          )
-          replace_once(
-              'func server(logf logger.Logf, serveSpec string) {\n\tportSet, services, err := parsePortSet(serveSpec)\n',
-              'func server(logf logger.Logf, serveSpec string) {\n\tif flagLegacyDERP != nil && !*flagLegacyDERP {\n\t\tif err := masqueServer(logf, serveSpec); err != nil {\n\t\t\tlog.Fatal(err)\n\t\t}\n\t\treturn\n\t}\n\tportSet, services, err := parsePortSet(serveSpec)\n',
-          )
-          replace_once(
-              'func genKey(args []string) error {\n\tif *flagKey != "" {\n\t\treturn usagef("genkey\'s --key argument must be after \\"genkey\\"")\n\t}\n',
-              'func genKey(args []string) error {\n\tif *flagKey != "" {\n\t\treturn usagef("genkey\'s --key argument must be after \\"genkey\\"")\n\t}\n\tif flagLegacyDERP != nil && !*flagLegacyDERP {\n\t\treturn masqueGenKey(args)\n\t}\n',
-          )
-          p.write_text(s)
           PY
 
-      - name: Format and commit integration
+      - name: Format and commit
         run: |
           set -euxo pipefail
-          gofmt -w cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go cmd/tailcat/masquecat_cli_test.go
-          go mod tidy
+          gofmt -w cmd/tailcat/masquecat_cli.go cmd/tailcat/e2e_test.go tailcat_ssh.go
           git diff --check
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go cmd/tailcat/masquecat_cli_test.go go.mod go.sum
-          git commit -m "feat: make MasqueCat the tailcat-compatible CLI transport"
+          git add cmd/tailcat/masquecat_cli.go cmd/tailcat/e2e_test.go tailcat_ssh.go
+          git commit -m "fix: preserve legacy CLI tests and Masque SSH logging"
           git push origin HEAD:feat/masquecat-masque-transport
