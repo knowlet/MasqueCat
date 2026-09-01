@@ -1,0 +1,41 @@
+name: oneoff-rebase-upstream
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/masquecat-masque-transport
+    paths:
+      - .github/workflows/oneoff-rebase-upstream.yml
+
+permissions:
+  contents: write
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/masquecat-masque-transport
+          fetch-depth: 0
+
+      - name: Rebase onto latest tailscale/tailcat main
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/tailscale/tailcat.git
+          git fetch upstream main
+          echo "upstream main: $(git rev-parse upstream/main)"
+          echo "branch before: $(git rev-parse HEAD)"
+          if ! git rebase upstream/main; then
+            echo "::error::Rebase conflicts detected"
+            git status --short
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+          echo "branch after: $(git rev-parse HEAD)"
+          git push --force-with-lease origin HEAD:feat/masquecat-masque-transport
