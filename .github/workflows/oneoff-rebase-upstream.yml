@@ -1,4 +1,4 @@
-name: oneoff-tailcat-cli-integration
+name: oneoff-tailcat-cli-verification
 
 on:
   workflow_dispatch:
@@ -8,11 +8,8 @@ on:
     paths:
       - .github/workflows/oneoff-rebase-upstream.yml
 
-permissions:
-  contents: write
-
 jobs:
-  compatibility-fixes:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch
@@ -21,47 +18,42 @@ jobs:
           ref: feat/masquecat-masque-transport
           fetch-depth: 0
 
-      - name: Apply compatibility fixes
+      - name: Verify formatting and modules
         shell: bash
         run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
+          set -euxo pipefail
+          test -z "$(gofmt -l cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go cmd/tailcat/masquecat_cli_test.go cmd/tailcat/e2e_test.go tailcat_ssh.go)"
+          cp go.mod /tmp/go.mod.before
+          cp go.sum /tmp/go.sum.before
+          go mod tidy
+          cmp go.mod /tmp/go.mod.before
+          cmp go.sum /tmp/go.sum.before
+          git diff --check
 
-          def replace_once(path, old, new):
-              p = Path(path)
-              s = p.read_text()
-              n = s.count(old)
-              if n != 1:
-                  raise SystemExit(f"{path}: expected exactly one match, got {n}: {old!r}")
-              p.write_text(s.replace(old, new, 1))
+      - name: Test repository
+        run: go test -count=1 -timeout 600s ./...
 
-          replace_once(
-              "cmd/tailcat/masquecat_cli.go",
-              'return usagef("genkey --client with --key=default is probably a mistake; client modes automatically load client-default")',
-              'return usagef("genkey --client with --key=default is probably a mistake; use --key=client-default for the automatic client key")',
-          )
-
-          replace_once(
-              "cmd/tailcat/e2e_test.go",
-              'args := append([]string{"--key=new", "--derpmap-url=" + e.derpMapURL}, extraFlags...)',
-              'args := append([]string{"--legacy-derp", "--key=new", "--derpmap-url=" + e.derpMapURL}, extraFlags...)',
-          )
-
-          replace_once(
-              "tailcat_ssh.go",
-              '\t\t\ts.lb.logf("SSH host keys: %v", err)\n',
-              '\t\t\tlogf := s.Logf\n\t\t\tif logf == nil && s.lb != nil {\n\t\t\t\tlogf = s.lb.logf\n\t\t\t}\n\t\t\tif logf != nil {\n\t\t\t\tlogf("SSH host keys: %v", err)\n\t\t\t}\n',
-          )
-          PY
-
-      - name: Format and commit
+      - name: Build runnable binaries
+        shell: bash
         run: |
           set -euxo pipefail
-          gofmt -w cmd/tailcat/masquecat_cli.go cmd/tailcat/e2e_test.go tailcat_ssh.go
-          git diff --check
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add cmd/tailcat/masquecat_cli.go cmd/tailcat/e2e_test.go tailcat_ssh.go
-          git commit -m "fix: preserve legacy CLI tests and Masque SSH logging"
-          git push origin HEAD:feat/masquecat-masque-transport
+          mkdir -p /tmp/masquecat-bin
+          go build -o /tmp/masquecat-bin/tailcat ./cmd/tailcat
+          go build -o /tmp/masquecat-bin/masquecat-relay ./cmd/masquecat-relay
+          test -x /tmp/masquecat-bin/tailcat
+          test -x /tmp/masquecat-bin/masquecat-relay
+
+      - name: Smoke Tailcat-compatible CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          /tmp/masquecat-bin/tailcat --help | grep -q -- '--relay-url'
+          /tmp/masquecat-bin/tailcat --help | grep -q -- '--legacy-derp'
+          /tmp/masquecat-bin/tailcat --help | grep -q -- 'serve'
+          /tmp/masquecat-bin/tailcat --help | grep -q -- 'ssh'
+          set +e
+          out="$(env -u MASQUECAT_RELAY_URL -u MASQUECAT_DIRECT_URL /tmp/masquecat-bin/tailcat 2>&1)"
+          rc=$?
+          set -e
+          test "$rc" -ne 0
+          printf '%s\n' "$out" | grep -q 'MasqueCat server needs an explicit endpoint'
