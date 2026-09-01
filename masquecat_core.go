@@ -339,7 +339,7 @@ func newMasqueCore(priv key.NodePrivate, opts masqueCoreOptions, logf logger.Log
 	}
 	if err := st.SetSpoofing(masqueCoreNIC, true); err != nil {
 		st.Close()
-		return nil, fmt.Errorf("masquecat: enable gVisor spoofing: %v", err)
+		return nil, fmt.Errorf("masquecat: enable gVisor spoofing mode: %v", err)
 	}
 	v4Subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice(make([]byte, 4)), tcpip.MaskFromBytes(make([]byte, 4)))
 	if err != nil {
@@ -542,6 +542,46 @@ func (c *masqueCore) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn,
 	}, proto)
 }
 
+func resolveMasqueTCPAddrs(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	if ip, err := netip.ParseAddr(host); err == nil {
+		switch network {
+		case "tcp4":
+			if !ip.Is4() {
+				return nil, fmt.Errorf("masquecat: %q is not an IPv4 address", host)
+			}
+		case "tcp6":
+			if !ip.Is6() || ip.Is4In6() {
+				return nil, fmt.Errorf("masquecat: %q is not an IPv6 address", host)
+			}
+		}
+		return []netip.Addr{ip.Unmap()}, nil
+	}
+
+	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, fmt.Errorf("masquecat: resolve %q: %w", host, err)
+	}
+	out := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		ip = ip.Unmap()
+		switch network {
+		case "tcp4":
+			if !ip.Is4() {
+				continue
+			}
+		case "tcp6":
+			if !ip.Is6() || ip.Is4() {
+				continue
+			}
+		}
+		out = append(out, ip)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("masquecat: no addresses for %q match network %q", host, network)
+	}
+	return out, nil
+}
+
 func (c *masqueCore) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	switch network {
 	case "tcp", "tcp4", "tcp6":
@@ -552,10 +592,6 @@ func (c *masqueCore) Dial(ctx context.Context, network, addr string) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	ip, err := netip.ParseAddr(host)
-	if err != nil {
-		return nil, fmt.Errorf("masquecat: destination must be an IP address, got %q: %w", host, err)
-	}
 	port, err := net.LookupPort("tcp", portText)
 	if err != nil {
 		return nil, err
@@ -563,7 +599,22 @@ func (c *masqueCore) Dial(ctx context.Context, network, addr string) (net.Conn, 
 	if port < 0 || port > 65535 {
 		return nil, fmt.Errorf("masquecat: invalid TCP port %d", port)
 	}
-	return c.DialTCP(ctx, netip.AddrPortFrom(ip, uint16(port)))
+	ips, err := resolveMasqueTCPAddrs(ctx, network, host)
+	if err != nil {
+		return nil, err
+	}
+	var errs []error
+	for _, ip := range ips {
+		conn, err := c.DialTCP(ctx, netip.AddrPortFrom(ip, uint16(port)))
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", ip, err))
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, fmt.Errorf("masquecat: dial %s: %w", addr, errors.Join(errs...))
 }
 
 func (c *masqueCore) Ping(ctx context.Context, peer key.NodePublic) (PingResult, error) {
@@ -576,12 +627,31 @@ func (c *masqueCore) Ping(ctx context.Context, peer key.NodePublic) (PingResult,
 	return PingResult{Latency: time.Since(start)}, nil
 }
 
+func masqueTCPStateNeedsDrain(state tcp.EndpointState) bool {
+	switch state {
+	case tcp.StateConnecting,
+		tcp.StateSynSent,
+		tcp.StateSynRecv,
+		tcp.StateEstablished,
+		tcp.StateFinWait1,
+		tcp.StateFinWait2,
+		tcp.StateClosing,
+		tcp.StateCloseWait,
+		tcp.StateLastAck:
+		return true
+	default:
+		// LISTEN sockets and TIME_WAIT endpoints don't carry application data;
+		// initial/bound/closed/error states likewise don't need graceful drain.
+		return false
+	}
+}
+
 func (c *masqueCore) DrainTCP(ctx context.Context) error {
 	for {
 		var active bool
 		for _, tep := range c.stack.RegisteredEndpoints() {
 			ep, ok := tep.(interface{ State() uint32 })
-			if ok && tcp.EndpointState(ep.State()) == tcp.StateEstablished {
+			if ok && masqueTCPStateNeedsDrain(tcp.EndpointState(ep.State())) {
 				active = true
 				break
 			}
@@ -598,7 +668,33 @@ func (c *masqueCore) DrainTCP(ctx context.Context) error {
 }
 
 func (c *masqueCore) Status() *ipnstate.Status {
-	return &ipnstate.Status{}
+	c.mu.Lock()
+	peers := make([]key.NodePublic, 0, len(c.peers))
+	for peer := range c.peers {
+		peers = append(peers, peer)
+	}
+	c.mu.Unlock()
+
+	st := &ipnstate.Status{
+		TUN:          false,
+		BackendState: "Running",
+		HaveNodeKey:  true,
+		TailscaleIPs: []netip.Addr{c.addr},
+		Self: &ipnstate.PeerStatus{
+			PublicKey:    c.pub,
+			TailscaleIPs: []netip.Addr{c.addr},
+			InEngine:     true,
+		},
+		Peer: make(map[key.NodePublic]*ipnstate.PeerStatus, len(peers)),
+	}
+	for _, peer := range peers {
+		st.Peer[peer] = &ipnstate.PeerStatus{
+			PublicKey:    peer,
+			TailscaleIPs: []netip.Addr{tcAddrForKey(peer)},
+			InEngine:     true,
+		}
+	}
+	return st
 }
 
 func (c *masqueCore) Close() error {
