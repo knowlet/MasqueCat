@@ -51,11 +51,10 @@ jobs:
                   git checkout --theirs -- "$f"
                   git add "$f"
                   ;;
-                tailcat.go)
-                  # This replayed commit contains broad historical cleanup in
-                  # addition to the self-hosted-default changes. Keep today's
-                  # upstream core here; the intended no-default-relay behavior
-                  # is reapplied as a small focused patch after the rebase.
+                tailcat.go|tailcat_test.go|.github/workflows/test.yml)
+                  # Preserve the latest upstream core/tests. MasqueCat-specific
+                  # behavior and validation live in dedicated files and are
+                  # reapplied/verified after the rebase.
                   git checkout --ours -- "$f"
                   git add "$f"
                   ;;
