@@ -166,10 +166,19 @@ DirectURL configured?
                                       +-- no --> fail startup
 ```
 
-There is currently no continuous path racing, STUN candidate search, automatic
-path migration, or reconnect/failover after the selected MASQUE session later
-dies. Those are separate reliability features that can be added without
-reintroducing external disco/STUN behavior.
+After startup, the selected MASQUE carrier is persistent rather than one-shot.
+The QUIC connection sends keepalive traffic during idle periods, and a failed
+CONNECT-UDP session is redialed to the **same explicitly selected endpoint**.
+Reconnect re-runs the normal TLS and node-key challenge authentication and uses
+capped exponential backoff. The `masquePath` forwarder object remains stable, so
+wgengine, WireGuard state, and the loopback DERP compatibility bridge do not need
+to be rebuilt when the outer carrier is replaced.
+
+There is still no continuous path racing, STUN candidate search, automatic path
+migration, or runtime direct-to-relay failover. A path selected as direct
+reconnects to its configured `DirectURL`; a relay path reconnects to its
+configured `RelayURL`. These reliability rules do not reintroduce external
+disco/STUN behavior.
 
 `MasqueClient.Path()` reports the selected path as `direct-masque` or
 `relay-masque` after startup.
@@ -234,6 +243,8 @@ RelayURL:  "https://relay.example.com",
 The client tries the direct endpoint once. If establishing the direct
 CONNECT-UDP session fails, it connects to the relay. This preserves predictable
 network behavior: MasqueCat does not probe arbitrary candidates to find a path.
+Runtime failure of an already-selected direct path currently reconnects that
+direct endpoint; it does not switch to the relay yet.
 
 ## Network requirements
 
@@ -283,8 +294,8 @@ s.InsecureSkipVerify = true // outbound RelayURL only
 > [!WARNING]
 > `InsecureSkipVerify` removes TLS server authentication and permits active
 > man-in-the-middle attacks. It is intended only for explicitly trusted test
-> environments. Normal Internet-facing deployments should use a trusted
-> certificate instead.
+environments. Normal Internet-facing deployments should use a trusted
+certificate instead.
 
 Custom per-client root CA configuration is not exposed by the first-cut
 `MasqueClient` API yet.
@@ -550,7 +561,7 @@ Useful current log events include:
 
 - `direct MASQUE peer connected`;
 - `MASQUE relay peer registered`;
-- direct / relay receive-loop failures;
+- MASQUE transport receive failures and reconnect attempts/successes;
 - malformed or identity-mismatched datagram drops;
 - the selected path through `MasqueClient.Path()`.
 
@@ -562,7 +573,7 @@ and explicit path-failover telemetry are not implemented in this first slice.
 The first implementation intentionally keeps scope narrow. Before calling it a
 production transport, at least the following should be addressed:
 
-- automatic reconnect and direct/relay failover after startup;
+- runtime direct-to-relay failover / path migration after startup;
 - end-to-end direct and relay tests with real WireGuard/TCP traffic;
 - complete `mc...` integration into the `tailcat` CLI, including SSH, serve,
   ping, parse, and saved-key workflows;
