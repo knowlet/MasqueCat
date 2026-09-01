@@ -207,7 +207,7 @@ func (e *testEnv) cmd(args ...string) *exec.Cmd {
 // so callers can wire up pipes before starting it.
 func (e *testEnv) serverCmd(extraFlags ...string) (*exec.Cmd, string) {
 	addrFile := filepath.Join(e.t.TempDir(), "addr")
-	args := append([]string{"--key=new", "--derpmap-url=" + e.derpMapURL}, extraFlags...)
+	args := append([]string{"--legacy-derp", "--key=new", "--derpmap-url=" + e.derpMapURL}, extraFlags...)
 	cmd := e.cmd(args...)
 	cmd.Env = append(cmd.Env, "TAILCAT_ADDR_FILE="+addrFile)
 	return cmd, addrFile

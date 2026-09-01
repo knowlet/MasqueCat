@@ -429,7 +429,7 @@ func masqueGenKey(args []string) error {
 		}
 	}
 	if *genkeyClient && *genkeyKey == "default" {
-		return usagef("genkey --client with --key=default is probably a mistake; client modes automatically load client-default")
+		return usagef("genkey --client with --key=default is probably a mistake; use --key=client-default for the automatic client key")
 	}
 
 	path := *genkeyKey

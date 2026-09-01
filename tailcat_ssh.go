@@ -51,7 +51,13 @@ func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
 	return func(c net.Conn) {
 		keys, err := getHostKeys()
 		if err != nil {
-			s.lb.logf("SSH host keys: %v", err)
+			logf := s.Logf
+			if logf == nil && s.lb != nil {
+				logf = s.lb.logf
+			}
+			if logf != nil {
+				logf("SSH host keys: %v", err)
+			}
 			c.Close()
 			return
 		}
