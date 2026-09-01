@@ -24,18 +24,43 @@ jobs:
       - name: Rebase onto latest tailscale/tailcat main
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/tailscale/tailcat.git
           git fetch upstream main
           echo "upstream main: $(git rev-parse upstream/main)"
           echo "branch before: $(git rev-parse HEAD)"
-          if ! git rebase upstream/main; then
-            echo "::error::Rebase conflicts detected"
-            git status --short
-            git diff --name-only --diff-filter=U
-            exit 1
-          fi
+
+          set +e
+          GIT_EDITOR=true git rebase upstream/main
+          rc=$?
+          set -e
+          while [ "$rc" -ne 0 ]; do
+            conflicts="$(git diff --name-only --diff-filter=U)"
+            echo "rebase conflicts:"
+            printf '%s\n' "$conflicts"
+            [ -n "$conflicts" ] || exit "$rc"
+            for f in $conflicts; do
+              case "$f" in
+                go.mod|go.sum)
+                  # Keep the MasqueCat dependency additions from the replayed
+                  # commit. A final `go mod tidy` after the rebase reconciles
+                  # these with the newer upstream dependency graph.
+                  git checkout --theirs -- "$f"
+                  git add "$f"
+                  ;;
+                *)
+                  echo "::error::Unexpected rebase conflict in $f"
+                  exit 1
+                  ;;
+              esac
+            done
+            set +e
+            GIT_EDITOR=true git rebase --continue
+            rc=$?
+            set -e
+          done
+
           echo "branch after: $(git rev-parse HEAD)"
           git push --force-with-lease origin HEAD:feat/masquecat-masque-transport
