@@ -4,9 +4,9 @@ package tailcat
 
 import (
 	"bytes"
-	"net"
 	"testing"
 
+	"github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/types/key"
 )
 
@@ -69,10 +69,7 @@ func TestMasqueBindInjectFeedsWireGuardReceive(t *testing.T) {
 	}
 	packets := [][]byte{make([]byte, 2048)}
 	sizes := make([]int, 1)
-	eps := make([]interfaceEndpoint, 0)
-	_ = eps
-
-	wireEndpoints := makeEndpointSlice(1)
+	wireEndpoints := make([]conn.Endpoint, 1)
 	n, err := receive[0](packets, sizes, wireEndpoints)
 	if err != nil {
 		t.Fatalf("receive: %v", err)
@@ -88,16 +85,3 @@ func TestMasqueBindInjectFeedsWireGuardReceive(t *testing.T) {
 		t.Fatalf("received endpoint = %#v, want peer %v", wireEndpoints[0], peer)
 	}
 }
-
-// Keep conn.Endpoint imports out of the production-facing test declarations
-// above so the assertions stay focused on MasqueCat semantics.
-type interfaceEndpoint = interface {
-	ClearSrc()
-	SrcToString() string
-	DstToString() string
-	DstToBytes() []byte
-	DstIP() net.IP
-	SrcIP() net.IP
-}
-
-func makeEndpointSlice(n int) []interfaceEndpoint { return make([]interfaceEndpoint, n) }
