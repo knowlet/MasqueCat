@@ -5,15 +5,21 @@ package tailcat
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"net"
 	"net/http/httptest"
 	"strconv"
 	"sync"
+	"time"
 
 	"tailscale.com/derp"
 	"tailscale.com/derp/derpserver"
@@ -26,6 +32,8 @@ import (
 // This DERP node exists only on loopback; it is a compatibility seam between
 // Tailcat's existing magicsock-backed wgengine and the external MASQUE paths.
 const localDERPRegionID tailcfg.DERPRegionID = 999
+
+const localDERPHostName = "masquecat-loopback.invalid"
 
 type localDERPBridge struct {
 	server *derpserver.Server
@@ -96,8 +104,15 @@ func newLocalDERPBridge(logf logger.Logf) (*localDERPBridge, error) {
 
 	// Use a loopback TLS DERP server for magicsock itself. CertName's
 	// sha256-raw pin lets magicsock authenticate the ephemeral self-signed cert
-	// without disabling TLS verification.
+	// without disabling TLS verification. tlsdial still verifies the advertised
+	// hostname after checking the pin, so the certificate must carry that name.
+	derpCert, err := generateLoopbackDERPCert()
+	if err != nil {
+		_ = b.Close()
+		return nil, fmt.Errorf("generate local DERP TLS certificate: %w", err)
+	}
 	ts := httptest.NewUnstartedServer(derpserver.Handler(s))
+	ts.TLS = &tls.Config{Certificates: []tls.Certificate{derpCert}}
 	ts.StartTLS()
 	b.http = ts
 
@@ -124,7 +139,7 @@ func newLocalDERPBridge(logf logger.Logf) (*localDERPBridge, error) {
 		Nodes: []*tailcfg.DERPNode{{
 			Name:     "mc-local-1",
 			RegionID: localDERPRegionID,
-			HostName: "masquecat-loopback.invalid",
+			HostName: localDERPHostName,
 			CertName: "sha256-raw:" + hex.EncodeToString(certHash[:]),
 			IPv4:     "127.0.0.1",
 			IPv6:     "none",
@@ -133,6 +148,37 @@ func newLocalDERPBridge(logf logger.Logf) (*localDERPBridge, error) {
 		}},
 	}
 	return b, nil
+}
+
+func generateLoopbackDERPCert() (tls.Certificate, error) {
+	publicKey, privateKey, err := ed25519.GenerateKey(crand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: localDERPHostName,
+		},
+		NotBefore: now.Add(-time.Minute),
+		NotAfter:  now.Add(24 * time.Hour),
+		KeyUsage:  x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageServerAuth,
+		},
+		DNSNames:    []string{localDERPHostName, "localhost"},
+		IPAddresses: []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	der, err := x509.CreateCertificate(crand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  privateKey,
+	}, nil
 }
 
 func (b *localDERPBridge) Region() *tailcfg.DERPRegion { return b.region }
