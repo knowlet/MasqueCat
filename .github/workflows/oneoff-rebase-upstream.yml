@@ -1,4 +1,4 @@
-name: oneoff-rebase-upstream
+name: oneoff-tailcat-cli-integration
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 jobs:
-  rebase:
+  integrate-and-test:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch
@@ -21,54 +21,97 @@ jobs:
           ref: feat/masquecat-masque-transport
           fetch-depth: 0
 
-      - name: Rebase onto latest tailscale/tailcat main
+      - name: Patch upstream tailcat command tree
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("cmd/tailcat/tailcat.go")
+          s = p.read_text()
+
+          def replace_once(old, new):
+              global s
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f"expected exactly one match, got {n}: {old[:120]!r}")
+              s = s.replace(old, new, 1)
+
+          replace_once(
+              '\tflagDERPMapURL = rootFS.StringLong("derpmap-url", tailcat.DefaultDERPMapURL, "URL of the JSON DERP map used to resolve or auto-select a DERP region")\n',
+              '\tflagDERPMapURL = rootFS.StringLong("derpmap-url", tailcat.DefaultDERPMapURL, "URL of the JSON DERP map used to resolve or auto-select a DERP region (legacy DERP mode)")\n\tregisterMasqueCLIFlags(rootFS)\n',
+          )
+          replace_once(
+              '\t\tShortHelp: "securely pipe or serve network connections over Tailscale\'s data plane (WireGuard®, NAT traversal), without Tailscale\'s control plane (central server, accounts)",\n',
+              '\t\tShortHelp: "securely pipe or serve network connections over end-to-end WireGuard carried by explicit HTTP/3 MASQUE paths",\n',
+          )
+          replace_once(
+              '\t\t\t\tShortHelp: "ping a server, reporting DERP or direct paths",\n',
+              '\t\t\t\tShortHelp: "ping a server, reporting MASQUE direct/relay or legacy DERP paths",\n',
+          )
+          replace_once(
+              '\t\t\treturn clientMode(getLogf(), string(addrBlobArg(args[0])), dst)\n',
+              '\t\t\tblob := string(addrBlobArg(args[0]))\n\t\t\tif isMasqueBlob(blob) {\n\t\t\t\treturn masqueClientMode(getLogf(), blob, dst)\n\t\t\t}\n\t\t\treturn clientMode(getLogf(), blob, dst)\n',
+          )
+          replace_once(
+              '\tif !strings.HasPrefix(arg, "tc") {\n\t\tlog.Fatalf("argument %q is neither a \\"tc\\"-prefixed address blob nor a DNS name", arg)\n\t}\n',
+              '\tif !strings.HasPrefix(arg, "tc") && !strings.HasPrefix(arg, "mc") {\n\t\tlog.Fatalf("argument %q is neither a \\"tc\\"/\\"mc\\"-prefixed address blob nor a DNS name", arg)\n\t}\n',
+          )
+          replace_once(
+              '\tcl := newClient(logf, addrBlobArg(args[0]), clientKey())\n\tdefer cl.Close()\n',
+              '\tblob := addrBlobArg(args[0])\n\tif isMasqueBlob(string(blob)) {\n\t\treturn masqueClientPingMode(logf, untilDirect, timeout, string(blob))\n\t}\n\tcl := newClient(logf, blob, clientKey())\n\tdefer cl.Close()\n',
+          )
+          replace_once(
+              'func clientParseMode(args []string) error {\n\tif len(args) != 1 {\n\t\treturn usagef("parse requires one <addrblob> argument")\n\t}\n\tv, err := tailcat.ParseConnBlobRaw(tailcat.ConnBlob(args[0]))\n',
+              'func clientParseMode(args []string) error {\n\tif len(args) != 1 {\n\t\treturn usagef("parse requires one <addrblob> argument")\n\t}\n\tif isMasqueBlob(args[0]) {\n\t\treturn masqueClientParseMode(args[0])\n\t}\n\tv, err := tailcat.ParseConnBlobRaw(tailcat.ConnBlob(args[0]))\n',
+          )
+          replace_once(
+              'func clientResolveMode(args []string) error {\n\tif len(args) != 1 {\n\t\treturn usagef("resolve requires one <addrblob> argument")\n\t}\n\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n',
+              'func clientResolveMode(args []string) error {\n\tif len(args) != 1 {\n\t\treturn usagef("resolve requires one <addrblob> argument")\n\t}\n\tif isMasqueBlob(args[0]) {\n\t\treturn masqueClientResolveMode(args[0])\n\t}\n\tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)\n',
+          )
+          replace_once(
+              'func server(logf logger.Logf, serveSpec string) {\n\tportSet, services, err := parsePortSet(serveSpec)\n',
+              'func server(logf logger.Logf, serveSpec string) {\n\tif flagLegacyDERP != nil && !*flagLegacyDERP {\n\t\tif err := masqueServer(logf, serveSpec); err != nil {\n\t\t\tlog.Fatal(err)\n\t\t}\n\t\treturn\n\t}\n\tportSet, services, err := parsePortSet(serveSpec)\n',
+          )
+          replace_once(
+              'func genKey(args []string) error {\n\tif *flagKey != "" {\n\t\treturn usagef("genkey\'s --key argument must be after \\"genkey\\"")\n\t}\n',
+              'func genKey(args []string) error {\n\tif *flagKey != "" {\n\t\treturn usagef("genkey\'s --key argument must be after \\"genkey\\"")\n\t}\n\tif flagLegacyDERP != nil && !*flagLegacyDERP {\n\t\treturn masqueGenKey(args)\n\t}\n',
+          )
+
+          p.write_text(s)
+          PY
+
+      - name: Format and reconcile module files
+        run: |
+          set -euxo pipefail
+          gofmt -w cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go cmd/tailcat/masquecat_cli_test.go
+          go mod tidy
+          git diff --check
+
+      - name: Test
+        run: go test -count=1 -timeout 600s ./...
+
+      - name: Build user-facing executables
+        run: |
+          set -euxo pipefail
+          mkdir -p /tmp/masquecat-bin
+          go build -o /tmp/masquecat-bin/tailcat ./cmd/tailcat
+          go build -o /tmp/masquecat-bin/masquecat-relay ./cmd/masquecat-relay
+          test -x /tmp/masquecat-bin/tailcat
+          test -x /tmp/masquecat-bin/masquecat-relay
+          /tmp/masquecat-bin/tailcat --help | grep -q -- '--relay-url'
+          /tmp/masquecat-bin/tailcat --help | grep -q -- '--legacy-derp'
+
+      - name: Commit integration
+        run: |
+          set -euxo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/tailscale/tailcat.git
-          git fetch upstream main
-          echo "upstream main: $(git rev-parse upstream/main)"
-          echo "branch before: $(git rev-parse HEAD)"
-
-          set +e
-          GIT_EDITOR=true git rebase upstream/main
-          rc=$?
-          set -e
-          while [ "$rc" -ne 0 ]; do
-            conflicts="$(git diff --name-only --diff-filter=U)"
-            echo "rebase conflicts:"
-            printf '%s\n' "$conflicts"
-            [ -n "$conflicts" ] || exit "$rc"
-            for f in $conflicts; do
-              case "$f" in
-                go.mod|go.sum)
-                  git checkout --theirs -- "$f"
-                  git add "$f"
-                  ;;
-                README.md)
-                  git checkout --theirs -- "$f"
-                  git add "$f"
-                  ;;
-                tailcat.go|tailcat_test.go|.github/workflows/test.yml)
-                  # Preserve the latest upstream core/tests. MasqueCat-specific
-                  # behavior and validation live in dedicated files and are
-                  # reapplied/verified after the rebase.
-                  git checkout --ours -- "$f"
-                  git add "$f"
-                  ;;
-                *)
-                  echo "::error::Unexpected rebase conflict in $f"
-                  exit 1
-                  ;;
-              esac
-            done
-            set +e
-            GIT_EDITOR=true git rebase --continue
-            rc=$?
-            set -e
-          done
-
-          echo "branch after: $(git rev-parse HEAD)"
-          git push --force-with-lease origin HEAD:feat/masquecat-masque-transport
+          git add cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go cmd/tailcat/masquecat_cli_test.go go.mod go.sum
+          if git diff --cached --quiet; then
+            echo "nothing to commit"
+            exit 0
+          fi
+          git commit -m "feat: make MasqueCat the tailcat-compatible CLI transport"
+          git push origin HEAD:feat/masquecat-masque-transport
