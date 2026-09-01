@@ -1,24 +1,22 @@
 # MasqueCat
 
-MasqueCat is an experimental fork of Tailcat that keeps the useful userspace
-WireGuard + gVisor netstack model while replacing the externally visible
+MasqueCat is an experimental Tailcat fork that keeps the useful userspace
+WireGuard + gVisor model while replacing Tailcat's external
 DERP/STUN/disco/raw-peer-UDP transport with explicit HTTP/3 MASQUE
 CONNECT-UDP paths.
 
-The design goal is a small remote-access tool with a Tailcat-like experience:
+The MasqueCat runtime data plane is now independent of Tailscale `magicsock`:
 
 ```text
 application / SSH / forwarded TCP
               |
         gVisor netstack
               |
-     WireGuard end-to-end
+     wireguard-go Device
               |
-      wgengine / magicsock
+          MasqueBind
               |
-  loopback-only compatibility bridge
-              |
-      MasqueCat datagram framing
+      MasqueCat framing
               |
       HTTP/3 CONNECT-UDP
               |
@@ -28,33 +26,54 @@ application / SSH / forwarded TCP
  endpoint          endpoint
 ```
 
+`MasqueBind` is a `wireguard-go/conn.Bind` implementation. WireGuard sees each
+peer as a logical node-key endpoint; the bind selects an explicit MASQUE path
+instead of opening a WireGuard UDP socket or delegating transport to magicsock.
+
+The original Tailcat `tc...` code remains in this repository and still uses the
+upstream Tailscale data plane. That legacy implementation is separate from the
+MasqueCat `mc...` runtime.
+
+## External network behavior
+
+When `MasqueServer` / `MasqueClient` are used, MasqueCat does **not** initialize:
+
+- `magicsock.Conn`;
+- DERP clients or a local DERP compatibility server;
+- netcheck;
+- STUN discovery;
+- Tailscale disco / CallMeMaybe exchange;
+- endpoint candidate probing or UDP hole punching;
+- a raw peer WireGuard UDP socket.
+
+The intended Internet-facing transport is the independently configured MASQUE
+HTTP/3 connection over QUIC/UDP, normally UDP port 443.
+
+This is a transport design, not an anonymity guarantee. A network observer can
+still see QUIC traffic, endpoint addresses, packet sizes, timing and connection
+lifetimes.
+
 ## No built-in infrastructure
 
 MasqueCat deliberately has **no built-in public relay, map service, control
-plane, or default external hostname**.
+plane, or default external hostname**. Every Internet-facing endpoint is
+operator supplied:
 
-Every Internet-facing endpoint is operator supplied:
-
-- `DirectURL` is an explicitly advertised peer MASQUE endpoint.
-- `RelayURL` is an explicitly configured MasqueCat relay.
-- relay-only deployments require only outbound UDP/443 from both peers.
+- `DirectURL` advertises an explicitly reachable peer MASQUE endpoint.
+- `RelayURL` configures an explicit MasqueCat relay.
+- relay-only deployments require outbound QUIC/UDP 443 from both peers.
 - direct deployments require an explicitly reachable QUIC/UDP endpoint.
 
-There is no automatic fallback to an upstream relay or map service.
-
-MasqueCat also does not use external STUN discovery, CallMeMaybe endpoint
-exchange, UDP hole punching, candidate probing, or a raw peer WireGuard path.
-Direct mode means **WireGuard-over-MASQUE directly to the peer**, not raw
-WireGuard over UDP.
+There is no fallback to an upstream Tailscale DERP or DERP map.
 
 ## Path selection
 
-MasqueCat currently uses deterministic startup-time selection:
+Startup selection is deterministic:
 
 ```text
 DirectURL configured?
     |
-    +-- yes --> try that exact MASQUE endpoint once
+    +-- yes --> connect that exact MASQUE endpoint
     |              |
     |              +-- success --> direct-masque
     |              |
@@ -67,7 +86,15 @@ DirectURL configured?
                                       +-- no --> fail
 ```
 
-No alternate peer addresses are discovered or probed.
+No alternate peer addresses are discovered or probed. After a path is selected,
+its QUIC connection uses keepalive and reconnects to the same configured
+endpoint with capped exponential backoff. Runtime direct-to-relay failover is
+not implemented yet.
+
+An important startup property is that `MasqueClient` establishes the outer
+CONNECT-UDP carrier before constructing its WireGuard/gVisor core. If QUIC or
+TLS establishment fails, the error therefore comes directly from the MASQUE
+transport; there is no preceding magicsock/netcheck/DERP startup sequence.
 
 ## Deployment modes
 
@@ -75,17 +102,113 @@ No alternate peer addresses are discovered or probed.
 | --- | --- | --- |
 | Relay-only | none | both peers make outbound QUIC/UDP 443 connections to the relay |
 | Direct-only | reachable QUIC/UDP endpoint with a valid TLS certificate | client connects directly with HTTP/3 CONNECT-UDP |
-| Direct + relay | direct endpoint plus outbound relay access | client tries the configured direct endpoint, then uses the relay if startup fails |
+| Direct + relay | direct endpoint plus outbound relay access | client tries the configured direct endpoint, then the relay if startup fails |
 
-For the overall architecture and Go API, see
-[`docs/masquecat.md`](./docs/masquecat.md). For relay-specific deployment,
-including DNS, TLS, UDP/443, systemd, containers, load balancers,
-troubleshooting, and current security limitations, see
-[`docs/masquecat-relay-deployment.md`](./docs/masquecat-relay-deployment.md).
+## Security model
 
-## Build
+Application traffic is protected by two layers:
 
-This branch is still experimental and is not represented by an existing release
+1. WireGuard provides end-to-end encryption between the MasqueCat peers.
+2. QUIC/TLS 1.3 protects the outer HTTP/3 connection to the direct endpoint or
+   relay.
+
+A relay terminates the outer TLS connection but forwards opaque WireGuard
+ciphertext. It can observe peer node keys and traffic metadata but cannot decrypt
+the inner WireGuard session.
+
+Direct and relay CONNECT-UDP registration uses a one-time challenge and proof of
+possession of the advertised node private key. Duplicate live registrations are
+rejected rather than silently replacing the current peer.
+
+`InsecureSkipVerify` exists only for development. Production endpoints should
+use normal certificate and hostname verification.
+
+## Go API
+
+### Server
+
+```go
+srv := &tailcat.MasqueServer{
+    Server: tailcat.Server{
+        OnTCP: func(port uint16) func(net.Conn) {
+            return func(c net.Conn) {
+                defer c.Close()
+                // Serve the application protocol.
+            }
+        },
+    },
+    RelayURL: "https://relay.example.com",
+}
+
+if err := srv.Start(); err != nil {
+    log.Fatal(err)
+}
+defer srv.Close()
+
+fmt.Println(srv.ConnBlob()) // mc...
+```
+
+For direct mode, additionally configure `DirectListen`, `DirectURL`, and
+`DirectTLSConfig`.
+
+### Client
+
+```go
+client := tailcat.NewMasqueClient(token)
+defer client.Close()
+
+conn, err := client.DialTCPPort(ctx, 22)
+if err != nil {
+    log.Fatal(err)
+}
+defer conn.Close()
+```
+
+Useful client operations include `Ping`, `DialTCPPort`, `DialTCP`, `Dial`,
+`DrainTCP`, `Path`, and `Close`.
+
+The current generic `Dial` path accepts IP-literal destinations; the primary
+peer-service API is `DialTCPPort`.
+
+## Connection tokens
+
+MasqueCat uses a distinct `mc...` token containing:
+
+- protocol version;
+- server WireGuard/node public key;
+- optional `DirectURL`;
+- optional `RelayURL`;
+- a legacy disco-public-key field retained in token version 1 for format
+  compatibility only.
+
+That legacy token field does not cause the MasqueCat runtime to construct a
+disco endpoint or send disco traffic.
+
+At least one MASQUE URL is required. URLs must use `https://` and may not contain
+userinfo, query strings, or fragments.
+
+## Relay deployment
+
+`cmd/masquecat-relay` is directly runnable. The relay must terminate HTTP/3
+itself and receive UDP/443; a TCP-only HTTP/1.1 or HTTP/2 reverse proxy cannot
+carry this protocol.
+
+```sh
+go build ./cmd/masquecat-relay
+
+sudo ./masquecat-relay \
+  -listen :443 \
+  -cert /etc/masquecat/tls/fullchain.pem \
+  -key /etc/masquecat/tls/privkey.pem
+```
+
+See [`cmd/masquecat-relay/README.md`](./cmd/masquecat-relay/README.md) and
+[`docs/masquecat-relay-deployment.md`](./docs/masquecat-relay-deployment.md)
+for deployment details.
+
+## Build and test
+
+This branch is experimental and is not represented by an existing release
 artifact.
 
 ```sh
@@ -93,211 +216,13 @@ git clone https://github.com/knowlet/tailcat.git
 cd tailcat
 git checkout feat/masquecat-masque-transport
 
-go build ./cmd/masquecat-relay
+go test ./...
+go build ./...
 ```
 
-The full client CLI integration is still in progress. The current MasqueCat
-server/client data path is exposed through the Go API (`MasqueServer` and
-`MasqueClient`), while `cmd/masquecat-relay` is directly runnable.
+The stable CLI integration for the MasqueCat client/server path is still in
+progress. The transport is currently exposed through the Go API, while the
+relay has a dedicated command.
 
-## Relay deployment
-
-Quick command documentation is in
-[`cmd/masquecat-relay/README.md`](./cmd/masquecat-relay/README.md). The full
-operator guide is
-[`docs/masquecat-relay-deployment.md`](./docs/masquecat-relay-deployment.md).
-
-A relay terminates HTTP/3 itself. Give it a public DNS name, a trusted TLS
-certificate, and inbound UDP/443.
-
-```sh
-sudo ./masquecat-relay \
-  -listen :443 \
-  -cert /etc/masquecat/tls/fullchain.pem \
-  -key /etc/masquecat/tls/privkey.pem
-```
-
-A TCP-only HTTP/1.1 or HTTP/2 reverse proxy is not sufficient. A
-QUIC/UDP-capable pass-through load balancer is fine.
-
-In relay-only mode the protected machine does not need an inbound Internet
-port; both the client and server only initiate outbound QUIC connections to the
-relay.
-
-> [!IMPORTANT]
-> Relay and direct registration use a one-time proof-of-possession challenge
-> bound to source key, target key, and path mode. A live relay registration is
-> not replaced by a duplicate node-key connection. The relay is still
-> experimental because general bandwidth/connection quotas, metrics, health
-> endpoints, abuse controls, live certificate reload, and horizontal shared
-> state are not implemented yet.
-
-### Local TLS development mode
-
-When `masquecat-relay` is started interactively without `-cert` and `-key`, it
-asks whether to generate an ephemeral 24-hour self-signed certificate for that
-run. The generated private key remains in memory and is not written to disk.
-Non-interactive launches still fail closed when certificate paths are missing.
-
-For an explicitly trusted development endpoint, outbound MASQUE clients can opt
-in to:
-
-```go
-InsecureSkipVerify: true
-```
-
-on either `MasqueClient` or `MasqueServer`. The default is `false`.
-`InsecureSkipVerify` disables TLS certificate-chain and hostname verification,
-so it must not be used for normal Internet-facing production connections.
-
-## Direct deployment
-
-A server with a reachable UDP endpoint can advertise a direct MASQUE listener.
-For example, conceptually:
-
-```go
-cert, err := tls.LoadX509KeyPair("fullchain.pem", "privkey.pem")
-if err != nil {
-    log.Fatal(err)
-}
-
-s := &tailcat.MasqueServer{
-    Server: tailcat.Server{
-        OnTCP: myTCPHandler,
-    },
-    DirectListen: ":443",
-    DirectURL:    "https://mc.example.com",
-    DirectTLSConfig: &tls.Config{
-        Certificates: []tls.Certificate{cert},
-    },
-    RelayURL: "https://relay.example.com", // optional fallback
-}
-```
-
-MasqueCat will never try to derive a public endpoint with STUN. If the server is
-behind NAT, configure a static UDP port-forward or use relay mode.
-
-## Relay-only Go example
-
-```go
-package main
-
-import (
-    "fmt"
-    "log"
-    "net"
-
-    tailcat "github.com/tailscale/tailcat"
-)
-
-func main() {
-    s := &tailcat.MasqueServer{
-        Server: tailcat.Server{
-            OnTCP: func(port uint16) func(net.Conn) {
-                if port != 22 {
-                    return nil
-                }
-                return func(tunnel net.Conn) {
-                    local, err := net.Dial("tcp", "127.0.0.1:22")
-                    if err != nil {
-                        _ = tunnel.Close()
-                        return
-                    }
-                    tailcat.ProxyConns(tunnel, local)
-                }
-            },
-        },
-        RelayURL: "https://relay.example.com",
-    }
-    if err := s.Start(); err != nil {
-        log.Fatal(err)
-    }
-    defer s.Close()
-
-    fmt.Println(s.ConnBlob()) // mc...
-    select {}
-}
-```
-
-Client:
-
-```go
-c := tailcat.NewMasqueClient(tailcat.MasqueConnBlob(token))
-defer c.Close()
-
-conn, err := c.DialTCPPort(context.Background(), 22)
-if err != nil {
-    log.Fatal(err)
-}
-defer conn.Close()
-```
-
-## Security model
-
-There are two cryptographic layers:
-
-1. WireGuard protects the inner tunnel end-to-end between MasqueCat peers.
-2. QUIC/TLS 1.3 protects each HTTP/3 transport hop.
-
-On a relay path, the relay terminates the outer QUIC/TLS connection but receives
-already encrypted WireGuard payloads. A relay can still observe connection
-source addresses, registered peer keys used for routing, packet sizes, timing,
-and traffic volume.
-
-The registration layer requires a one-time cryptographic proof of possession of
-the advertised node key before a direct or relay CONNECT-UDP stream is accepted.
-The challenge is short-lived and bound to source key, target key, and path mode.
-Relay registration is fail-closed: a duplicate live node key receives a conflict
-instead of evicting the existing peer. General relay resource quotas, abuse
-controls, metrics, and operational hardening remain separate production work.
-
-## What MasqueCat is not
-
-MasqueCat uses a standardized HTTP/3 transport. It does not claim to be
-undetectable, anonymous, or resistant to traffic analysis. It does not implement
-browser fingerprint cloning, domain fronting, TLS fingerprint mutation, traffic
-morphing, or active-probing countermeasures.
-
-## Current implementation status
-
-Implemented in this branch:
-
-- `mc...` connection tokens with explicit direct and/or relay URLs
-- HTTP/3 CONNECT-UDP transport with QUIC DATAGRAM
-- direct MASQUE peer path
-- paired MasqueCat relay
-- proof-of-possession for direct/relay node-key registration
-- fail-closed duplicate relay registration
-- explicit development-only `InsecureSkipVerify` for outbound MASQUE TLS
-- interactive ephemeral self-signed TLS for `masquecat-relay`
-- direct-first, relay-fallback startup selection
-- end-to-end WireGuard carried inside MASQUE
-- loopback-only compatibility bridge for the reused userspace networking engine
-- suppression of the reused engine's external STUN/UDP discovery in MasqueCat mode
-- dropping legacy disco/CallMeMaybe packets at the MASQUE boundary
-
-Still required before production-ready:
-
-- complete `mc...` CLI integration (`serve`, `ssh`, `ping`, `parse`, saved keys)
-- direct and relay WireGuard/TCP/SSH E2E tests
-- reconnect and runtime direct-to-relay failover
-- MTU / fragmentation validation
-- relay limits, health endpoint, structured metrics, and abuse protection
-- production deployment validation beyond CI platform builds/tests
-
-## Upstream code reuse
-
-MasqueCat is intentionally being developed as an in-place Tailcat fork, so the
-current branch still reuses upstream open-source networking packages at compile
-time. That source-level dependency is distinct from runtime infrastructure:
-MasqueCat's transport configuration has no built-in external service endpoint.
-
-Removing the upstream networking module itself would require replacing the
-current wgengine/netstack integration with a standalone WireGuard + gVisor
-implementation and is tracked as a separate architectural migration rather than
-being hidden behind a hostname change.
-
-## License and attribution
-
-This fork retains the upstream BSD-3-Clause licensing and copyright notices.
-See [`LICENSE`](./LICENSE).
+For a deeper design description, see
+[`docs/masquecat.md`](./docs/masquecat.md).
