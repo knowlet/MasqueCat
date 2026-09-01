@@ -3,7 +3,6 @@
 package tailcat
 
 import (
-	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -12,22 +11,12 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"slices"
 	"sync"
 
 	"github.com/quic-go/quic-go/http3"
-	"tailscale.com/health"
-	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/ipn/store/mem"
-	"tailscale.com/net/netmon"
-	"tailscale.com/net/tsdial"
-	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/netmap"
-	"tailscale.com/util/eventbus"
-	"tailscale.com/util/mak"
 )
 
 // MasquePathType identifies the external path carrying WireGuard datagrams.
@@ -38,29 +27,27 @@ const (
 	MasquePathRelay  MasquePathType = "relay-masque"
 )
 
-// MasqueServer preserves Tailcat's userspace WireGuard/netstack server while
-// replacing externally visible DERP, STUN, disco path discovery and raw direct
-// WireGuard with MASQUE CONNECT-UDP paths.
+// MasqueServer is a userspace WireGuard + gVisor server whose only external
+// transport is MASQUE CONNECT-UDP. Unlike legacy Server it does not construct a
+// Tailscale wgengine, magicsock.Conn, DERP client, netcheck client, STUN socket,
+// disco endpoint, or hole-punching state machine.
 type MasqueServer struct {
+	// Embed Server to keep the existing configuration surface (Key, Logf,
+	// AllowedClients, OnTCP, OnTCPForward, ServedTCPPorts) source-compatible.
+	// MasqueServer does not call Server.Start and does not use Server.lb.
 	Server
 
-	// DirectListen enables a peer-to-peer MASQUE listener, for example ":443".
-	// DirectURL is the https URL embedded in the mc token and must identify the
-	// same listener from the client's point of view.
 	DirectListen    string
 	DirectURL       string
 	DirectTLSConfig *tls.Config
-
-	// RelayURL, when set, is a MasqueCat relay reached over HTTP/3 CONNECT-UDP.
-	RelayURL string
+	RelayURL        string
 
 	// InsecureSkipVerify disables TLS certificate and hostname verification for
-	// outbound MASQUE connections. It is intended only for development with
-	// explicitly trusted self-signed endpoints and is false by default.
+	// the outbound relay connection. It is intended only for development.
 	InsecureSkipVerify bool
 
 	mu         sync.Mutex
-	bridge     *localDERPBridge
+	core       *masqueCore
 	relayPath  *masquePath
 	directHTTP *http3.Server
 	directPC   net.PacketConn
@@ -68,12 +55,10 @@ type MasqueServer struct {
 	blob       MasqueConnBlob
 }
 
-// Start brings up the Tailcat userspace stack and the configured MASQUE paths.
-// At least one of DirectURL or RelayURL must be configured.
 func (s *MasqueServer) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.lb != nil || s.bridge != nil {
+	if s.core != nil {
 		return errors.New("masquecat: MasqueServer.Start called twice")
 	}
 	if s.DirectURL == "" && s.RelayURL == "" {
@@ -106,15 +91,22 @@ func (s *MasqueServer) Start() error {
 	}
 	s.Key = priv
 
-	bridge, err := newLocalDERPBridge(logf)
+	core, err := newMasqueCore(priv, masqueCoreOptions{
+		IsServer:       true,
+		AllowedClients: s.AllowedClients,
+		OnTCP:          s.OnTCP,
+		OnTCPForward:   s.OnTCPForward,
+		ServedTCPPorts: s.ServedTCPPorts,
+	}, logf)
 	if err != nil {
-		return fmt.Errorf("start loopback DERP compatibility bridge: %w", err)
+		return err
 	}
-	s.bridge = bridge
+	s.core = core
+	ctx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+
 	cleanup := func() {
-		if s.cancel != nil {
-			s.cancel()
-		}
+		cancel()
 		if s.directHTTP != nil {
 			_ = s.directHTTP.Close()
 		}
@@ -124,28 +116,16 @@ func (s *MasqueServer) Start() error {
 		if s.relayPath != nil {
 			_ = s.relayPath.Close()
 		}
-		if s.lb != nil {
-			_ = s.Server.Close()
-		}
-		_ = bridge.Close()
+		_ = core.Close()
 		s.cancel = nil
 		s.directHTTP = nil
 		s.directPC = nil
 		s.relayPath = nil
-		s.bridge = nil
-		s.lb = nil
+		s.core = nil
 		s.blob = ""
 	}
 
-	if err := s.startTailcatCore(priv, bridge.Region(), logf); err != nil {
-		cleanup()
-		return err
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
 	local := priv.Public()
-
 	if s.DirectURL != "" {
 		pc, err := net.ListenPacket("udp", s.DirectListen)
 		if err != nil {
@@ -156,7 +136,7 @@ func (s *MasqueServer) Start() error {
 		conf.MinVersion = tls.VersionTLS13
 		h3 := &http3.Server{
 			TLSConfig:       conf,
-			Handler:         directMasqueHandler(priv, bridge, logf),
+			Handler:         directMasqueCoreHandler(priv, core, logf),
 			EnableDatagrams: true,
 		}
 		s.directPC, s.directHTTP = pc, h3
@@ -176,8 +156,11 @@ func (s *MasqueServer) Start() error {
 		s.relayPath = path
 		go func() {
 			err := path.run(ctx, local, func(src key.NodePublic, payload []byte) error {
-				bridge.AddForwarder(src, path)
-				return bridge.Inject(src, local, payload)
+				if err := core.SetPath(src, path); err != nil {
+					logf("dropping relay packet from rejected peer %v: %v", src.ShortString(), err)
+					return nil
+				}
+				return core.Inject(src, payload)
 			})
 			if err != nil && ctx.Err() == nil {
 				logf("MASQUE relay receive loop stopped: %v", err)
@@ -185,6 +168,8 @@ func (s *MasqueServer) Start() error {
 		}()
 	}
 
+	// ServerDiscoPublic remains in v1 tokens for backward token-format
+	// compatibility only. MasqueServer never creates or transmits disco traffic.
 	blob, err := (MasqueConnInfo{
 		Version:           1,
 		ServerPublic:      local,
@@ -200,15 +185,43 @@ func (s *MasqueServer) Start() error {
 	return nil
 }
 
-// ConnBlob returns the mc-prefixed connection token. Start must have succeeded.
 func (s *MasqueServer) ConnBlob() MasqueConnBlob {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.blob
 }
 
-// Close shuts down the MASQUE paths, loopback compatibility bridge and Tailcat
-// userspace networking stack.
+func (s *MasqueServer) Addr() netip.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.core == nil {
+		if !s.Key.IsZero() {
+			return tcAddrForKey(s.Key.Public())
+		}
+		return netip.Addr{}
+	}
+	return s.core.Addr()
+}
+
+func (s *MasqueServer) Status() *ipnstate.Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.core == nil {
+		return nil
+	}
+	return s.core.Status()
+}
+
+func (s *MasqueServer) DrainTCP(ctx context.Context) error {
+	s.mu.Lock()
+	core := s.core
+	s.mu.Unlock()
+	if core == nil {
+		return nil
+	}
+	return core.DrainTCP(ctx)
+}
+
 func (s *MasqueServer) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -229,194 +242,28 @@ func (s *MasqueServer) Close() error {
 		errs = append(errs, s.relayPath.Close())
 		s.relayPath = nil
 	}
-	if s.lb != nil {
-		errs = append(errs, s.Server.Close())
-		s.lb = nil
-	}
-	if s.bridge != nil {
-		errs = append(errs, s.bridge.Close())
-		s.bridge = nil
+	if s.core != nil {
+		errs = append(errs, s.core.Close())
+		s.core = nil
 	}
 	s.blob = ""
 	return errors.Join(errs...)
 }
 
-// startTailcatCore is intentionally close to Server.Start. The key difference
-// is that magicsock is switched to TCP443-only mode before NetworkUp, which
-// prevents its own UDP/STUN discovery while leaving the independent QUIC/UDP
-// sockets used by MasqueCat untouched.
-func (s *MasqueServer) startTailcatCore(priv key.NodePrivate, reg *tailcfg.DERPRegion, logf logger.Logf) error {
-	lb := newLocoBackend(priv)
-	lb.logf = logf
-	lb.dm = &tailcfg.DERPMap{}
-	mak.Set(&lb.dm.Regions, reg.RegionID, reg)
-	for _, k := range s.AllowedClients {
-		mak.Set(&lb.allowedClients, k, true)
-	}
-
-	sys := &lb.sys
-	bus := eventbus.New()
-	sys.Set(bus)
-	sys.Set(health.NewTracker(bus))
-	netMon, err := netmon.New(bus, func(format string, args ...any) { logf(format, args...) })
-	if err != nil {
-		_ = lb.Close()
-		return fmt.Errorf("netmon.New: %w", err)
-	}
-	sys.Set(netMon)
-	dialer := &tsdial.Dialer{Logf: logf}
-	sys.Set(dialer)
-	var store ipn.StateStore = new(mem.Store)
-	sys.Set(store)
-
-	lb.isServer = true
-	lb.onDERPRecv = func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool {
-		if !IsMeowPacket(pkt) {
-			return false
-		}
-		if IsMeowedPacket(pkt) {
-			return true
-		}
-		if _, discoPub, ok := ParseMeowPing(pkt); ok {
-			mc := lb.sys.MagicSock.Get()
-			go func() {
-				if lb.onMasqueMeow(src, discoPub) {
-					if _, err := mc.SendDERPPacketTo(src, regionID, EncodeMeowed()); err != nil {
-						logf("send MasqueCat meowed response to %v: %v", src.ShortString(), err)
-					}
-				}
-			}()
-			return true
-		}
-		return false
-	}
-
-	if err := createEngine(logf, lb); err != nil {
-		_ = lb.Close()
-		return fmt.Errorf("createEngine: %w", err)
-	}
-	// This switch applies only to magicsock. MasqueCat's QUIC sockets are
-	// independent, so they remain free to use UDP/443.
-	sys.MagicSock.Get().SetOnlyTCP443(true)
-
-	ns, err := newNetstack(logf, sys)
-	if err != nil {
-		_ = lb.Close()
-		return fmt.Errorf("newNetstack: %w", err)
-	}
-	ns.ProcessLocalIPs = true
-	ns.ProcessSubnets = true
-	ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
-		if dst.Addr() == lb.addr {
-			if s.OnTCP == nil {
-				return nil, true
-			}
-			return s.OnTCP(dst.Port()), true
-		}
-		if s.OnTCPForward == nil {
-			return nil, true
-		}
-		if nat64Prefix.Contains(dst.Addr()) {
-			var a4 [4]byte
-			d6 := dst.Addr().As16()
-			copy(a4[:], d6[12:16])
-			dst = netip.AddrPortFrom(netip.AddrFrom4(a4), dst.Port())
-		}
-		return s.OnTCPForward(dst), true
-	}
-	lb.ns = ns
-	sys.Set(ns)
-	dialer.UseNetstackForIP = func(ip netip.Addr) bool {
-		_, ok := lb.peerByIP(ip)
-		return ok
-	}
-	dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		return ns.DialContextTCP(ctx, dst)
-	}
-	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		panic("unreachable from masquecat")
-	}
-	sys.Tun.Get().Start()
-
-	s.lb = lb
-	sys.Engine.Get().SetFilter(s.buildFilter())
-	if err := lb.Start(); err != nil {
-		s.lb = nil
-		_ = lb.Close()
-		return err
-	}
-	return nil
-}
-
-// onMasqueMeow is Tailcat's onMeow peer admission logic without the endpoint
-// advertisement side effect. Direct MasqueCat paths are configured explicitly;
-// relay paths are registered with the relay, so CallMeMaybe is never needed.
-func (b *locoBackend) onMasqueMeow(src key.NodePublic, discoPub key.DiscoPublic) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.logf("got MasqueCat meow from %v", src.String())
-	if b.allowedClients != nil && !b.allowedClients[src] {
-		b.logf("ignoring meow from %v: not in allowedClients", src.String())
-		return false
-	}
-	if _, ok := b.clients[src]; ok {
-		return true
-	}
-	id := len(b.clients) + 2
-	derpRegion := b.derpRegionID()
-	mak.Set(&b.clients, src, &tailcfg.Node{
-		ID:         tailcfg.NodeID(id),
-		StableID:   tailcfg.StableNodeID(fmt.Sprint(id)),
-		Name:       fmt.Sprintf("client%d.masquecat.", id),
-		User:       100,
-		Key:        src,
-		DiscoKey:   discoPub,
-		Addresses:  []netip.Prefix{pfxOf(tcAddrForKey(src))},
-		AllowedIPs: []netip.Prefix{pfxOf(tcAddrForKey(src))},
-		HomeDERP:   derpRegion,
-	})
-	nm := &netmap.NetworkMap{
-		NodeKey: b.pub,
-		SelfNode: (&tailcfg.Node{
-			ID:         1,
-			StableID:   "1",
-			Name:       "server.masquecat.",
-			User:       100,
-			Key:        b.pub,
-			DiscoKey:   b.discoPublic(),
-			Addresses:  []netip.Prefix{b.addrPrefix},
-			AllowedIPs: []netip.Prefix{b.addrPrefix, allIPv6},
-			HomeDERP:   derpRegion,
-		}).View(),
-	}
-	for _, n := range b.clients {
-		nm.Peers = append(nm.Peers, n.View())
-	}
-	slices.SortFunc(nm.Peers, func(a, b tailcfg.NodeView) int { return cmp.Compare(a.ID(), b.ID()) })
-	b.nm = nm
-	mc := b.sys.MagicSock.Get()
-	mc.SetNetworkMap(nm.SelfNode, nm.Peers)
-	b.sys.Netstack.Get().UpdateNetstackIPs(nm)
-	return true
-}
-
-// MasqueClient is the Tailcat client API with deterministic MASQUE path
-// selection. It attempts DirectURL once, then falls back to RelayURL. It never
-// invokes Tailcat's endpoint discovery or raw direct WireGuard path.
+// MasqueClient is the Tailcat client-facing API with deterministic MASQUE path
+// selection. Its WireGuard device uses masqueBind directly; no Tailscale
+// networking engine is initialized.
 type MasqueClient struct {
 	Server MasqueConnBlob
 	Key    key.NodePrivate
 	Logf   logger.Logf
 
-	// InsecureSkipVerify disables TLS certificate and hostname verification for
-	// direct and relay MASQUE connections. It is false by default and should
-	// only be used for explicitly trusted development endpoints.
 	InsecureSkipVerify bool
 
 	mu           sync.Mutex
 	activeOps    sync.WaitGroup
-	base         *Client
-	bridge       *localDERPBridge
+	core         *masqueCore
+	serverPublic key.NodePublic
 	path         *masquePath
 	pathType     MasquePathType
 	lifecycleCtx context.Context
@@ -432,10 +279,10 @@ func (c *MasqueClient) ensureStarted(ctx context.Context) error {
 	return c.ensureStartedLocked(ctx)
 }
 
-// masqueDialContext makes an in-flight CONNECT-UDP establishment
-// cancelable by the caller without letting that one-shot operation context
-// own the established transport. Calling finish(true) is the detach point:
-// after it succeeds, only lifecycleCtx can cancel the returned context.
+// masqueDialContext makes an in-flight CONNECT-UDP establishment cancelable by
+// the caller without letting that one-shot operation context own the established
+// transport. Calling finish(true) detaches the caller and leaves lifecycleCtx
+// as the owner of the transport.
 func masqueDialContext(lifecycleCtx, operationCtx context.Context) (context.Context, func(bool) bool) {
 	dialCtx, cancelDial := context.WithCancel(lifecycleCtx)
 	stopOperationCancel := context.AfterFunc(operationCtx, cancelDial)
@@ -448,9 +295,6 @@ func masqueDialContext(lifecycleCtx, operationCtx context.Context) (context.Cont
 	}
 }
 
-// masqueOperationContext combines a caller's operation context with the
-// client's lifecycle. The returned context is canceled by either source. The
-// stop function detaches the lifecycle callback and releases local resources.
 func masqueOperationContext(operationCtx, lifecycleCtx context.Context) (context.Context, func()) {
 	opCtx, cancel := context.WithCancel(operationCtx)
 	stopLifecycleCancel := context.AfterFunc(lifecycleCtx, cancel)
@@ -477,37 +321,6 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 		priv = key.NewNode()
 		c.Key = priv
 	}
-	bridge, err := newLocalDERPBridge(logf)
-	if err != nil {
-		return fmt.Errorf("start loopback DERP compatibility bridge: %w", err)
-	}
-
-	internalBlob := (&ConnInfo{
-		ServerPublic:      NodePublic{ci.ServerPublic},
-		ServerDiscoPublic: DiscoPublic{ci.ServerDiscoPublic},
-		Region:            []*tailcfg.DERPRegion{bridge.Region()},
-	}).ConnBlob()
-	base := NewClient(internalBlob)
-	base.Key = priv
-	base.Logf = logf
-	base.startMu.Lock()
-	if err := base.initLocked(); err != nil {
-		base.startMu.Unlock()
-		_ = bridge.Close()
-		return err
-	}
-	base.lb.sys.MagicSock.Get().SetOnlyTCP443(true)
-	for _, r := range base.ci.Region {
-		mak.Set(&base.lb.dm.Regions, r.RegionID, r)
-	}
-	if err := base.lb.Start(); err != nil {
-		base.startMu.Unlock()
-		_ = base.Close()
-		_ = bridge.Close()
-		return err
-	}
-	base.started = true
-	base.startMu.Unlock()
 
 	childCtx, cancel := context.WithCancel(context.Background())
 	local := priv.Public()
@@ -545,8 +358,6 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 		path, err = dialPath(ci.RelayURL, local, masqueModeRelay)
 		if err != nil {
 			cancel()
-			_ = base.Close()
-			_ = bridge.Close()
 			if directErr != nil {
 				return errors.Join(fmt.Errorf("direct MASQUE: %w", directErr), fmt.Errorf("relay MASQUE: %w", err))
 			}
@@ -556,28 +367,44 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 	}
 	if path == nil {
 		cancel()
-		_ = base.Close()
-		_ = bridge.Close()
 		if directErr != nil {
 			return fmt.Errorf("direct MASQUE: %w", directErr)
 		}
 		return errors.New("no usable MASQUE path")
 	}
 
+	core, err := newMasqueCore(priv, masqueCoreOptions{}, logf)
+	if err != nil {
+		cancel()
+		_ = path.Close()
+		return err
+	}
+	if err := core.SetPath(ci.ServerPublic, path); err != nil {
+		cancel()
+		_ = path.Close()
+		_ = core.Close()
+		return err
+	}
+
 	c.lifecycleCtx = childCtx
 	c.cancel = cancel
-	c.base, c.bridge, c.path, c.pathType = base, bridge, path, pathType
-	bridge.AddForwarder(ci.ServerPublic, path)
+	c.core = core
+	c.serverPublic = ci.ServerPublic
+	c.path = path
+	c.pathType = pathType
+	c.started = true
 	go func() {
 		err := path.run(childCtx, local, func(src key.NodePublic, payload []byte) error {
-			bridge.AddForwarder(src, path)
-			return bridge.Inject(src, local, payload)
+			if src != ci.ServerPublic {
+				logf("dropping MASQUE packet from unexpected peer %v", src.ShortString())
+				return nil
+			}
+			return core.Inject(src, payload)
 		})
 		if err != nil && childCtx.Err() == nil {
 			logf("MASQUE receive loop stopped: %v", err)
 		}
 	}()
-	c.started = true
 	return nil
 }
 
@@ -596,22 +423,17 @@ func (c *MasqueClient) PublicKey() key.NodePublic {
 	return c.Key.Public()
 }
 
-// acquireBase ensures startup first, then takes a lifecycle lease under c.mu
-// and releases the mutex before any potentially blocking base operation. Close
-// holds c.mu while canceling the lifecycle and waiting for existing leases, so
-// teardown cannot race a captured base pointer. If Close wins between startup
-// and lease acquisition, the nil/lifecycle check fails closed.
-func (c *MasqueClient) acquireBase(ctx context.Context) (*Client, context.Context, func(), error) {
+func (c *MasqueClient) acquireCore(ctx context.Context) (*masqueCore, key.NodePublic, context.Context, func(), error) {
 	if err := c.ensureStarted(ctx); err != nil {
-		return nil, nil, nil, err
+		return nil, key.NodePublic{}, nil, nil, err
 	}
-
 	c.mu.Lock()
-	if c.base == nil || c.lifecycleCtx == nil || !c.started {
+	if c.core == nil || c.lifecycleCtx == nil || !c.started {
 		c.mu.Unlock()
-		return nil, nil, nil, errors.New("masquecat: client closed during startup")
+		return nil, key.NodePublic{}, nil, nil, errors.New("masquecat: client closed during startup")
 	}
-	base := c.base
+	core := c.core
+	server := c.serverPublic
 	lifecycleCtx := c.lifecycleCtx
 	c.activeOps.Add(1)
 	c.mu.Unlock()
@@ -621,84 +443,70 @@ func (c *MasqueClient) acquireBase(ctx context.Context) (*Client, context.Contex
 		stopContext()
 		c.activeOps.Done()
 	}
-	return base, opCtx, release, nil
+	return core, server, opCtx, release, nil
 }
 
 func (c *MasqueClient) Ping(ctx context.Context) (PingResult, error) {
-	base, opCtx, release, err := c.acquireBase(ctx)
+	core, server, opCtx, release, err := c.acquireCore(ctx)
 	if err != nil {
 		return PingResult{}, err
 	}
 	defer release()
-	return base.Ping(opCtx)
+	return core.Ping(opCtx, server)
 }
 
 func (c *MasqueClient) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	base, opCtx, release, err := c.acquireBase(ctx)
+	core, _, opCtx, release, err := c.acquireCore(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	return base.Dial(opCtx, network, addr)
+	return core.Dial(opCtx, network, addr)
 }
 
 func (c *MasqueClient) DialTCPPort(ctx context.Context, port uint16) (net.Conn, error) {
-	base, opCtx, release, err := c.acquireBase(ctx)
+	core, server, opCtx, release, err := c.acquireCore(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	return base.DialTCPPort(opCtx, port)
+	return core.DialTCP(opCtx, netip.AddrPortFrom(tcAddrForKey(server), port))
 }
 
 func (c *MasqueClient) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-	base, opCtx, release, err := c.acquireBase(ctx)
+	core, _, opCtx, release, err := c.acquireCore(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
-	return base.DialTCP(opCtx, dst)
+	return core.DialTCP(opCtx, dst)
 }
 
 func (c *MasqueClient) DrainTCP(ctx context.Context) error {
-	c.mu.Lock()
-	if c.base == nil || c.lifecycleCtx == nil {
-		c.mu.Unlock()
-		return nil
+	core, _, opCtx, release, err := c.acquireCore(ctx)
+	if err != nil {
+		return err
 	}
-	base := c.base
-	lifecycleCtx := c.lifecycleCtx
-	c.activeOps.Add(1)
-	c.mu.Unlock()
-
-	opCtx, stopContext := masqueOperationContext(ctx, lifecycleCtx)
-	defer func() {
-		stopContext()
-		c.activeOps.Done()
-	}()
-	return base.DrainTCP(opCtx)
+	defer release()
+	return core.DrainTCP(opCtx)
 }
 
 func (c *MasqueClient) Status() *ipnstate.Status {
 	c.mu.Lock()
-	if c.base == nil || c.base.lb == nil {
+	if c.core == nil {
 		c.mu.Unlock()
 		return nil
 	}
-	base := c.base
+	core := c.core
 	c.activeOps.Add(1)
 	c.mu.Unlock()
 	defer c.activeOps.Done()
-	return base.lb.Status()
+	return core.Status()
 }
 
 func (c *MasqueClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	// No new operation can acquire a lease while c.mu is held. Cancel first so
-	// blocking base calls receive context cancellation, then wait for every
-	// already-acquired lease before tearing down base/path/bridge pointers.
 	if c.cancel != nil {
 		c.cancel()
 		c.cancel = nil
@@ -710,15 +518,12 @@ func (c *MasqueClient) Close() error {
 		errs = append(errs, c.path.Close())
 		c.path = nil
 	}
-	if c.base != nil {
-		errs = append(errs, c.base.Close())
-		c.base = nil
-	}
-	if c.bridge != nil {
-		errs = append(errs, c.bridge.Close())
-		c.bridge = nil
+	if c.core != nil {
+		errs = append(errs, c.core.Close())
+		c.core = nil
 	}
 	c.lifecycleCtx = nil
+	c.serverPublic = key.NodePublic{}
 	c.pathType = ""
 	c.started = false
 	return errors.Join(errs...)
