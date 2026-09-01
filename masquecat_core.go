@@ -579,14 +579,13 @@ func (c *masqueCore) Ping(ctx context.Context, peer key.NodePublic) (PingResult,
 func (c *masqueCore) DrainTCP(ctx context.Context) error {
 	for {
 		var active bool
-		c.stack.RegisteredEndpoints(func(tep tcpip.TransportEndpoint) (stop bool) {
+		for _, tep := range c.stack.RegisteredEndpoints() {
 			ep, ok := tep.(interface{ State() uint32 })
 			if ok && tcp.EndpointState(ep.State()) == tcp.StateEstablished {
 				active = true
-				return true
+				break
 			}
-			return false
-		})
+		}
 		if !active {
 			return nil
 		}
