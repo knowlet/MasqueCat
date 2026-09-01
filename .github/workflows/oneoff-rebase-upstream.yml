@@ -44,16 +44,19 @@ jobs:
             for f in $conflicts; do
               case "$f" in
                 go.mod|go.sum)
-                  # Preserve MasqueCat transport dependencies; go mod tidy after
-                  # the rebase will reconcile them with the new upstream graph.
                   git checkout --theirs -- "$f"
                   git add "$f"
                   ;;
                 README.md)
-                  # The fork intentionally replaces the upstream README with
-                  # MasqueCat deployment/transport docs. Keep that version here;
-                  # CLI usage is refreshed in the follow-up integration commit.
                   git checkout --theirs -- "$f"
+                  git add "$f"
+                  ;;
+                tailcat.go)
+                  # This replayed commit contains broad historical cleanup in
+                  # addition to the self-hosted-default changes. Keep today's
+                  # upstream core here; the intended no-default-relay behavior
+                  # is reapplied as a small focused patch after the rebase.
+                  git checkout --ours -- "$f"
                   git add "$f"
                   ;;
                 *)
