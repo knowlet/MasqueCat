@@ -1,4 +1,4 @@
-name: oneoff-tailcat-cli-verification
+name: oneoff-refresh-upstream-generated-files
 
 on:
   workflow_dispatch:
@@ -8,8 +8,11 @@ on:
     paths:
       - .github/workflows/oneoff-rebase-upstream.yml
 
+permissions:
+  contents: write
+
 jobs:
-  verify:
+  refresh:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch
@@ -18,42 +21,18 @@ jobs:
           ref: feat/masquecat-masque-transport
           fetch-depth: 0
 
-      - name: Verify formatting and modules
+      - name: Run upstream tidy generator and commit
         shell: bash
         run: |
           set -euxo pipefail
-          test -z "$(gofmt -l cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go cmd/tailcat/masquecat_cli_test.go cmd/tailcat/e2e_test.go tailcat_ssh.go)"
-          cp go.mod /tmp/go.mod.before
-          cp go.sum /tmp/go.sum.before
-          go mod tidy
-          cmp go.mod /tmp/go.mod.before
-          cmp go.sum /tmp/go.sum.before
+          make tidy
           git diff --check
-
-      - name: Test repository
-        run: go test -count=1 -timeout 600s ./...
-
-      - name: Build runnable binaries
-        shell: bash
-        run: |
-          set -euxo pipefail
-          mkdir -p /tmp/masquecat-bin
-          go build -o /tmp/masquecat-bin/tailcat ./cmd/tailcat
-          go build -o /tmp/masquecat-bin/masquecat-relay ./cmd/masquecat-relay
-          test -x /tmp/masquecat-bin/tailcat
-          test -x /tmp/masquecat-bin/masquecat-relay
-
-      - name: Smoke Tailcat-compatible CLI
-        shell: bash
-        run: |
-          set -euxo pipefail
-          /tmp/masquecat-bin/tailcat --help | grep -q -- '--relay-url'
-          /tmp/masquecat-bin/tailcat --help | grep -q -- '--legacy-derp'
-          /tmp/masquecat-bin/tailcat --help | grep -q -- 'serve'
-          /tmp/masquecat-bin/tailcat --help | grep -q -- 'ssh'
-          set +e
-          out="$(env -u MASQUECAT_RELAY_URL -u MASQUECAT_DIRECT_URL /tmp/masquecat-bin/tailcat 2>&1)"
-          rc=$?
-          set -e
-          test "$rc" -ne 0
-          printf '%s\n' "$out" | grep -q 'MasqueCat server needs an explicit endpoint'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add go.mod go.sum flake.nix flakehashes.json
+          if git diff --cached --quiet; then
+            echo "upstream-generated files already clean"
+            exit 0
+          fi
+          git commit -m "chore: refresh generated dependency hashes after rebase"
+          git push origin HEAD:feat/masquecat-masque-transport
