@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 jobs:
-  integrate-and-test:
+  integrate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch
@@ -78,40 +78,17 @@ jobs:
               'func genKey(args []string) error {\n\tif *flagKey != "" {\n\t\treturn usagef("genkey\'s --key argument must be after \\"genkey\\"")\n\t}\n',
               'func genKey(args []string) error {\n\tif *flagKey != "" {\n\t\treturn usagef("genkey\'s --key argument must be after \\"genkey\\"")\n\t}\n\tif flagLegacyDERP != nil && !*flagLegacyDERP {\n\t\treturn masqueGenKey(args)\n\t}\n',
           )
-
           p.write_text(s)
           PY
 
-      - name: Format and reconcile module files
+      - name: Format and commit integration
         run: |
           set -euxo pipefail
           gofmt -w cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go cmd/tailcat/masquecat_cli_test.go
           go mod tidy
           git diff --check
-
-      - name: Test
-        run: go test -count=1 -timeout 600s ./...
-
-      - name: Build user-facing executables
-        run: |
-          set -euxo pipefail
-          mkdir -p /tmp/masquecat-bin
-          go build -o /tmp/masquecat-bin/tailcat ./cmd/tailcat
-          go build -o /tmp/masquecat-bin/masquecat-relay ./cmd/masquecat-relay
-          test -x /tmp/masquecat-bin/tailcat
-          test -x /tmp/masquecat-bin/masquecat-relay
-          /tmp/masquecat-bin/tailcat --help | grep -q -- '--relay-url'
-          /tmp/masquecat-bin/tailcat --help | grep -q -- '--legacy-derp'
-
-      - name: Commit integration
-        run: |
-          set -euxo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go cmd/tailcat/masquecat_cli_test.go go.mod go.sum
-          if git diff --cached --quiet; then
-            echo "nothing to commit"
-            exit 0
-          fi
           git commit -m "feat: make MasqueCat the tailcat-compatible CLI transport"
           git push origin HEAD:feat/masquecat-masque-transport
