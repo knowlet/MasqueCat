@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	masque "github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go"
@@ -39,6 +40,15 @@ const (
 	masqueVirtualPort    = "1"
 	masquePeerSuffix     = ".peer.masquecat.invalid"
 	nodePublicTextPrefix = "nodekey:"
+
+	// Persistent MasqueCat carriers must survive idle application periods while
+	// still detecting a dead network in bounded time. QUIC PING keepalives keep
+	// NAT/firewall state warm without reintroducing STUN or endpoint probing.
+	masqueKeepAlivePeriod = 10 * time.Second
+	masqueMaxIdleTimeout  = 30 * time.Second
+
+	masqueReconnectInitialBackoff = 250 * time.Millisecond
+	masqueReconnectMaxBackoff     = 10 * time.Second
 )
 
 var (
@@ -158,6 +168,14 @@ func masqueTLSClientConfig(rawURL string, insecureSkipVerify bool) (*tls.Config,
 	}, nil
 }
 
+func masqueQUICConfig() *quic.Config {
+	return &quic.Config{
+		EnableDatagrams: true,
+		KeepAlivePeriod: masqueKeepAlivePeriod,
+		MaxIdleTimeout:  masqueMaxIdleTimeout,
+	}
+}
+
 func masqueProofForChallenge(local key.NodePrivate, challenge, verifierText string, requestTarget key.NodePublic, mode string) (string, error) {
 	if challenge == "" || verifierText == "" {
 		return "", errors.New("MASQUE endpoint requested authentication without a challenge")
@@ -176,15 +194,25 @@ func masqueProofForChallenge(local key.NodePrivate, challenge, verifierText stri
 }
 
 // masquePath is the external MASQUE transport used by the loopback DERP
-// compatibility bridge. It deliberately drops Tailscale disco packets: MASQUE
-// paths are explicit, so CallMeMaybe/disco path discovery must never leave the
-// process.
+// compatibility bridge. The object itself is stable for its lifetime: runtime
+// reconnect swaps only the underlying CONNECT-UDP PacketConn, so wgengine and
+// DERP forwarder registrations do not need to be rebuilt. It deliberately drops
+// Tailscale disco packets: MASQUE paths are explicit, so CallMeMaybe/disco path
+// discovery must never leave the process.
 type masquePath struct {
 	local key.NodePublic
-	pc    net.PacketConn
 	logf  logger.Logf
+	dial  func(context.Context) (net.PacketConn, error)
+
+	stateMu sync.RWMutex
+	pc      net.PacketConn
+	closed  bool
 
 	writeMu sync.Mutex
+
+	// reconnectBackoff is injectable for deterministic unit tests. Production
+	// paths use masqueReconnectBackoff when this field is nil.
+	reconnectBackoff func(attempt int) time.Duration
 }
 
 func newMasquePathWithTLS(ctx context.Context, rawURL string, requestTarget key.NodePublic, local key.NodePrivate, mode string, insecureSkipVerify bool, logf logger.Logf) (*masquePath, error) {
@@ -192,6 +220,27 @@ func newMasquePathWithTLS(ctx context.Context, rawURL string, requestTarget key.
 	if err != nil {
 		return nil, err
 	}
+	tlsConfig, err := masqueTLSClientConfig(rawURL, insecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
+	if insecureSkipVerify {
+		logf("WARNING: InsecureSkipVerify enabled for MASQUE endpoint %s; TLS certificate and hostname verification are disabled", rawURL)
+	}
+
+	p := &masquePath{local: local.Public(), logf: logf}
+	p.dial = func(dialCtx context.Context) (net.PacketConn, error) {
+		return dialMasquePacketConn(dialCtx, tmpl, rawURL, requestTarget, local, mode, tlsConfig)
+	}
+	conn, err := p.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p.pc = conn
+	return p, nil
+}
+
+func dialMasquePacketConn(ctx context.Context, tmpl *uritemplate.Template, rawURL string, requestTarget key.NodePublic, local key.NodePrivate, mode string, tlsConfig *tls.Config) (net.PacketConn, error) {
 	localPublic := local.Public()
 	newRequest := func(proof string) (*masque.Request, error) {
 		req, err := masque.NewRequest(ctx, tmpl, masqueTarget(requestTarget))
@@ -210,16 +259,9 @@ func newMasquePathWithTLS(ctx context.Context, rawURL string, requestTarget key.
 	if err != nil {
 		return nil, err
 	}
-	tlsConfig, err := masqueTLSClientConfig(rawURL, insecureSkipVerify)
-	if err != nil {
-		return nil, err
-	}
-	if insecureSkipVerify {
-		logf("WARNING: InsecureSkipVerify enabled for MASQUE endpoint %s; TLS certificate and hostname verification are disabled", rawURL)
-	}
 	tr := &masque.Transport{
 		TLSClientConfig: tlsConfig,
-		QUICConfig:      &quic.Config{EnableDatagrams: true},
+		QUICConfig:      masqueQUICConfig(),
 	}
 	conn, resp, err := tr.Dial(req)
 	// masque-go v0.4 returns both resp and a non-nil error for non-2xx
@@ -261,7 +303,104 @@ func newMasquePathWithTLS(ctx context.Context, rawURL string, requestTarget key.
 		}
 		return nil, fmt.Errorf("MASQUE endpoint returned %s", resp.Status)
 	}
-	return &masquePath{local: localPublic, pc: conn, logf: logf}, nil
+	return conn, nil
+}
+
+func masqueReconnectBackoff(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	d := masqueReconnectInitialBackoff
+	for i := 1; i < attempt && d < masqueReconnectMaxBackoff; i++ {
+		d *= 2
+		if d >= masqueReconnectMaxBackoff {
+			return masqueReconnectMaxBackoff
+		}
+	}
+	return d
+}
+
+func (p *masquePath) backoff(attempt int) time.Duration {
+	if p.reconnectBackoff != nil {
+		return p.reconnectBackoff(attempt)
+	}
+	return masqueReconnectBackoff(attempt)
+}
+
+func (p *masquePath) packetConn() (net.PacketConn, error) {
+	p.stateMu.RLock()
+	defer p.stateMu.RUnlock()
+	if p.closed || p.pc == nil {
+		return nil, net.ErrClosed
+	}
+	return p.pc, nil
+}
+
+func (p *masquePath) replacePacketConn(conn net.PacketConn) error {
+	p.stateMu.Lock()
+	if p.closed {
+		p.stateMu.Unlock()
+		_ = conn.Close()
+		return net.ErrClosed
+	}
+	old := p.pc
+	p.pc = conn
+	p.stateMu.Unlock()
+	if old != nil && old != conn {
+		_ = old.Close()
+	}
+	return nil
+}
+
+func (p *masquePath) retirePacketConn(failed net.PacketConn) {
+	if failed == nil {
+		return
+	}
+	p.stateMu.Lock()
+	if p.pc == failed {
+		p.pc = nil
+	}
+	p.stateMu.Unlock()
+	_ = failed.Close()
+}
+
+func (p *masquePath) reconnect(ctx context.Context, cause error) error {
+	if p.dial == nil {
+		return cause
+	}
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		p.stateMu.RLock()
+		closed := p.closed
+		p.stateMu.RUnlock()
+		if closed {
+			return net.ErrClosed
+		}
+
+		if delay := p.backoff(attempt); delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		conn, err := p.dial(ctx)
+		if err == nil {
+			if err := p.replacePacketConn(conn); err != nil {
+				return err
+			}
+			p.logf("MASQUE transport reconnected after %d attempt(s)", attempt+1)
+			return nil
+		}
+		p.logf("MASQUE reconnect attempt %d failed after transport error %v: %v", attempt+1, cause, err)
+	}
 }
 
 func (p *masquePath) ForwardPacket(src, dst key.NodePublic, payload []byte) error {
@@ -274,24 +413,63 @@ func (p *masquePath) ForwardPacket(src, dst key.NodePublic, payload []byte) erro
 	b := encodeMasquePacket(src, dst, payload)
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	_, err := p.pc.WriteTo(b, nil)
+	pc, err := p.packetConn()
+	if err != nil {
+		return err
+	}
+	_, err = pc.WriteTo(b, nil)
+	if err != nil {
+		p.retirePacketConn(pc)
+	}
 	return err
 }
 
 func (p *masquePath) String() string { return "masquecat-masque" }
 
-func (p *masquePath) Close() error { return p.pc.Close() }
+func (p *masquePath) Close() error {
+	p.stateMu.Lock()
+	if p.closed {
+		p.stateMu.Unlock()
+		return nil
+	}
+	p.closed = true
+	pc := p.pc
+	p.pc = nil
+	p.stateMu.Unlock()
+	if pc != nil {
+		return pc.Close()
+	}
+	return nil
+}
 
 func (p *masquePath) run(ctx context.Context, local key.NodePublic, onPacket func(src key.NodePublic, payload []byte) error) error {
 	buf := make([]byte, 64<<10)
 	for {
-		_ = p.pc.SetReadDeadline(noDeadline)
-		n, _, err := p.pc.ReadFrom(buf)
+		pc, err := p.packetConn()
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			return err
+		}
+		_ = pc.SetReadDeadline(noDeadline)
+		n, _, err := pc.ReadFrom(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			p.stateMu.RLock()
+			closed := p.closed
+			p.stateMu.RUnlock()
+			if closed {
+				return net.ErrClosed
+			}
+			p.logf("MASQUE receive failed; reconnecting transport: %v", err)
+			p.retirePacketConn(pc)
+			if err := p.reconnect(ctx, err); err != nil {
+				return err
+			}
+			continue
 		}
 		pkt, err := decodeMasquePacket(buf[:n])
 		if err != nil {
