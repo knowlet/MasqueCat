@@ -13,6 +13,7 @@ require (
 	github.com/quic-go/masque-go v0.4.0
 	github.com/quic-go/quic-go v0.60.0
 	github.com/tailscale/gliderssh v0.3.4-0.20260716005906-1a0f895faf28
+	github.com/tailscale/wireguard-go v0.0.0-20260821191448-23d18d66172c
 	github.com/u-root/u-root v0.14.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
@@ -96,7 +97,6 @@ require (
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
 	github.com/tailscale/wf v0.0.0-20240214030419-6fbb0a674ee6 // indirect
-	github.com/tailscale/wireguard-go v0.0.0-20260821191448-23d18d66172c // indirect
 	github.com/tailscale/xnet v0.0.0-20240729143630-8497ac4dab2e // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
