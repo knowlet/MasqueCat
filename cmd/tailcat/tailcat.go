@@ -90,7 +90,8 @@ func newRootCommand() *ff.Command {
 	flagKey = rootFS.StringLong("key", "", "'new' for an ephemeral key. If empty, the default saved key is used if it exists ('default' in server mode, 'client-default' in client modes; see genkey), else an ephemeral key. Otherwise the path to a *.private.json or a name like 'foo' to read it from $CONFIG/tailcat/keys/foo.private.json")
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
 	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout")
-	flagDERPMapURL = rootFS.StringLong("derpmap-url", tailcat.DefaultDERPMapURL, "URL of the JSON DERP map used to resolve or auto-select a DERP region")
+	flagDERPMapURL = rootFS.StringLong("derpmap-url", tailcat.DefaultDERPMapURL, "URL of the JSON DERP map used to resolve or auto-select a DERP region (legacy DERP mode)")
+	registerMasqueCLIFlags(rootFS)
 
 	serveFS := ff.NewFlagSet("serve").SetParent(rootFS)
 	flagAllow = serveFS.StringLong("allow", "", "comma-separated list of public keys to allow access to the server, or 'none' to allow no clients. If empty, all clients are allowed.")
@@ -123,7 +124,7 @@ func newRootCommand() *ff.Command {
 	return &ff.Command{
 		Name:      "tailcat",
 		Usage:     "tailcat [flags] [<subcommand> [flags]] [args...]",
-		ShortHelp: "securely pipe or serve network connections over Tailscale's data plane (WireGuard®, NAT traversal), without Tailscale's control plane (central server, accounts)",
+		ShortHelp: "securely pipe or serve network connections over end-to-end WireGuard carried by explicit HTTP/3 MASQUE paths",
 		LongHelp:  rootLongHelp,
 		Flags:     rootFS,
 		Subcommands: []*ff.Command{
@@ -148,7 +149,7 @@ func newRootCommand() *ff.Command {
 			{
 				Name:      "ping",
 				Usage:     "tailcat ping [--until-direct] [--timeout=10s] <addrblob>",
-				ShortHelp: "ping a server, reporting DERP or direct paths",
+				ShortHelp: "ping a server, reporting MASQUE direct/relay or legacy DERP paths",
 				LongHelp:  pingLongHelp,
 				Flags:     pingFS,
 				Exec: func(ctx context.Context, args []string) error {
@@ -263,7 +264,11 @@ func newRootCommand() *ff.Command {
 			if len(args) == 2 {
 				dst = args[1]
 			}
-			return clientMode(getLogf(), string(addrBlobArg(args[0])), dst)
+			blob := string(addrBlobArg(args[0]))
+			if isMasqueBlob(blob) {
+				return masqueClientMode(getLogf(), blob, dst)
+			}
+			return clientMode(getLogf(), blob, dst)
 		},
 	}
 }
@@ -644,8 +649,8 @@ func addrBlobArg(arg string) tailcat.ConnBlob {
 		}
 		log.Fatalf("no \"tailcat=\" TXT record found for %q", arg)
 	}
-	if !strings.HasPrefix(arg, "tc") {
-		log.Fatalf("argument %q is neither a \"tc\"-prefixed address blob nor a DNS name", arg)
+	if !strings.HasPrefix(arg, "tc") && !strings.HasPrefix(arg, "mc") {
+		log.Fatalf("argument %q is neither a \"tc\"/\"mc\"-prefixed address blob nor a DNS name", arg)
 	}
 	return tailcat.ConnBlob(arg)
 }
@@ -744,7 +749,11 @@ func clientPingMode(logf logger.Logf, untilDirect bool, timeout time.Duration, a
 	if len(args) != 1 {
 		return usagef("ping requires one <addrblob> argument")
 	}
-	cl := newClient(logf, addrBlobArg(args[0]), clientKey())
+	blob := addrBlobArg(args[0])
+	if isMasqueBlob(string(blob)) {
+		return masqueClientPingMode(logf, untilDirect, timeout, string(blob))
+	}
+	cl := newClient(logf, blob, clientKey())
 	defer cl.Close()
 
 	deadline := time.Now().Add(timeout)
@@ -1025,6 +1034,9 @@ func clientParseMode(args []string) error {
 	if len(args) != 1 {
 		return usagef("parse requires one <addrblob> argument")
 	}
+	if isMasqueBlob(args[0]) {
+		return masqueClientParseMode(args[0])
+	}
 	v, err := tailcat.ParseConnBlobRaw(tailcat.ConnBlob(args[0]))
 	if err != nil {
 		return err
@@ -1038,6 +1050,9 @@ func clientResolveMode(args []string) error {
 	if len(args) != 1 {
 		return usagef("resolve requires one <addrblob> argument")
 	}
+	if isMasqueBlob(args[0]) {
+		return masqueClientResolveMode(args[0])
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	rb, err := addrBlobArg(args[0]).Resolve(ctx, tailcat.DERPMapURL(*flagDERPMapURL), derpMapCache{})
@@ -1049,6 +1064,12 @@ func clientResolveMode(args []string) error {
 }
 
 func server(logf logger.Logf, serveSpec string) {
+	if flagLegacyDERP != nil && !*flagLegacyDERP {
+		if err := masqueServer(logf, serveSpec); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	portSet, services, err := parsePortSet(serveSpec)
 	if err != nil {
 		log.Fatalf("invalid port or service to serve: %v", err)
@@ -1462,6 +1483,9 @@ func keyPath(name string) string {
 func genKey(args []string) error {
 	if *flagKey != "" {
 		return usagef("genkey's --key argument must be after \"genkey\"")
+	}
+	if flagLegacyDERP != nil && !*flagLegacyDERP {
+		return masqueGenKey(args)
 	}
 	if len(args) > 0 {
 		return usagef("genkey takes no positional arguments")
