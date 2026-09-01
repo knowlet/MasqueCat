@@ -28,15 +28,15 @@ func TestMasqueOperationContextCanceledByLifecycle(t *testing.T) {
 func TestMasqueClientCloseCancelsAndWaitsForActiveLease(t *testing.T) {
 	lifecycleCtx, cancelLifecycle := context.WithCancel(context.Background())
 	c := &MasqueClient{
-		base:         new(Client),
+		core:         new(masqueCore),
 		lifecycleCtx: lifecycleCtx,
 		cancel:       cancelLifecycle,
 		started:      true,
 	}
 
-	_, opCtx, release, err := c.acquireBase(context.Background())
+	_, _, opCtx, release, err := c.acquireCore(context.Background())
 	if err != nil {
-		t.Fatalf("acquireBase: %v", err)
+		t.Fatalf("acquireCore: %v", err)
 	}
 
 	closed := make(chan error, 1)
@@ -45,8 +45,7 @@ func TestMasqueClientCloseCancelsAndWaitsForActiveLease(t *testing.T) {
 	select {
 	case <-opCtx.Done():
 		// Close must be able to acquire c.mu and cancel the lifecycle even while
-		// the lease remains active. The old implementation blocked here because
-		// the operation held c.mu for its entire duration.
+		// the lease remains active.
 	case <-time.After(time.Second):
 		t.Fatal("Close did not cancel an active operation lease")
 	}
