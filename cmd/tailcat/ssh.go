@@ -124,6 +124,9 @@ func sshProxyCommand(exe, keyName, derpMapURL, connBlob, portOrIPPort string) st
 	if derpMapURL != tailcat.DefaultDERPMapURL {
 		cmd += fmt.Sprintf(" --derpmap-url=%q", derpMapURL)
 	}
+	if flagMasqueInsecureSkipVerify != nil && *flagMasqueInsecureSkipVerify {
+		cmd += " --insecure-skip-verify"
+	}
 	return fmt.Sprintf("%s %s %s", cmd, connBlob, portOrIPPort)
 }
 
