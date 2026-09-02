@@ -24,6 +24,21 @@ jobs:
       - run: go build ./...
       - run: go test -count=1 -timeout 600s ./...
       - run: go vet ./...
+  race:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: race detector for MASQUE transport and core
+        run: go test -race -count=1 -timeout 900s -run 'Masque|StreamForwarder|ReceiveStreamDatagram' .
+      - name: race detector for masquecat-relay
+        run: go test -race -count=1 -timeout 900s ./cmd/masquecat-relay
   tidy:
     runs-on: ubuntu-latest
     steps:
