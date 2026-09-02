@@ -418,9 +418,17 @@ func (p *masquePath) ForwardPacket(src, dst key.NodePublic, payload []byte) erro
 		return err
 	}
 	_, err = pc.WriteTo(b, nil)
-	if err != nil {
-		p.retirePacketConn(pc)
+	if err == nil {
+		return nil
 	}
+	var tooLarge *quic.DatagramTooLargeError
+	if errors.As(err, &tooLarge) {
+		// A DATAGRAM size violation is local to this packet. The CONNECT-UDP
+		// carrier is still healthy, so closing it would turn an MTU problem into
+		// a local HTTP/3 NO_ERROR cancel followed by a pointless reconnect loop.
+		return fmt.Errorf("MASQUE datagram exceeds QUIC DATAGRAM payload limit %d: %w", tooLarge.MaxDatagramPayloadSize, err)
+	}
+	p.retirePacketConn(pc)
 	return err
 }
 
