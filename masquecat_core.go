@@ -73,11 +73,12 @@ func (*masqueEndpoint) SrcIP() netip.Addr    { return netip.Addr{} }
 type masqueBind struct {
 	local key.NodePublic
 
-	mu     sync.RWMutex
-	open   bool
-	recv   chan masqueInboundPacket
-	closed chan struct{}
-	paths  map[key.NodePublic]masquePacketForwarder
+	mu        sync.RWMutex
+	open      bool
+	recv      chan masqueInboundPacket
+	closed    chan struct{}
+	paths     map[key.NodePublic]masquePacketForwarder
+	fragments masqueWGReassembler
 }
 
 func newMasqueBind(local key.NodePublic) *masqueBind {
@@ -93,6 +94,7 @@ func (b *masqueBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	if b.open {
 		return nil, 0, conn.ErrBindAlreadyOpen
 	}
+	b.fragments.Reset()
 	recv := make(chan masqueInboundPacket, masqueCoreQueueSize)
 	closed := make(chan struct{})
 	b.recv = recv
@@ -128,6 +130,7 @@ func (b *masqueBind) Close() error {
 	b.open = false
 	b.recv = nil
 	b.closed = nil
+	b.fragments.Reset()
 	return nil
 }
 
@@ -148,8 +151,21 @@ func (b *masqueBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 		if offset < 0 || offset > len(buf) {
 			return fmt.Errorf("masquecat: invalid WireGuard packet offset %d for %d-byte buffer", offset, len(buf))
 		}
-		if err := path.ForwardPacket(b.local, mep.peer, buf[offset:]); err != nil {
+		payload := buf[offset:]
+		fragments, err := fragmentMasqueWireGuardPacket(payload)
+		if err != nil {
 			return err
+		}
+		if len(fragments) == 0 {
+			if err := path.ForwardPacket(b.local, mep.peer, payload); err != nil {
+				return err
+			}
+			continue
+		}
+		for _, fragment := range fragments {
+			if err := path.ForwardPacket(b.local, mep.peer, fragment); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -198,7 +214,16 @@ func (b *masqueBind) Inject(src key.NodePublic, payload []byte) error {
 	}
 	recv, closed := b.recv, b.closed
 	b.mu.RUnlock()
-	pkt := masqueInboundPacket{src: src, payload: append([]byte(nil), payload...)}
+
+	reassembled, ready, err := b.fragments.Push(src, payload)
+	if err != nil || !ready {
+		// Fragment metadata is transport framing, not a WireGuard failure. Drop
+		// malformed or incomplete assemblies without tearing down the MASQUE
+		// carrier; the WireGuard retransmission machinery will recover any lost
+		// inner packet.
+		return nil
+	}
+	pkt := masqueInboundPacket{src: src, payload: append([]byte(nil), reassembled...)}
 	select {
 	case <-closed:
 		return net.ErrClosed
