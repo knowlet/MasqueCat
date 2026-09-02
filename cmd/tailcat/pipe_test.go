@@ -28,7 +28,7 @@ func TestLocalDERPMode(t *testing.T) {
 	const derpMapURL = "none"
 	addrFile := filepath.Join(t.TempDir(), "addr")
 
-	server := exec.Command(bin, "--key=new", "--derpmap-url="+derpMapURL)
+	server := exec.Command(bin, "--legacy-derp", "--key=new", "--derpmap-url="+derpMapURL)
 	server.Env = append(append(os.Environ(), cacheEnv(t)...),
 		"TS_DEBUG_TAILCAT_LOCAL_DERP=1",
 		"TAILCAT_ADDR_FILE="+addrFile)
