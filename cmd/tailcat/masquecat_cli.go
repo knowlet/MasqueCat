@@ -421,7 +421,7 @@ func masqueGenKey(args []string) error {
 		return os.Remove(keyPath(*genkeyKey))
 	}
 	if *genkeyKey == "" {
-		return usagef("genkey requires --key=<name>; use default for server mode or client-default for client mode")
+		return usagef("genkey requires --key=<name>; use \"default\" for server mode or \"client-default\" for client mode")
 	}
 	for _, name := range []string{"region", "fixed-region", "embed-derp-map"} {
 		if f, ok := genkeyFS.GetFlag(name); ok && f.IsSet() {
