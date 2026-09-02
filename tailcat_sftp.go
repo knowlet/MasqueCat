@@ -36,7 +36,7 @@ func (s *Server) sftpSubsystemHandler(opts SSHOptions) ssh.SubsystemHandler {
 		if opts.Files != nil {
 			rsrv, root, err := newRootedSFTPServer(sess, opts.Files)
 			if err != nil {
-				s.lb.logf("sftp session: %v", err)
+				s.sshLogf("sftp session: %v", err)
 				sess.Exit(1)
 				return
 			}
@@ -45,7 +45,7 @@ func (s *Server) sftpSubsystemHandler(opts SSHOptions) ssh.SubsystemHandler {
 		} else {
 			fsrv, err := newFullSFTPServer(sess)
 			if err != nil {
-				s.lb.logf("sftp session: %v", err)
+				s.sshLogf("sftp session: %v", err)
 				sess.Exit(1)
 				return
 			}
@@ -60,7 +60,7 @@ func (s *Server) sftpSubsystemHandler(opts SSHOptions) ssh.SubsystemHandler {
 		// scp report failure for successful transfers. Close still
 		// runs afterwards to release any handles a client left open.
 		if err != nil {
-			s.lb.logf("sftp session: %v", err)
+			s.sshLogf("sftp session: %v", err)
 			sess.Exit(1)
 		} else {
 			sess.Exit(0)
@@ -262,78 +262,81 @@ func (h *rootedFiles) setstat(r *sftp.Request, p string) error {
 	return nil
 }
 
-// Filelist implements [sftp.FileLister] (the SFTP List and Stat
-// methods; Lstat and Readlink have dedicated methods below).
+// Filelist implements [sftp.FileLister] (the SFTP List, Stat, and
+// Readlink methods).
 func (h *rootedFiles) Filelist(r *sftp.Request) (sftp.ListerAt, error) {
 	p := rel(r.Filepath)
+	if h.mode == FileServeWO {
+		switch r.Method {
+		case "List", "Readlink":
+			return nil, sftp.ErrSSHFxPermissionDenied
+		case "Stat":
+			if p != "." && !h.isOwn(p) {
+				fi, err := h.root.Stat(p)
+				if err != nil || !fi.IsDir() {
+					return nil, os.ErrNotExist
+				}
+			}
+		}
+	}
 	switch r.Method {
 	case "List":
-		if h.mode == FileServeWO {
-			return nil, sftp.ErrSSHFxPermissionDenied
-		}
-		f, err := h.root.Open(p)
+		fis, err := h.root.ReadDir(p)
 		if err != nil {
 			return nil, err
 		}
-		defer f.Close()
-		fis, err := f.Readdir(0)
-		if err != nil {
-			return nil, err
-		}
-		return listerAt(fis), nil
+		return fileInfoListerAt(fis), nil
 	case "Stat":
-		fi, err := h.stat(p, h.root.Stat)
+		fi, err := h.root.Stat(p)
 		if err != nil {
 			return nil, err
 		}
-		return listerAt{fi}, nil
+		return fileInfoListerAt([]os.FileInfo{fi}), nil
+	case "Readlink":
+		target, err := h.root.Readlink(p)
+		if err != nil {
+			return nil, err
+		}
+		return nameListerAt([]string{target}), nil
 	}
 	return nil, sftp.ErrSSHFxOpUnsupported
 }
 
-// Lstat implements [sftp.LstatFileLister].
-func (h *rootedFiles) Lstat(r *sftp.Request) (sftp.ListerAt, error) {
-	fi, err := h.stat(rel(r.Filepath), h.root.Lstat)
-	if err != nil {
-		return nil, err
-	}
-	return listerAt{fi}, nil
-}
+type fileInfoListerAt []os.FileInfo
 
-// Readlink implements [sftp.ReadlinkFileLister].
-func (h *rootedFiles) Readlink(requestPath string) (string, error) {
-	if h.mode == FileServeWO {
-		return "", sftp.ErrSSHFxPermissionDenied
-	}
-	return h.root.Readlink(rel(requestPath))
-}
-
-// stat stats the rooted path p with statf (Stat or Lstat), applying
-// the write-only mode's visibility policy: a write-only session may
-// stat paths it wrote itself and directories (so upload destinations
-// resolve), but everything else reports not-exist, whether or not it
-// exists, so filenames can't be probed.
-func (h *rootedFiles) stat(p string, statf func(string) (os.FileInfo, error)) (os.FileInfo, error) {
-	fi, err := statf(p)
-	if h.mode != FileServeWO || h.isOwn(p) {
-		return fi, err
-	}
-	if err != nil || !fi.IsDir() {
-		return nil, sftp.ErrSSHFxNoSuchFile
-	}
-	return fi, nil
-}
-
-// listerAt adapts a []os.FileInfo to [sftp.ListerAt].
-type listerAt []os.FileInfo
-
-func (l listerAt) ListAt(dst []os.FileInfo, off int64) (int, error) {
-	if off >= int64(len(l)) {
+func (l fileInfoListerAt) ListAt(dst []os.FileInfo, offset int64) (int, error) {
+	if offset >= int64(len(l)) {
 		return 0, io.EOF
 	}
-	n := copy(dst, l[off:])
+	n := copy(dst, l[offset:])
 	if n < len(dst) {
 		return n, io.EOF
 	}
 	return n, nil
 }
+
+type nameListerAt []string
+
+func (l nameListerAt) ListAt(dst []os.FileInfo, offset int64) (int, error) {
+	if offset >= int64(len(l)) {
+		return 0, io.EOF
+	}
+	n := 0
+	for i := offset; i < int64(len(l)) && n < len(dst); i++ {
+		dst[n] = namedFileInfo(l[i])
+		n++
+	}
+	if int(offset)+n >= len(l) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+type namedFileInfo string
+
+func (fi namedFileInfo) Name() string       { return string(fi) }
+func (namedFileInfo) Size() int64           { return 0 }
+func (namedFileInfo) Mode() os.FileMode     { return 0 }
+func (namedFileInfo) ModTime() time.Time    { return time.Time{} }
+func (namedFileInfo) IsDir() bool            { return false }
+func (namedFileInfo) Sys() any               { return nil }
