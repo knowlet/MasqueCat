@@ -26,6 +26,11 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 		wantExe = `"` + exe + `"`
 	}
 
+	oldInsecure := flagMasqueInsecureSkipVerify
+	insecure := false
+	flagMasqueInsecureSkipVerify = &insecure
+	t.Cleanup(func() { flagMasqueInsecureSkipVerify = oldInsecure })
+
 	got := sshProxyCommand(exe, key, url, blob, port)
 	want := wantExe + ` --key="client-default" --derpmap-url="https://derp.example.com/derpmap.json" tc-short-blob 22`
 	if got != want {
@@ -45,6 +50,13 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 	want = wantExe + ` tc-short-blob 22`
 	if got != want {
 		t.Errorf("sshProxyCommand with no key = %q; want %q", got, want)
+	}
+
+	insecure = true
+	got = sshProxyCommand(exe, key, tailcat.DefaultDERPMapURL, blob, port)
+	want = wantExe + ` --key="client-default" --insecure-skip-verify tc-short-blob 22`
+	if got != want {
+		t.Errorf("sshProxyCommand with insecure MASQUE TLS = %q; want %q", got, want)
 	}
 }
 
