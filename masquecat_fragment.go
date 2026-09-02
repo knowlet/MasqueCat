@@ -21,11 +21,12 @@ const (
 	// header below. A 1000-byte WireGuard fragment produces a 1086-byte HTTP
 	// Datagram payload (1 + 65 + 20 + 1000), leaving more than 100 bytes for the
 	// QUIC packet envelope even on the minimum-size path.
-	masqueWGFragmentChunkSize = 1000
-	masqueWGFragmentHeaderLen = 20
-	masqueWGFragmentMaxSize   = 64 << 10
-	masqueWGFragmentTTL       = 30 * time.Second
-	masqueWGMaxAssemblies     = 256
+	masqueWGFragmentChunkSize          = 1000
+	masqueWGFragmentHeaderLen          = 20
+	masqueWGFragmentMaxSize            = 64 << 10
+	masqueWGFragmentTTL                = 30 * time.Second
+	masqueWGMaxAssemblies              = 256
+	masqueWGMaxAssembliesPerSource     = 32
 )
 
 var (
@@ -42,11 +43,11 @@ type masqueWGFragmentKey struct {
 }
 
 type masqueWGFragmentAssembly struct {
-	count   uint16
-	total   uint32
-	parts   [][]byte
+	count    uint16
+	total    uint32
+	parts    [][]byte
 	received int
-	updated time.Time
+	updated  time.Time
 }
 
 type masqueWGReassembler struct {
@@ -106,6 +107,16 @@ func (r *masqueWGReassembler) cleanupLocked(now time.Time) {
 	}
 }
 
+func (r *masqueWGReassembler) sourceAssemblyCountLocked(src key.NodePublic) int {
+	count := 0
+	for k := range r.sets {
+		if k.src == src {
+			count++
+		}
+	}
+	return count
+}
+
 func (r *masqueWGReassembler) Push(src key.NodePublic, payload []byte) ([]byte, bool, error) {
 	if !bytes.HasPrefix(payload, masqueWGFragmentMagic[:]) {
 		return payload, true, nil
@@ -149,6 +160,9 @@ func (r *masqueWGReassembler) Push(src key.NodePublic, payload []byte) ([]byte, 
 
 	set := r.sets[key]
 	if set == nil {
+		if r.sourceAssemblyCountLocked(src) >= masqueWGMaxAssembliesPerSource {
+			return nil, false, fmt.Errorf("masquecat: too many incomplete WireGuard fragment assemblies for source")
+		}
 		if len(r.sets) >= masqueWGMaxAssemblies {
 			return nil, false, fmt.Errorf("masquecat: too many incomplete WireGuard fragment assemblies")
 		}
