@@ -150,3 +150,36 @@ func TestMasqueWGReassemblerRejectsConflictingDuplicate(t *testing.T) {
 		t.Fatal("conflicting duplicate fragment unexpectedly accepted")
 	}
 }
+
+func TestMasqueWGReassemblerLimitsAssembliesPerSource(t *testing.T) {
+	noisy := key.NewNode().Public()
+	other := key.NewNode().Public()
+	payload := bytes.Repeat([]byte{0x33}, 1312)
+	var r masqueWGReassembler
+
+	for i := 0; i < masqueWGMaxAssembliesPerSource; i++ {
+		fragments, err := fragmentMasqueWireGuardPacket(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ready, err := r.Push(noisy, fragments[0]); err != nil || ready {
+			t.Fatalf("noisy source assembly %d = ready %v, err %v; want incomplete", i, ready, err)
+		}
+	}
+
+	overLimit, err := fragmentMasqueWireGuardPacket(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.Push(noisy, overLimit[0]); err == nil {
+		t.Fatal("source exceeded per-source fragment assembly quota")
+	}
+
+	otherFragments, err := fragmentMasqueWireGuardPacket(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ready, err := r.Push(other, otherFragments[0]); err != nil || ready {
+		t.Fatalf("other source first assembly = ready %v, err %v; want incomplete", ready, err)
+	}
+}
