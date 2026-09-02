@@ -10,11 +10,11 @@ import (
 	"tailscale.com/types/key"
 )
 
-type recordingMasqueForwarder struct {
+type fragmentRecordingMasqueForwarder struct {
 	packets [][]byte
 }
 
-func (f *recordingMasqueForwarder) ForwardPacket(_, _ key.NodePublic, payload []byte) error {
+func (f *fragmentRecordingMasqueForwarder) ForwardPacket(_, _ key.NodePublic, payload []byte) error {
 	f.packets = append(f.packets, append([]byte(nil), payload...))
 	return nil
 }
@@ -22,7 +22,7 @@ func (f *recordingMasqueForwarder) ForwardPacket(_, _ key.NodePublic, payload []
 func TestMasqueBindLeavesSmallWireGuardPacketUnfragmented(t *testing.T) {
 	local := key.NewNode().Public()
 	peer := key.NewNode().Public()
-	forwarder := new(recordingMasqueForwarder)
+	forwarder := new(fragmentRecordingMasqueForwarder)
 	bind := newMasqueBind(local)
 	bind.SetPath(peer, forwarder)
 
@@ -41,7 +41,7 @@ func TestMasqueBindLeavesSmallWireGuardPacketUnfragmented(t *testing.T) {
 func TestMasqueBindFragmentsLargeWireGuardPacketWithinQUICBudget(t *testing.T) {
 	local := key.NewNode().Public()
 	peer := key.NewNode().Public()
-	forwarder := new(recordingMasqueForwarder)
+	forwarder := new(fragmentRecordingMasqueForwarder)
 	bind := newMasqueBind(local)
 	bind.SetPath(peer, forwarder)
 
@@ -75,7 +75,7 @@ func TestMasqueBindFragmentsLargeWireGuardPacketWithinQUICBudget(t *testing.T) {
 func TestMasqueBindReassemblesOutOfOrderWireGuardFragments(t *testing.T) {
 	sender := key.NewNode().Public()
 	receiver := key.NewNode().Public()
-	forwarder := new(recordingMasqueForwarder)
+	forwarder := new(fragmentRecordingMasqueForwarder)
 	sendBind := newMasqueBind(sender)
 	sendBind.SetPath(receiver, forwarder)
 
