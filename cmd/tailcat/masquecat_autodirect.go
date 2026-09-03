@@ -6,6 +6,7 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -13,16 +14,18 @@ import (
 	"math/big"
 	"net"
 	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/tailscale/tailcat"
 )
 
-const autoMasqueDirectPort = "4433"
+const (
+	autoMasqueDirectPort      = "4433"
+	autoMasqueDirectMarkerEnv = "MASQUECAT_AUTO_DIRECT"
+)
+
+var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
 
 // initMasqueAutoDirect restores the original Tailcat zero-argument UX for the
 // MasqueCat transport: a server can be started without first provisioning a
@@ -30,33 +33,59 @@ const autoMasqueDirectPort = "4433"
 // interface address and a locally generated outer TLS certificate.
 //
 // The self-signed certificate is deliberately only an outer QUIC carrier
-// credential. Direct-only CLI clients authenticate the actual peer end-to-end
-// with the node key embedded in the mc token, so they may skip verification of
-// this automatically generated outer certificate. Relay and mixed
-// direct+relay tokens keep normal TLS verification unless the user explicitly
-// opts out with --insecure-skip-verify.
+// credential. Automatic direct-only tokens carry an explicit marker so clients
+// can distinguish this generated endpoint from an explicitly configured
+// self-signed endpoint before relaxing outer TLS verification.
 func init() {
 	if shouldConfigureAutoMasqueDirect(os.Args) {
 		if err := configureAutoMasqueDirect(); err != nil {
 			fmt.Fprintf(os.Stderr, "# MasqueCat automatic direct-only setup unavailable: %v\n", err)
 		}
 	}
-	configureAutoMasqueDirectClient(os.Args)
 }
 
 func shouldConfigureAutoMasqueDirect(args []string) bool {
-	if hasExplicitMasqueEndpoint(args) || os.Getenv("MASQUECAT_RELAY_URL") != "" || os.Getenv("MASQUECAT_DIRECT_URL") != "" {
+	if hasExplicitMasqueEndpoint(args) || hasExplicitMasqueEnvironment() || isHelpInvocation(args) {
 		return false
 	}
 	if len(args) == 1 {
 		return true
 	}
-	for _, arg := range args[1:] {
-		if arg == "serve" || arg == "recv" || arg == "--serve" || strings.HasPrefix(arg, "--serve=") {
+	for i, arg := range args[1:] {
+		if arg == "serve" || arg == "recv" || strings.HasPrefix(arg, "--serve=") {
+			return true
+		}
+		if arg == "--serve" && i+2 < len(args) {
 			return true
 		}
 	}
 	return false
+}
+
+func hasExplicitMasqueEnvironment() bool {
+	for _, name := range []string{
+		"MASQUECAT_RELAY_URL",
+		"MASQUECAT_DIRECT_URL",
+		"MASQUECAT_DIRECT_LISTEN",
+		"MASQUECAT_TLS_CERT",
+		"MASQUECAT_TLS_KEY",
+	} {
+		if os.Getenv(name) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func isHelpInvocation(args []string) bool {
+	for _, arg := range args[1:] {
+		if arg == "help" || arg == "-h" || arg == "--help" {
+			return true
+		}
+	}
+	// A trailing --serve has no value. main treats that parse error as a help
+	// request, so automatic setup must stay silent here as well.
+	return len(args) > 1 && args[len(args)-1] == "--serve"
 }
 
 func hasExplicitMasqueEndpoint(args []string) bool {
@@ -87,14 +116,23 @@ func configureAutoMasqueDirect() error {
 	_ = os.Setenv("MASQUECAT_DIRECT_LISTEN", ":"+autoMasqueDirectPort)
 	_ = os.Setenv("MASQUECAT_TLS_CERT", certPath)
 	_ = os.Setenv("MASQUECAT_TLS_KEY", keyPath)
+	_ = os.Setenv(autoMasqueDirectMarkerEnv, "1")
 
 	fmt.Fprintf(os.Stderr, "# No MASQUE relay URL configured; starting direct-only mode at %s (UDP %s).\n", directURL, autoMasqueDirectPort)
-	if addr.IsPrivate() {
-		fmt.Fprintln(os.Stderr, "# The automatic endpoint is a private/local address. It is reachable only on a network that can route to it; for Internet/NAT/CGNAT use an explicit --direct-url with a reachable UDP endpoint or configure --relay-url.")
+	if !isPublicMasqueDirectAddr(addr) {
+		fmt.Fprintln(os.Stderr, "# The automatic endpoint is a private/local/shared address. It is reachable only on a network that can route to it; for Internet/NAT/CGNAT use an explicit --direct-url with a reachable UDP endpoint or configure --relay-url.")
 	} else {
 		fmt.Fprintln(os.Stderr, "# Direct-only mode has no relay fallback. Ensure inbound UDP reaches this host/port; configure --relay-url if you want relay fallback.")
 	}
 	return nil
+}
+
+func isPublicMasqueDirectAddr(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsPrivate() {
+		return false
+	}
+	return !cgnatPrefix.Contains(addr)
 }
 
 func preferredMasqueDirectAddr() (netip.Addr, error) {
@@ -102,7 +140,7 @@ func preferredMasqueDirectAddr() (netip.Addr, error) {
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("list network interfaces: %w", err)
 	}
-	var private netip.Addr
+	var fallback netip.Addr
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -129,16 +167,16 @@ func preferredMasqueDirectAddr() (netip.Addr, error) {
 			if !addr.IsGlobalUnicast() || addr.IsLoopback() || addr.IsLinkLocalUnicast() {
 				continue
 			}
-			if !addr.IsPrivate() {
+			if isPublicMasqueDirectAddr(addr) {
 				return addr, nil
 			}
-			if !private.IsValid() {
-				private = addr
+			if !fallback.IsValid() {
+				fallback = addr
 			}
 		}
 	}
-	if private.IsValid() {
-		return private, nil
+	if fallback.IsValid() {
+		return fallback, nil
 	}
 	return netip.Addr{}, fmt.Errorf("no non-loopback unicast address found; configure --direct-url or --relay-url explicitly")
 }
@@ -152,10 +190,13 @@ func ensureAutoMasqueCertificate() (certPath, keyPath string, err error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", "", fmt.Errorf("create automatic direct TLS directory: %w", err)
 	}
-	certPath = filepath.Join(dir, "cert.pem")
-	keyPath = filepath.Join(dir, "key.pem")
-	if fileExists(certPath) && fileExists(keyPath) {
-		return certPath, keyPath, nil
+
+	// Keep the certificate and private key in one PEM bundle. Replacing one file
+	// atomically means concurrent processes can never observe a certificate from
+	// one generation paired with a key from another.
+	bundlePath := filepath.Join(dir, "tls.pem")
+	if _, err := tls.LoadX509KeyPair(bundlePath, bundlePath); err == nil {
+		return bundlePath, bundlePath, nil
 	}
 
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -186,49 +227,41 @@ func ensureAutoMasqueCertificate() (certPath, keyPath string, err error) {
 	}
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
-	if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
-		return "", "", fmt.Errorf("write automatic direct TLS certificate: %w", err)
-	}
-	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
-		_ = os.Remove(certPath)
-		return "", "", fmt.Errorf("write automatic direct TLS key: %w", err)
-	}
-	return certPath, keyPath, nil
-}
-
-func fileExists(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && !st.IsDir()
-}
-
-func configureAutoMasqueDirectClient(args []string) {
-	if os.Getenv("MASQUECAT_INSECURE_SKIP_VERIFY") != "" {
-		return
-	}
-	for _, arg := range args[1:] {
-		if !strings.HasPrefix(arg, "mc") {
-			continue
+	bundle := append(certPEM, keyPEM...)
+	if err := writeAutoMasqueBundle(dir, bundlePath, bundle); err != nil {
+		// On Windows another process may have won the rename race. Accept its
+		// complete bundle rather than failing merely because our rename lost.
+		if _, loadErr := tls.LoadX509KeyPair(bundlePath, bundlePath); loadErr == nil {
+			return bundlePath, bundlePath, nil
 		}
-		ci, err := tailcat.ParseMasqueConnBlob(tailcat.MasqueConnBlob(arg))
-		if err != nil || !isAutomaticDirectOnlyToken(ci) {
-			continue
-		}
-		// The inner WireGuard node key from the mc token is the end-to-end peer
-		// identity. This opt-out applies only to the automatic direct-only outer
-		// carrier; there is no relay TLS connection in this token to weaken.
-		_ = os.Setenv("MASQUECAT_INSECURE_SKIP_VERIFY", "1")
-		return
+		return "", "", fmt.Errorf("write automatic direct TLS bundle: %w", err)
 	}
+	return bundlePath, bundlePath, nil
 }
 
-func isAutomaticDirectOnlyToken(ci tailcat.MasqueConnInfo) bool {
-	if ci.DirectURL == "" || ci.RelayURL != "" {
-		return false
+func writeAutoMasqueBundle(dir, path string, data []byte) (retErr error) {
+	f, err := os.CreateTemp(dir, ".tls-*.tmp")
+	if err != nil {
+		return err
 	}
-	u, err := url.Parse(ci.DirectURL)
-	if err != nil || u.Scheme != "https" || u.Port() != autoMasqueDirectPort {
-		return false
+	tmp := f.Name()
+	defer func() { _ = os.Remove(tmp) }()
+	defer func() {
+		if err := f.Close(); retErr == nil && err != nil {
+			retErr = err
+		}
+	}()
+	if err := f.Chmod(0600); err != nil {
+		return err
 	}
-	_, err = netip.ParseAddr(u.Hostname())
-	return err == nil
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
