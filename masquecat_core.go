@@ -42,6 +42,12 @@ const (
 	masqueCorePingPort       uint16      = 65535
 )
 
+// masqueCorePingAddr is an internal control address carried only inside the
+// one-peer WireGuard tunnel. Keeping ping on a distinct address means every
+// uint16 TCP port, including 65535, remains available on the server's real
+// Tailcat address for OnTCP/ServedTCPPorts.
+var masqueCorePingAddr = netip.MustParseAddr("fd00:7461:696c:6361:7400:7069:6e67:1")
+
 type masquePacketForwarder interface {
 	ForwardPacket(src, dst key.NodePublic, payload []byte) error
 }
@@ -516,9 +522,6 @@ func (c *masqueCore) Inject(src key.NodePublic, payload []byte) error {
 }
 
 func (c *masqueCore) localPortAllowed(port uint16) bool {
-	if port == masqueCorePingPort {
-		return true
-	}
 	if c.servedTCPPorts == nil {
 		return true
 	}
@@ -539,13 +542,14 @@ func (c *masqueCore) handleTCPForward(r *tcp.ForwarderRequest) {
 	}
 	dst := netip.AddrPortFrom(dstAddr.Unmap(), id.LocalPort)
 	var handler func(net.Conn)
-	if dst.Addr() == c.addr {
-		if dst.Port() == masqueCorePingPort {
-			handler = func(conn net.Conn) { _ = conn.Close() }
-		} else if c.localPortAllowed(dst.Port()) && c.onTCP != nil {
+	switch {
+	case dst.Addr() == masqueCorePingAddr && dst.Port() == masqueCorePingPort:
+		handler = func(conn net.Conn) { _ = conn.Close() }
+	case dst.Addr() == c.addr:
+		if c.localPortAllowed(dst.Port()) && c.onTCP != nil {
 			handler = c.onTCP(dst.Port())
 		}
-	} else if c.onTCPForward != nil {
+	case c.onTCPForward != nil:
 		if nat64Prefix.Contains(dst.Addr()) {
 			var a4 [4]byte
 			d6 := dst.Addr().As16()
@@ -665,7 +669,7 @@ func (c *masqueCore) Dial(ctx context.Context, network, addr string) (net.Conn, 
 
 func (c *masqueCore) Ping(ctx context.Context, peer key.NodePublic) (PingResult, error) {
 	start := time.Now()
-	conn, err := c.DialTCP(ctx, netip.AddrPortFrom(tcAddrForKey(peer), masqueCorePingPort))
+	conn, err := c.DialTCP(ctx, netip.AddrPortFrom(masqueCorePingAddr, masqueCorePingPort))
 	if err != nil {
 		return PingResult{}, err
 	}
