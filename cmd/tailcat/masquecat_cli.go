@@ -148,10 +148,18 @@ func masqueClientPingMode(logf logger.Logf, untilDirect bool, timeout time.Durat
 		cancel()
 		_ = cl.Close()
 		if err != nil {
-			if untilDirect && time.Now().After(deadline) {
+			if !untilDirect {
+				return fmt.Errorf("ping: %w", err)
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
 				return fmt.Errorf("no direct MASQUE path to the server after %v: %w", timeout, err)
 			}
-			return fmt.Errorf("ping: %w", err)
+			// A refused or temporarily unavailable endpoint can fail immediately.
+			// --until-direct is a deadline-based diagnostic, so retain retrying
+			// until that deadline instead of treating the first fast error as final.
+			time.Sleep(max(time.Duration(0), min(remaining, time.Second-time.Since(t0))))
+			continue
 		}
 		fmt.Printf("pong in %v via %v\n", res.Latency.Round(10*time.Microsecond), path)
 		if !untilDirect || path == tailcat.MasquePathDirect {
@@ -266,6 +274,7 @@ func masqueServer(logf logger.Logf, serveSpec string) error {
 		DirectURL:          *flagMasqueDirectURL,
 		DirectTLSConfig:    directTLS,
 		RelayURL:           *flagMasqueRelayURL,
+		AutomaticDirect:    envTruthy(autoMasqueDirectMarkerEnv),
 		InsecureSkipVerify: *flagMasqueInsecureSkipVerify,
 	}
 
@@ -465,6 +474,7 @@ func masqueGenKey(args []string) error {
 		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv.Private).DiscoPublic,
 		DirectURL:         *flagMasqueDirectURL,
 		RelayURL:          *flagMasqueRelayURL,
+		AutomaticDirect:   envTruthy(autoMasqueDirectMarkerEnv),
 	}).ConnBlob()
 	if err != nil {
 		return err
