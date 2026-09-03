@@ -880,7 +880,7 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 	// server.tailcat magic name and exit-node destinations.
 	var blob tailcat.ConnBlob
 	if len(args) > 0 {
-		if _, err := tailcat.ParseConnBlob(tailcat.ConnBlob(args[0])); err == nil {
+		if validCLIConnBlob(tailcat.ConnBlob(args[0])) {
 			blob = tailcat.ConnBlob(args[0])
 			args = args[1:]
 		} else if strings.Contains(args[0], ".") {
@@ -898,10 +898,10 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 	// proxy sees the same identity, matching the other client modes.
 	clientPriv := clientKey()
 
-	var cl *tailcat.Client
+	var cl cliTCPClient
 	if blob != "" {
-		cl = newClient(logf, blob, clientPriv)
-		pi, err := cl.Ping(context.Background())
+		cl = newCLITCPClient(logf, blob, clientPriv)
+		pi, err := pingCLITCPClient(context.Background(), cl)
 		if err != nil {
 			log.Fatalf("tailcat Ping: %v", err)
 		}
@@ -909,17 +909,17 @@ func clientSOCKSMode(logf logger.Logf, listen string, args []string) error {
 	}
 
 	var clientsMu sync.Mutex
-	clients := map[tailcat.ConnBlob]*tailcat.Client{}
+	clients := map[tailcat.ConnBlob]cliTCPClient{}
 	if cl != nil {
 		clients[blob] = cl
 	}
-	clientForBlob := func(b tailcat.ConnBlob) *tailcat.Client {
+	clientForBlob := func(b tailcat.ConnBlob) cliTCPClient {
 		clientsMu.Lock()
 		defer clientsMu.Unlock()
 		if c, ok := clients[b]; ok {
 			return c
 		}
-		c := newClient(logf, b, clientPriv)
+		c := newCLITCPClient(logf, b, clientPriv)
 		clients[b] = c
 		return c
 	}
@@ -1005,8 +1005,8 @@ func classifySOCKSAddr(ctx context.Context, lookup func(context.Context, string)
 	if host == "server.tailcat" || host == "" {
 		return socksTarget{toServer: true, port: uint16(portNum)}, nil
 	}
-	if strings.HasPrefix(host, "tc") && !strings.Contains(host, ".") {
-		if _, err := tailcat.ParseConnBlob(tailcat.ConnBlob(host)); err == nil {
+	if (strings.HasPrefix(host, "tc") || strings.HasPrefix(host, "mc")) && !strings.Contains(host, ".") {
+		if validCLIConnBlob(tailcat.ConnBlob(host)) {
 			return socksTarget{blob: tailcat.ConnBlob(host), port: uint16(portNum)}, nil
 		}
 	}
@@ -1583,6 +1583,10 @@ func genKey(args []string) error {
 		fmt.Fprintf(os.Stderr, "# wrote file to %v\n", *key)
 		fmt.Println(priv.Private.Public().String())
 		return nil
+	}
+	if *region == "list" {
+		// Listing regions is the only legacy genkey operation that doesn't
+		// need a destination key path.
 	}
 
 	var match string
