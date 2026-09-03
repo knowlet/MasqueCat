@@ -105,17 +105,22 @@ func TestMasqueCoreAddAllowedClientTightensLivePolicy(t *testing.T) {
 
 func TestMasqueCoreServedTCPPortsNilVersusEmpty(t *testing.T) {
 	unrestricted := &masqueCore{servedTCPPorts: nil}
-	if !unrestricted.localPortAllowed(1234) {
-		t.Fatal("nil ServedTCPPorts should admit all local ports")
+	if !unrestricted.localPortAllowed(1234) || !unrestricted.localPortAllowed(65535) {
+		t.Fatal("nil ServedTCPPorts should admit every local application port")
 	}
 
 	none := &masqueCore{servedTCPPorts: []filter.PortRange{}}
-	if none.localPortAllowed(1234) {
-		t.Fatal("non-nil empty ServedTCPPorts should admit no application ports")
+	if none.localPortAllowed(1234) || none.localPortAllowed(65535) {
+		t.Fatal("non-nil empty ServedTCPPorts should admit no application ports, including 65535")
 	}
 
 	only443 := &masqueCore{servedTCPPorts: []filter.PortRange{{First: 443, Last: 443}}}
-	if !only443.localPortAllowed(443) || only443.localPortAllowed(80) {
+	if !only443.localPortAllowed(443) || only443.localPortAllowed(80) || only443.localPortAllowed(65535) {
 		t.Fatal("explicit ServedTCPPorts range was not enforced")
+	}
+
+	only65535 := &masqueCore{servedTCPPorts: []filter.PortRange{{First: 65535, Last: 65535}}}
+	if !only65535.localPortAllowed(65535) {
+		t.Fatal("TCP port 65535 must remain available to applications")
 	}
 }
