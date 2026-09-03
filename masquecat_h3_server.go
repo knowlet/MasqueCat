@@ -204,7 +204,7 @@ func (r *MasqueRelay) lookup(k key.NodePublic) *relayPeer {
 // ServeMasqueHTTP3 serves handler over HTTP/3 with CONNECT-UDP datagrams.
 // It blocks until the server stops.
 func ServeMasqueHTTP3(addr string, tlsConfig *tls.Config, handler http.Handler) error {
-	if tlsConfig == nil || len(tlsConfig.Certificates) == 0 {
+	if !hasMasqueServerCertificate(tlsConfig) {
 		return fmt.Errorf("MASQUE HTTP/3 server requires a TLS certificate")
 	}
 	conf := http3.ConfigureTLSConfig(tlsConfig.Clone())
