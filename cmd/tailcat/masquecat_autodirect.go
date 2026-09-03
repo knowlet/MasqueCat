@@ -25,7 +25,16 @@ const (
 	autoMasqueDirectMarkerEnv = "MASQUECAT_AUTO_DIRECT"
 )
 
-var cgnatPrefix = netip.MustParsePrefix("100.64.0.0/10")
+var nonPublicMasqueDirectPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),  // RFC 6598 shared address space
+	netip.MustParsePrefix("192.0.0.0/24"),   // IETF protocol assignments
+	netip.MustParsePrefix("192.0.2.0/24"),   // TEST-NET-1
+	netip.MustParsePrefix("198.18.0.0/15"),  // benchmarking
+	netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
+	netip.MustParsePrefix("203.0.113.0/24"), // TEST-NET-3
+	netip.MustParsePrefix("240.0.0.0/4"),    // reserved
+	netip.MustParsePrefix("2001:db8::/32"),  // IPv6 documentation
+}
 
 // initMasqueAutoDirect restores the original Tailcat zero-argument UX for the
 // MasqueCat transport: a server can be started without first provisioning a
@@ -119,8 +128,8 @@ func configureAutoMasqueDirect() error {
 	_ = os.Setenv(autoMasqueDirectMarkerEnv, "1")
 
 	fmt.Fprintf(os.Stderr, "# No MASQUE relay URL configured; starting direct-only mode at %s (UDP %s).\n", directURL, autoMasqueDirectPort)
-	if !isPublicMasqueDirectAddr(addr) {
-		fmt.Fprintln(os.Stderr, "# The automatic endpoint is a private/local/shared address. It is reachable only on a network that can route to it; for Internet/NAT/CGNAT use an explicit --direct-url with a reachable UDP endpoint or configure --relay-url.")
+	if addr.IsPrivate() {
+		fmt.Fprintln(os.Stderr, "# The automatic endpoint is a private/local address. It is reachable only on a network that can route to it; for Internet/NAT use an explicit --direct-url with a reachable UDP endpoint or configure --relay-url.")
 	} else {
 		fmt.Fprintln(os.Stderr, "# Direct-only mode has no relay fallback. Ensure inbound UDP reaches this host/port; configure --relay-url if you want relay fallback.")
 	}
@@ -132,7 +141,12 @@ func isPublicMasqueDirectAddr(addr netip.Addr) bool {
 	if !addr.IsValid() || !addr.IsGlobalUnicast() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsPrivate() {
 		return false
 	}
-	return !cgnatPrefix.Contains(addr)
+	for _, pfx := range nonPublicMasqueDirectPrefixes {
+		if pfx.Contains(addr) {
+			return false
+		}
+	}
+	return true
 }
 
 func preferredMasqueDirectAddr() (netip.Addr, error) {
@@ -140,7 +154,7 @@ func preferredMasqueDirectAddr() (netip.Addr, error) {
 	if err != nil {
 		return netip.Addr{}, fmt.Errorf("list network interfaces: %w", err)
 	}
-	var fallback netip.Addr
+	var private netip.Addr
 	for _, iface := range ifaces {
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
 			continue
@@ -170,15 +184,18 @@ func preferredMasqueDirectAddr() (netip.Addr, error) {
 			if isPublicMasqueDirectAddr(addr) {
 				return addr, nil
 			}
-			if !fallback.IsValid() {
-				fallback = addr
+			// RFC1918/ULA addresses remain useful for the original same-LAN
+			// zero-config workflow. Shared, documentation, benchmark and other
+			// reserved ranges are deliberately not advertised automatically.
+			if addr.IsPrivate() && !private.IsValid() {
+				private = addr
 			}
 		}
 	}
-	if fallback.IsValid() {
-		return fallback, nil
+	if private.IsValid() {
+		return private, nil
 	}
-	return netip.Addr{}, fmt.Errorf("no non-loopback unicast address found; configure --direct-url or --relay-url explicitly")
+	return netip.Addr{}, fmt.Errorf("no public or private LAN address found; CGNAT/shared/reserved addresses require an explicit --direct-url or --relay-url")
 }
 
 func ensureAutoMasqueCertificate() (certPath, keyPath string, err error) {
@@ -239,18 +256,14 @@ func ensureAutoMasqueCertificate() (certPath, keyPath string, err error) {
 	return bundlePath, bundlePath, nil
 }
 
-func writeAutoMasqueBundle(dir, path string, data []byte) (retErr error) {
+func writeAutoMasqueBundle(dir, path string, data []byte) error {
 	f, err := os.CreateTemp(dir, ".tls-*.tmp")
 	if err != nil {
 		return err
 	}
 	tmp := f.Name()
 	defer func() { _ = os.Remove(tmp) }()
-	defer func() {
-		if err := f.Close(); retErr == nil && err != nil {
-			retErr = err
-		}
-	}()
+	defer func() { _ = f.Close() }()
 	if err := f.Chmod(0600); err != nil {
 		return err
 	}
