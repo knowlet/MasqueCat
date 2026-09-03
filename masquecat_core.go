@@ -321,8 +321,11 @@ type masqueCore struct {
 	bind  *masqueBind
 	wg    *device.Device
 
-	isServer       bool
+	isServer bool
+
+	allowMu        sync.RWMutex
 	allowedClients map[key.NodePublic]bool
+
 	onTCP          func(uint16) func(net.Conn)
 	onTCPForward   func(netip.AddrPort) func(net.Conn)
 	servedTCPPorts []filter.PortRange
@@ -410,9 +413,13 @@ func newMasqueCore(priv key.NodePrivate, opts masqueCoreOptions, logf logger.Log
 		isServer:       opts.IsServer,
 		onTCP:          opts.OnTCP,
 		onTCPForward:   opts.OnTCPForward,
-		servedTCPPorts: append([]filter.PortRange(nil), opts.ServedTCPPorts...),
 		peers:          make(map[key.NodePublic]bool),
 		allowedClients: nil,
+	}
+	// Preserve nil versus non-nil empty. The public Server contract uses nil
+	// for unrestricted local ports and an empty slice for "serve no ports".
+	if opts.ServedTCPPorts != nil {
+		c.servedTCPPorts = append([]filter.PortRange{}, opts.ServedTCPPorts...)
 	}
 	if len(opts.AllowedClients) != 0 {
 		c.allowedClients = make(map[key.NodePublic]bool, len(opts.AllowedClients))
@@ -442,7 +449,21 @@ func newMasqueCore(priv key.NodePrivate, opts masqueCoreOptions, logf logger.Log
 func (c *masqueCore) Addr() netip.Addr { return c.addr }
 
 func (c *masqueCore) peerAllowed(peer key.NodePublic) bool {
+	c.allowMu.RLock()
+	defer c.allowMu.RUnlock()
 	return !c.isServer || c.allowedClients == nil || c.allowedClients[peer]
+}
+
+// AddAllowedClient applies the same transition as Server.AddAllowedClient: an
+// empty/nil allowlist initially admits every client, and the first addition
+// switches the live server to an explicit allowlist for future admissions.
+func (c *masqueCore) AddAllowedClient(peer key.NodePublic) {
+	c.allowMu.Lock()
+	defer c.allowMu.Unlock()
+	if c.allowedClients == nil {
+		c.allowedClients = make(map[key.NodePublic]bool)
+	}
+	c.allowedClients[peer] = true
 }
 
 func nodePublicHex(k key.NodePublic) string { return hex.EncodeToString(k.AppendTo(nil)) }
@@ -498,7 +519,7 @@ func (c *masqueCore) localPortAllowed(port uint16) bool {
 	if port == masqueCorePingPort {
 		return true
 	}
-	if len(c.servedTCPPorts) == 0 {
+	if c.servedTCPPorts == nil {
 		return true
 	}
 	for _, pr := range c.servedTCPPorts {
