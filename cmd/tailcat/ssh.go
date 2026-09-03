@@ -88,13 +88,14 @@ func clientSSHMode(portOrIPPort string, args []string) error {
 	if sshUser != "" {
 		sshDst = sshUser + "@" + sshDst
 	}
+	insecureSkipVerify := flagMasqueInsecureSkipVerify != nil && *flagMasqueInsecureSkipVerify
 	argv := []string{
 		sshExe,
 		"-o", "UpdateHostKeys no",
 		"-o", "StrictHostKeyChecking no",
 		"-o", "UserKnownHostsFile " + os.DevNull,
 		"-o", "LogLevel ERROR",
-		"-o", "ProxyCommand=" + sshProxyCommand(exe, *flagKey, *flagDERPMapURL, connBlobStr, portOrIPPort),
+		"-o", "ProxyCommand=" + sshProxyCommand(exe, *flagKey, *flagDERPMapURL, insecureSkipVerify, connBlobStr, portOrIPPort),
 		sshDst,
 	}
 	argv = append(argv, cmdArgs...)
@@ -106,7 +107,7 @@ func clientSSHMode(portOrIPPort string, args []string) error {
 // sshProxyCommand returns the command passed to OpenSSH to connect the SSH
 // client to a tailcat server. The command is run by OpenSSH, so values that
 // can contain shell-special characters must be quoted.
-func sshProxyCommand(exe, keyName, derpMapURL, connBlob, portOrIPPort string) string {
+func sshProxyCommand(exe, keyName, derpMapURL string, insecureSkipVerify bool, connBlob, portOrIPPort string) string {
 	if runtime.GOOS == "windows" {
 		// Plain quotes without Go's %q backslash escaping: the
 		// executable is a Windows path whose backslashes must survive
@@ -124,7 +125,7 @@ func sshProxyCommand(exe, keyName, derpMapURL, connBlob, portOrIPPort string) st
 	if derpMapURL != tailcat.DefaultDERPMapURL {
 		cmd += fmt.Sprintf(" --derpmap-url=%q", derpMapURL)
 	}
-	if flagMasqueInsecureSkipVerify != nil && *flagMasqueInsecureSkipVerify {
+	if insecureSkipVerify {
 		cmd += " --insecure-skip-verify"
 	}
 	return fmt.Sprintf("%s %s %s", cmd, connBlob, portOrIPPort)
