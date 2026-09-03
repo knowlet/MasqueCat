@@ -8,6 +8,7 @@ import (
 
 	"github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/types/key"
+	"tailscale.com/wgengine/filter"
 )
 
 type recordingMasqueForwarder struct {
@@ -83,5 +84,38 @@ func TestMasqueBindInjectFeedsWireGuardReceive(t *testing.T) {
 	mep, ok := wireEndpoints[0].(*masqueEndpoint)
 	if !ok || mep.peer != peer {
 		t.Fatalf("received endpoint = %#v, want peer %v", wireEndpoints[0], peer)
+	}
+}
+
+func TestMasqueCoreAddAllowedClientTightensLivePolicy(t *testing.T) {
+	allowed := key.NewNode().Public()
+	other := key.NewNode().Public()
+	c := &masqueCore{isServer: true}
+	if !c.peerAllowed(other) {
+		t.Fatal("nil allowlist should initially allow all clients")
+	}
+	c.AddAllowedClient(allowed)
+	if !c.peerAllowed(allowed) {
+		t.Fatal("newly allowed client was rejected")
+	}
+	if c.peerAllowed(other) {
+		t.Fatal("first live allowlist addition must switch the server to explicit admission")
+	}
+}
+
+func TestMasqueCoreServedTCPPortsNilVersusEmpty(t *testing.T) {
+	unrestricted := &masqueCore{servedTCPPorts: nil}
+	if !unrestricted.localPortAllowed(1234) {
+		t.Fatal("nil ServedTCPPorts should admit all local ports")
+	}
+
+	none := &masqueCore{servedTCPPorts: []filter.PortRange{}}
+	if none.localPortAllowed(1234) {
+		t.Fatal("non-nil empty ServedTCPPorts should admit no application ports")
+	}
+
+	only443 := &masqueCore{servedTCPPorts: []filter.PortRange{{First: 443, Last: 443}}}
+	if !only443.localPortAllowed(443) || only443.localPortAllowed(80) {
+		t.Fatal("explicit ServedTCPPorts range was not enforced")
 	}
 }
