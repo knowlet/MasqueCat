@@ -42,6 +42,12 @@ type MasqueServer struct {
 	DirectTLSConfig *tls.Config
 	RelayURL        string
 
+	// AutomaticDirect marks DirectURL as the CLI-synthesized direct-only
+	// endpoint. It is serialized into the connection token so clients can relax
+	// only this generated endpoint's outer TLS verification without guessing
+	// from its URL shape.
+	AutomaticDirect bool
+
 	// InsecureSkipVerify disables TLS certificate and hostname verification for
 	// the outbound relay connection. It is intended only for development.
 	InsecureSkipVerify bool
@@ -55,6 +61,10 @@ type MasqueServer struct {
 	blob       MasqueConnBlob
 }
 
+func hasMasqueServerCertificate(conf *tls.Config) bool {
+	return conf != nil && (len(conf.Certificates) != 0 || conf.GetCertificate != nil || conf.GetConfigForClient != nil)
+}
+
 func (s *MasqueServer) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -64,6 +74,9 @@ func (s *MasqueServer) Start() error {
 	if s.DirectURL == "" && s.RelayURL == "" {
 		return errors.New("masquecat: configure a direct or relay MASQUE endpoint")
 	}
+	if s.AutomaticDirect && (s.DirectURL == "" || s.RelayURL != "") {
+		return errors.New("masquecat: AutomaticDirect requires a direct-only endpoint")
+	}
 	if s.DirectURL != "" {
 		if err := validateMasqueURL("direct", s.DirectURL); err != nil {
 			return err
@@ -71,7 +84,7 @@ func (s *MasqueServer) Start() error {
 		if s.DirectListen == "" {
 			return errors.New("masquecat: DirectURL requires DirectListen")
 		}
-		if s.DirectTLSConfig == nil || len(s.DirectTLSConfig.Certificates) == 0 {
+		if !hasMasqueServerCertificate(s.DirectTLSConfig) {
 			return errors.New("masquecat: direct MASQUE requires a TLS certificate")
 		}
 	}
@@ -176,6 +189,7 @@ func (s *MasqueServer) Start() error {
 		ServerDiscoPublic: DiscoPublicForNode(priv).DiscoPublic,
 		DirectURL:         s.DirectURL,
 		RelayURL:          s.RelayURL,
+		AutomaticDirect:   s.AutomaticDirect,
 	}).ConnBlob()
 	if err != nil {
 		cleanup()
@@ -183,6 +197,18 @@ func (s *MasqueServer) Start() error {
 	}
 	s.blob = blob
 	return nil
+}
+
+// AddAllowedClient adds k to the admission policy used by both future starts
+// and the currently running MASQUE core. This intentionally overrides the
+// promoted Server method: MasqueServer never initializes the legacy Server.lb.
+func (s *MasqueServer) AddAllowedClient(k key.NodePublic) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Server.AddAllowedClient(k)
+	if s.core != nil {
+		s.core.AddAllowedClient(k)
+	}
 }
 
 func (s *MasqueServer) ConnBlob() MasqueConnBlob {
@@ -324,12 +350,13 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 
 	childCtx, cancel := context.WithCancel(context.Background())
 	local := priv.Public()
+	insecureSkipVerify := c.InsecureSkipVerify || ci.AutomaticDirect
 	dialPath := func(rawURL string, target key.NodePublic, mode string) (*masquePath, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		dialCtx, finishDial := masqueDialContext(childCtx, ctx)
-		p, err := newMasquePathWithTLS(dialCtx, rawURL, target, priv, mode, c.InsecureSkipVerify, logf)
+		p, err := newMasquePathWithTLS(dialCtx, rawURL, target, priv, mode, insecureSkipVerify, logf)
 		operationActive := finishDial(err == nil)
 		if !operationActive {
 			if p != nil {
