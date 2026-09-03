@@ -30,6 +30,13 @@ type MasqueConnInfo struct {
 	ServerDiscoPublic key.DiscoPublic
 	DirectURL         string
 	RelayURL          string
+
+	// AutomaticDirect marks the direct-only endpoint as one synthesized by the
+	// tailcat CLI with its local self-signed carrier certificate. Clients may use
+	// this explicit marker to relax only the outer direct TLS verification while
+	// still authenticating the peer with ServerPublic. URL shape alone must not
+	// be used to infer this property.
+	AutomaticDirect bool
 }
 
 type masqueWireConnInfo struct {
@@ -38,6 +45,7 @@ type masqueWireConnInfo struct {
 	ServerDiscoPublic key.DiscoPublic `json:"d"`
 	DirectURL         string          `json:"p,omitempty"`
 	RelayURL          string          `json:"r,omitempty"`
+	AutomaticDirect   bool            `json:"a,omitempty"`
 }
 
 // ConnBlob serializes ci to the compact mc-prefixed token used by MasqueCat.
@@ -100,6 +108,9 @@ func (ci MasqueConnInfo) validate() error {
 	}
 	if ci.DirectURL == "" && ci.RelayURL == "" {
 		return errors.New("MasqueCat token has neither a direct nor relay endpoint")
+	}
+	if ci.AutomaticDirect && (ci.DirectURL == "" || ci.RelayURL != "") {
+		return errors.New("MasqueCat automatic-direct marker requires a direct-only endpoint")
 	}
 	if ci.DirectURL != "" {
 		if err := validateMasqueURL("direct", ci.DirectURL); err != nil {
