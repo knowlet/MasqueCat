@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"net/netip"
 	"path/filepath"
 	"sync"
 	"testing"
