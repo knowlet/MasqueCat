@@ -26,18 +26,13 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 		wantExe = `"` + exe + `"`
 	}
 
-	oldInsecure := flagMasqueInsecureSkipVerify
-	insecure := false
-	flagMasqueInsecureSkipVerify = &insecure
-	t.Cleanup(func() { flagMasqueInsecureSkipVerify = oldInsecure })
-
-	got := sshProxyCommand(exe, key, url, blob, port)
+	got := sshProxyCommand(exe, key, url, false, blob, port)
 	want := wantExe + ` --key="client-default" --derpmap-url="https://derp.example.com/derpmap.json" tc-short-blob 22`
 	if got != want {
 		t.Errorf("sshProxyCommand with custom DERP map = %q; want %q", got, want)
 	}
 
-	got = sshProxyCommand(exe, key, tailcat.DefaultDERPMapURL, blob, port)
+	got = sshProxyCommand(exe, key, tailcat.DefaultDERPMapURL, false, blob, port)
 	want = wantExe + ` --key="client-default" tc-short-blob 22`
 	if got != want {
 		t.Errorf("sshProxyCommand with default DERP map = %q; want %q", got, want)
@@ -46,14 +41,13 @@ func TestSSHProxyCommandDERPMap(t *testing.T) {
 	// No --key flag at all when unset. The shell would collapse
 	// --key="" to --key=, which ff parses by consuming the next
 	// argument, the address blob.
-	got = sshProxyCommand(exe, "", tailcat.DefaultDERPMapURL, blob, port)
+	got = sshProxyCommand(exe, "", tailcat.DefaultDERPMapURL, false, blob, port)
 	want = wantExe + ` tc-short-blob 22`
 	if got != want {
 		t.Errorf("sshProxyCommand with no key = %q; want %q", got, want)
 	}
 
-	insecure = true
-	got = sshProxyCommand(exe, key, tailcat.DefaultDERPMapURL, blob, port)
+	got = sshProxyCommand(exe, key, tailcat.DefaultDERPMapURL, true, blob, port)
 	want = wantExe + ` --key="client-default" --insecure-skip-verify tc-short-blob 22`
 	if got != want {
 		t.Errorf("sshProxyCommand with insecure MASQUE TLS = %q; want %q", got, want)
