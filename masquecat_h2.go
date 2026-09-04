@@ -5,6 +5,7 @@ package tailcat
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -459,10 +460,11 @@ func (s *masqueHTTP2Server) serveConn(conn net.Conn) error {
 		return fmt.Errorf("masquecat: HTTP/2 listener negotiated %q", tlsConn.ConnectionState().NegotiatedProtocol)
 	}
 
-	// Keep a bounded read deadline from the end of TLS negotiation through
-	// the first valid Extended CONNECT request. This prevents unauthenticated
-	// peers from pinning one fd/goroutine forever by stalling on the preface or
-	// request headers.
+	// Keep a bounded absolute read deadline from the end of TLS negotiation
+	// through the first valid Extended CONNECT request. This prevents
+	// unauthenticated peers from extending their lifetime indefinitely with
+	// partial preface/settings/header traffic. After CONNECT is accepted,
+	// readLoop switches to idle PING-based liveness detection.
 	if err := conn.SetReadDeadline(time.Now().Add(masqueH2WriteTimeout)); err != nil {
 		return err
 	}
@@ -538,10 +540,45 @@ func (c *masqueHTTP2Conn) writeSettings() error {
 }
 
 func (c *masqueHTTP2Conn) readLoop(tlsConn *tls.Conn) error {
+	pingOutstanding := false
+	var pingData [8]byte
 	for {
+		// Before a CONNECT stream exists, preserve the absolute deadline that
+		// serveConn installed. Once authenticated/session traffic can be long
+		// lived, switch to an idle timeout and probe a silent peer with PING.
+		if c.streamID != 0 {
+			timeout := masqueH2ReadIdleTimeout
+			if pingOutstanding {
+				timeout = masqueH2PingTimeout
+			}
+			if err := c.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+				return err
+			}
+		}
+
 		frame, err := c.fr.ReadFrame()
 		if err != nil {
+			var netErr net.Error
+			if c.streamID != 0 && errors.As(err, &netErr) && netErr.Timeout() {
+				if pingOutstanding {
+					return fmt.Errorf("masquecat: HTTP/2 client did not answer PING within %s", masqueH2PingTimeout)
+				}
+				if _, randErr := rand.Read(pingData[:]); randErr != nil {
+					return randErr
+				}
+				if pingErr := c.writeFrame(func() error { return c.fr.WritePing(false, pingData) }); pingErr != nil {
+					return pingErr
+				}
+				pingOutstanding = true
+				continue
+			}
 			return err
+		}
+		if c.streamID != 0 {
+			// Any successfully received frame proves the peer is alive. A PING
+			// ACK is ideal, but normal DATA/WINDOW_UPDATE traffic is equally
+			// sufficient to avoid declaring a live session dead.
+			pingOutstanding = false
 		}
 		switch f := frame.(type) {
 		case *http2.SettingsFrame:
@@ -668,11 +705,9 @@ func (c *masqueHTTP2Conn) startRequest(tlsConn *tls.Conn, f *http2.MetaHeadersFr
 		_ = bodyW.Close()
 		return errors.New("masquecat: expected HTTP/2 extended CONNECT-UDP")
 	}
-	if err := c.conn.SetReadDeadline(time.Time{}); err != nil {
-		_ = bodyR.Close()
-		_ = bodyW.Close()
-		return err
-	}
+	// Do not clear the read deadline permanently here. The next read-loop
+	// iteration replaces the initial absolute deadline with idle/PING liveness
+	// deadlines for this established CONNECT stream.
 	c.flowMu.Lock()
 	c.streamID = f.StreamID
 	c.peerStreamWindow = c.peerInitialWindow
