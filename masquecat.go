@@ -145,11 +145,23 @@ func (s *MasqueServer) Start() error {
 			cleanup()
 			return fmt.Errorf("listen for direct MASQUE: %w", err)
 		}
+		handler := directMasqueCoreHandler(priv, core, logf)
+		h2Addr, err := masqueHTTP2CompanionAddr(s.DirectListen, pc.LocalAddr())
+		if err != nil {
+			_ = pc.Close()
+			cleanup()
+			return fmt.Errorf("derive direct HTTP/2 MASQUE listen address: %w", err)
+		}
+		if err := startMasqueHTTP2(ctx, h2Addr, s.DirectTLSConfig, handler, logf); err != nil {
+			_ = pc.Close()
+			cleanup()
+			return fmt.Errorf("start direct HTTP/2 MASQUE: %w", err)
+		}
 		conf := http3.ConfigureTLSConfig(s.DirectTLSConfig.Clone())
 		conf.MinVersion = tls.VersionTLS13
 		h3 := &http3.Server{
 			TLSConfig:       conf,
-			Handler:         directMasqueCoreHandler(priv, core, logf),
+			Handler:         handler,
 			EnableDatagrams: true,
 		}
 		s.directPC, s.directHTTP = pc, h3
@@ -161,7 +173,7 @@ func (s *MasqueServer) Start() error {
 	}
 
 	if s.RelayURL != "" {
-		path, err := newMasquePathWithTLS(ctx, s.RelayURL, local, priv, masqueModeRelay, s.InsecureSkipVerify, logf)
+		path, err := newMasquePathWithFallback(ctx, s.RelayURL, local, priv, masqueModeRelay, s.InsecureSkipVerify, logf)
 		if err != nil {
 			cleanup()
 			return fmt.Errorf("connect MASQUE relay: %w", err)
@@ -356,7 +368,7 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 			return nil, err
 		}
 		dialCtx, finishDial := masqueDialContext(childCtx, ctx)
-		p, err := newMasquePathWithTLS(dialCtx, rawURL, target, priv, mode, insecureSkipVerify, logf)
+		p, err := newMasquePathWithFallback(dialCtx, rawURL, target, priv, mode, insecureSkipVerify, logf)
 		operationActive := finishDial(err == nil)
 		if !operationActive {
 			if p != nil {
