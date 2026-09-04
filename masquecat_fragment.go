@@ -1,41 +1,27 @@
-//go:build !js
-
 package tailcat
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"tailscale.com/types/key"
 )
 
 const (
-	// QUIC requires endpoints to be able to send 1200-byte UDP payloads. Keep
-	// each MasqueCat application datagram comfortably below that floor after
-	// accounting for the HTTP Datagram context ID, the 65-byte MasqueCat peer
-	// header, QUIC short-header / packet-number / AEAD overhead, and the fragment
-	// header below. A 1000-byte WireGuard fragment produces a 1086-byte HTTP
-	// Datagram payload (1 + 65 + 20 + 1000), leaving more than 100 bytes for the
-	// QUIC packet envelope even on the minimum-size path.
-	masqueWGFragmentChunkSize          = 1000
+	masqueWGFragmentVersion            = 1
 	masqueWGFragmentHeaderLen          = 20
+	masqueWGFragmentChunkSize          = 960
 	masqueWGFragmentMaxSize            = 64 << 10
-	masqueWGFragmentTTL                = 30 * time.Second
 	masqueWGMaxAssemblies              = 256
 	masqueWGMaxAssembliesPerSource     = 32
+	masqueWGFragmentAssemblyExpiration = 30 * time.Second
 )
 
-var (
-	// WireGuard messages start with a little-endian uint32 message type in the
-	// range 1..4. This marker therefore cannot collide with a valid current
-	// WireGuard message at offset zero.
-	masqueWGFragmentMagic = [4]byte{'M', 'C', 'F', 1}
-	masqueWGFragmentSeq   atomic.Uint64
-)
+var masqueWGFragmentMagic = [4]byte{'M', 'C', 'F', masqueWGFragmentVersion}
 
 type masqueWGFragmentKey struct {
 	src key.NodePublic
@@ -55,44 +41,6 @@ type masqueWGReassembler struct {
 	sets map[masqueWGFragmentKey]*masqueWGFragmentAssembly
 }
 
-func nextMasqueWGFragmentID() uint64 {
-	// The timestamp makes reuse across process restarts vanishingly unlikely,
-	// while the atomic sequence guarantees uniqueness for concurrent sends in a
-	// single process even when multiple fragments are created in one nanosecond.
-	return uint64(time.Now().UnixNano()) + masqueWGFragmentSeq.Add(1)
-}
-
-func fragmentMasqueWireGuardPacket(payload []byte) ([][]byte, error) {
-	if len(payload) <= masqueWGFragmentChunkSize {
-		return nil, nil
-	}
-	if len(payload) > masqueWGFragmentMaxSize {
-		return nil, fmt.Errorf("masquecat: WireGuard packet too large to fragment: %d bytes", len(payload))
-	}
-	count := (len(payload) + masqueWGFragmentChunkSize - 1) / masqueWGFragmentChunkSize
-	if count > int(^uint16(0)) {
-		return nil, fmt.Errorf("masquecat: WireGuard packet needs too many fragments: %d", count)
-	}
-
-	id := nextMasqueWGFragmentID()
-	fragments := make([][]byte, 0, count)
-	for i, off := 0, 0; off < len(payload); i, off = i+1, off+masqueWGFragmentChunkSize {
-		end := off + masqueWGFragmentChunkSize
-		if end > len(payload) {
-			end = len(payload)
-		}
-		fragment := make([]byte, masqueWGFragmentHeaderLen+end-off)
-		copy(fragment[:4], masqueWGFragmentMagic[:])
-		binary.BigEndian.PutUint64(fragment[4:12], id)
-		binary.BigEndian.PutUint16(fragment[12:14], uint16(i))
-		binary.BigEndian.PutUint16(fragment[14:16], uint16(count))
-		binary.BigEndian.PutUint32(fragment[16:20], uint32(len(payload)))
-		copy(fragment[masqueWGFragmentHeaderLen:], payload[off:end])
-		fragments = append(fragments, fragment)
-	}
-	return fragments, nil
-}
-
 func (r *masqueWGReassembler) Reset() {
 	r.mu.Lock()
 	r.sets = nil
@@ -101,7 +49,7 @@ func (r *masqueWGReassembler) Reset() {
 
 func (r *masqueWGReassembler) cleanupLocked(now time.Time) {
 	for k, set := range r.sets {
-		if now.Sub(set.updated) >= masqueWGFragmentTTL {
+		if now.Sub(set.updated) >= masqueWGFragmentAssemblyExpiration {
 			delete(r.sets, k)
 		}
 	}
@@ -115,6 +63,41 @@ func (r *masqueWGReassembler) sourceAssemblyCountLocked(src key.NodePublic) int 
 		}
 	}
 	return count
+}
+
+func fragmentMasqueWireGuardPacket(payload []byte) ([][]byte, error) {
+	if len(payload) <= masqueWGFragmentChunkSize {
+		return nil, nil
+	}
+	if len(payload) > masqueWGFragmentMaxSize {
+		return nil, fmt.Errorf("masquecat: WireGuard packet exceeds %d-byte fragmentation limit", masqueWGFragmentMaxSize)
+	}
+	count := (len(payload) + masqueWGFragmentChunkSize - 1) / masqueWGFragmentChunkSize
+	if count > int(^uint16(0)) {
+		return nil, fmt.Errorf("masquecat: WireGuard packet needs too many fragments: %d", count)
+	}
+	var idBytes [8]byte
+	if _, err := rand.Read(idBytes[:]); err != nil {
+		return nil, fmt.Errorf("masquecat: generate fragment id: %w", err)
+	}
+	id := binary.BigEndian.Uint64(idBytes[:])
+	fragments := make([][]byte, 0, count)
+	for i := 0; i < count; i++ {
+		start := i * masqueWGFragmentChunkSize
+		end := start + masqueWGFragmentChunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		fragment := make([]byte, masqueWGFragmentHeaderLen+end-start)
+		copy(fragment[:4], masqueWGFragmentMagic[:])
+		binary.BigEndian.PutUint64(fragment[4:12], id)
+		binary.BigEndian.PutUint16(fragment[12:14], uint16(i))
+		binary.BigEndian.PutUint16(fragment[14:16], uint16(count))
+		binary.BigEndian.PutUint32(fragment[16:20], uint32(len(payload)))
+		copy(fragment[masqueWGFragmentHeaderLen:], payload[start:end])
+		fragments = append(fragments, fragment)
+	}
+	return fragments, nil
 }
 
 func (r *masqueWGReassembler) Push(src key.NodePublic, payload []byte) ([]byte, bool, error) {
@@ -177,10 +160,12 @@ func (r *masqueWGReassembler) Push(src key.NodePublic, payload []byte) ([]byte, 
 		delete(r.sets, key)
 		return nil, false, fmt.Errorf("masquecat: inconsistent WireGuard fragment metadata")
 	}
-	set.updated = now
 
 	if old := set.parts[index]; old != nil {
 		if bytes.Equal(old, chunk) {
+			// A duplicate is not forward progress. In particular, do not refresh
+			// the assembly TTL here: otherwise one tiny duplicate can pin an
+			// incomplete assembly forever and exhaust the shared reassembly quota.
 			return nil, false, nil
 		}
 		delete(r.sets, key)
@@ -188,6 +173,7 @@ func (r *masqueWGReassembler) Push(src key.NodePublic, payload []byte) ([]byte, 
 	}
 	set.parts[index] = append([]byte(nil), chunk...)
 	set.received++
+	set.updated = now
 	if set.received != int(set.count) {
 		return nil, false, nil
 	}
