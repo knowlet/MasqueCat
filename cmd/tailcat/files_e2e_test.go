@@ -29,7 +29,7 @@ func runSFTPBatch(t *testing.T, e *testEnv, blob, batch string) ([]byte, error) 
 		"-o", "StrictHostKeyChecking no",
 		"-o", "UserKnownHostsFile "+os.DevNull,
 		"-o", "LogLevel ERROR",
-		"-o", "ProxyCommand="+sshProxyCommand(e.bin, "new", e.derpMapURL, blob, "22"),
+		"-o", "ProxyCommand="+sshProxyCommand(e.bin, "new", e.derpMapURL, false, blob, "22"),
 		"-b", batchFile,
 		sshDestHost(blob))
 	cmd.Env = e.env
