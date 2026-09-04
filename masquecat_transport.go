@@ -160,12 +160,34 @@ func masqueTLSClientConfig(rawURL string, insecureSkipVerify bool) (*tls.Config,
 	if u.Scheme != "https" || u.Hostname() == "" {
 		return nil, errors.New("MASQUE endpoint must be an https URL with a hostname")
 	}
-	return &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		ServerName:         u.Hostname(),
-		NextProtos:         []string{http3.NextProtoH3},
-		InsecureSkipVerify: insecureSkipVerify, //nolint:gosec // Explicit development opt-in exposed by MasqueCat.
-	}, nil
+	cfg := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		ServerName: u.Hostname(),
+		NextProtos: []string{http3.NextProtoH3},
+	}
+	pin, pinned, err := masqueTLSCertPinFromURL(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse MASQUE TLS certificate pin: %w", err)
+	}
+	if pinned {
+		// Automatic direct mode uses a self-signed carrier certificate. Skip the
+		// ambient PKI/hostname check only while replacing it with exact leaf-cert
+		// pinning. A token marker by itself can therefore never turn this into a
+		// generic accept-any-certificate mode.
+		cfg.InsecureSkipVerify = true //nolint:gosec // VerifyConnection enforces an exact SHA-256 certificate pin below.
+		cfg.VerifyConnection = func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return errors.New("MASQUE TLS peer presented no certificate")
+			}
+			if !pin.matchesCertificate(cs.PeerCertificates[0].Raw) {
+				return errors.New("MASQUE TLS certificate pin mismatch")
+			}
+			return nil
+		}
+		return cfg, nil
+	}
+	cfg.InsecureSkipVerify = insecureSkipVerify //nolint:gosec // Explicit development opt-in exposed by MasqueCat.
+	return cfg, nil
 }
 
 func masqueQUICConfig() *quic.Config {
@@ -224,7 +246,9 @@ func newMasquePathWithTLS(ctx context.Context, rawURL string, requestTarget key.
 	if err != nil {
 		return nil, err
 	}
-	if insecureSkipVerify {
+	if tlsConfig.VerifyConnection != nil {
+		logf("using SHA-256 pinned TLS certificate for MASQUE endpoint %s", rawURL)
+	} else if insecureSkipVerify {
 		logf("WARNING: InsecureSkipVerify enabled for MASQUE endpoint %s; TLS certificate and hostname verification are disabled", rawURL)
 	}
 
