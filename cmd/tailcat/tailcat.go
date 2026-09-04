@@ -1417,7 +1417,6 @@ func runDevDERP(logf logger.Logf) (*derpserver.Server, *tailcfg.DERPRegion) {
 	}
 
 	logf("starting dev derp on %v ...", ln.Addr())
-
 	httpsrv := httptest.NewUnstartedServer(derpserver.Handler(d))
 	httpsrv.Listener = ln
 	httpsrv.Config.ErrorLog = logger.StdLogger(logf)
@@ -1456,7 +1455,7 @@ func runDevDERP(logf logger.Logf) (*derpserver.Server, *tailcfg.DERPRegion) {
 				RegionID:         1,
 				HostName:         "T",
 				IPv4:             "127.0.0.1",
-				IPv6:             "none", // netcheck's magic "no v6 probes" value; other values leave doomed probes running until its 3s timeout
+				IPv6:             "none",
 				STUNPort:         uln.LocalAddr().(*net.UDPAddr).Port,
 				DERPPort:         httpsrv.Listener.Addr().(*net.TCPAddr).Port,
 				InsecureForTests: true,
@@ -1506,8 +1505,6 @@ func genKey(args []string) error {
 		fixedRegion  = genkeyFixedRegion
 		embedDERPMap = genkeyEmbedDERPMap
 	)
-	// isSet reports whether the named genkey flag was set explicitly,
-	// as opposed to holding its default value.
 	isSet := func(name string) bool {
 		f, ok := genkeyFS.GetFlag(name)
 		return ok && f.IsSet()
@@ -1553,7 +1550,6 @@ func genKey(args []string) error {
 		if isSet("region") {
 			return usagef("genkey --fixed-region and --region are mutually exclusive")
 		}
-		// The empty region means "pick the best region now", below.
 		*region = ""
 	}
 	if !keyIsPath(*key) {
@@ -1563,8 +1559,6 @@ func genKey(args []string) error {
 		}
 	}
 	if _, err := os.Stat(*key); err == nil {
-		// The "list" mode exits before writing anything, so it
-		// doesn't need --force.
 		if !*force && *region != "list" {
 			log.Fatalf("%v already exists; use --force to overwrite", *key)
 		}
@@ -1584,10 +1578,6 @@ func genKey(args []string) error {
 		fmt.Println(priv.Private.Public().String())
 		return nil
 	}
-	if *region == "list" {
-		// Listing regions is the only legacy genkey operation that doesn't
-		// need a destination key path.
-	}
 
 	var match string
 	if *region == "auto" {
@@ -1599,9 +1589,7 @@ func genKey(args []string) error {
 		reg := &tailcfg.DERPRegion{}
 		priv.Public.Region = append(priv.Public.Region, reg)
 		for _, host := range hosts {
-			reg.Nodes = append(reg.Nodes, &tailcfg.DERPNode{
-				HostName: host,
-			})
+			reg.Nodes = append(reg.Nodes, &tailcfg.DERPNode{HostName: host})
 		}
 	} else {
 		match = *region
@@ -1610,10 +1598,7 @@ func genKey(args []string) error {
 	var dm tailcfg.DERPMap
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-
 	if match != "" || *region == "" || *embedDERPMap {
-		// genkey picks the region a future server will listen on,
-		// hence ExpandForServer.
 		got, err := tailcat.FetchDERPMap(ctx, tailcat.DERPMapURL(*flagDERPMapURL), tailcat.ExpandForServer, derpMapCache{})
 		if err != nil {
 			log.Fatalf("derpmap fetch: %v", err)
@@ -1660,7 +1645,6 @@ func genKey(args []string) error {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	if err := os.WriteFile(*key, privj, 0600); err != nil {
 		log.Fatal(err)
 	}
@@ -1669,18 +1653,15 @@ func genKey(args []string) error {
 	return nil
 }
 
-// or returns 0 on no match
 func findRegionIDFromSubstring(dm *tailcfg.DERPMap, s string) (regionID tailcfg.DERPRegionID) {
 	if s == "list" {
 		return 0
 	}
-	// First look my region code
 	for _, r := range dm.Regions {
 		if strings.EqualFold(r.RegionCode, s) {
 			return r.RegionID
 		}
 	}
-	// Then look by substring
 	for _, r := range dm.Regions {
 		if mem.ContainsFold(mem.S(r.RegionName), mem.S(s)) {
 			return r.RegionID
