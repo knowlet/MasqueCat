@@ -4,7 +4,9 @@ package tailcat
 
 import (
 	"bytes"
+	"context"
 	"testing"
+	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/types/key"
@@ -161,5 +163,40 @@ func TestMasqueCoreServedTCPPortsNilVersusEmpty(t *testing.T) {
 	only65535 := &masqueCore{servedTCPPorts: []filter.PortRange{{First: 65535, Last: 65535}}}
 	if !only65535.localPortAllowed(65535) {
 		t.Fatal("TCP port 65535 must remain available to applications")
+	}
+}
+
+type injectingMasqueForwarder struct {
+	dst *masqueCore
+}
+
+func (f *injectingMasqueForwarder) ForwardPacket(src, _ key.NodePublic, payload []byte) error {
+	return f.dst.Inject(src, payload)
+}
+
+func TestMasqueCorePingControlAddress(t *testing.T) {
+	client, err := newMasqueCore(key.NewNode(), masqueCoreOptions{}, t.Logf)
+	if err != nil {
+		t.Fatalf("new client core: %v", err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+
+	server, err := newMasqueCore(key.NewNode(), masqueCoreOptions{IsServer: true}, t.Logf)
+	if err != nil {
+		t.Fatalf("new server core: %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	if err := client.SetPath(server.pub, &injectingMasqueForwarder{dst: server}); err != nil {
+		t.Fatalf("set client path: %v", err)
+	}
+	if err := server.SetPath(client.pub, &injectingMasqueForwarder{dst: client}); err != nil {
+		t.Fatalf("set server path: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Ping(ctx, server.pub); err != nil {
+		t.Fatalf("Ping over internal control address: %v", err)
 	}
 }

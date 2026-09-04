@@ -400,6 +400,18 @@ func newMasqueCore(priv key.NodePrivate, opts masqueCoreOptions, logf logger.Log
 		st.Close()
 		return nil, fmt.Errorf("masquecat: add local gVisor address: %v", err)
 	}
+	if opts.IsServer {
+		if err := st.AddProtocolAddress(masqueCoreNIC, tcpip.ProtocolAddress{
+			Protocol: ipv6.ProtocolNumber,
+			AddressWithPrefix: tcpip.AddressWithPrefix{
+				Address:   tcpip.AddrFromSlice(masqueCorePingAddr.AsSlice()),
+				PrefixLen: masqueCorePingAddr.BitLen(),
+			},
+		}, stack.AddressProperties{}); err != nil {
+			st.Close()
+			return nil, fmt.Errorf("masquecat: add ping gVisor address: %v", err)
+		}
+	}
 
 	mtun := newMasqueTun(link)
 	bind := newMasqueBind(pub)
