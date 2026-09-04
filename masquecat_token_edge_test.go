@@ -49,8 +49,8 @@ func TestMasqueConnInfoValidationFailures(t *testing.T) {
 		{name: "relay no host", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https:///path" }, want: "no hostname"},
 		{name: "relay empty hostname", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://:443" }, want: "no hostname"},
 		{name: "userinfo", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://user:pass@relay.example" }, want: "userinfo"},
-		{name: "query", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://relay.example?q=1" }, want: "query or fragment"},
-		{name: "fragment", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://relay.example/#x" }, want: "query or fragment"},
+		{name: "query", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://relay.example?q=1" }, want: "query"},
+		{name: "fragment", edit: func(ci *MasqueConnInfo) { ci.RelayURL = "https://relay.example/#x" }, want: "fragment"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
