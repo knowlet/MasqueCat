@@ -60,15 +60,40 @@ func shouldConfigureAutoMasqueDirect(args []string) bool {
 	if len(args) == 1 {
 		return true
 	}
-	for i, arg := range args[1:] {
-		if arg == "serve" || arg == "recv" || strings.HasPrefix(arg, "--serve=") {
+
+	// Automatic direct setup follows the command's parsed behavior, not merely
+	// raw argument count. Global flags alone still select the implicit server
+	// path (for example `tailcat --json` or `tailcat --key=new`). Stop as soon as
+	// a positional client subcommand/address is present, while skipping values of
+	// global flags that take a separate argument.
+	for i := 1; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "serve" || arg == "recv" || strings.HasPrefix(arg, "--serve="):
 			return true
+		case arg == "--serve":
+			return i+1 < len(args)
+		case !strings.HasPrefix(arg, "--"):
+			return false
+		case strings.Contains(arg, "="):
+			continue
 		}
-		if arg == "--serve" && i+2 < len(args) {
-			return true
+
+		switch arg {
+		case "--key", "--derpmap-url", "--direct-listen", "--tls-cert", "--tls-key":
+			if i+1 >= len(args) {
+				return false
+			}
+			i++
+		case "--verbose", "--json", "--legacy-derp", "--insecure-skip-verify":
+			// Boolean global flags consume no following argument.
+		default:
+			// Unknown options should be left for ff to reject rather than causing
+			// automatic network/TLS setup as a side effect of a parse error.
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func hasExplicitMasqueEnvironment() bool {
