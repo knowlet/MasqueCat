@@ -30,6 +30,13 @@ var (
 
 func main() {
 	flag.Parse()
+	if *flagDERPMapURL == "" {
+		log.Fatal("-derpmap-url is required; tailcat-web has no built-in hosted DERP map default")
+	}
+	mapReq, err := http.NewRequest(http.MethodGet, *flagDERPMapURL, nil)
+	if err != nil || mapReq.URL.Hostname() == "" || (mapReq.URL.Scheme != "http" && mapReq.URL.Scheme != "https") {
+		log.Fatalf("invalid -derpmap-url %q: must be an absolute http(s) URL", *flagDERPMapURL)
+	}
 
 	distDir, err := os.MkdirTemp("", "tailcat-web")
 	if err != nil {
@@ -57,7 +64,12 @@ func main() {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		req.Header.Set("Tailcat-Mode", r.Header.Get("Tailcat-Mode"))
+		if mode := r.Header.Get("Tailcat-Mode"); mode != "" {
+			req.Header.Set("Tailcat-Mode", mode)
+		}
+		if mode := r.Header.Get("MasqueCat-Mode"); mode != "" {
+			req.Header.Set("MasqueCat-Mode", mode)
+		}
 		res, err := http.DefaultClient.Do(req)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)

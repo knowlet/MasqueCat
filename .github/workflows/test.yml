@@ -2,11 +2,39 @@ name: Test
 
 on:
   push:
-    branches: [main]
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  # Required by golangci-lint-action when only-new-issues is enabled.
+  pull-requests: read
+
+concurrency:
+  group: test-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
+  lint:
+    # golangci-lint-action's only-new-issues mode needs pull-request context to
+    # compute a merge base. Keep push CI focused on build/test/vet instead of
+    # invoking that PR-only diff mode with an all-zero base SHA.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.13.2
+          args: --timeout=5m
+          only-new-issues: true
+
   test:
     strategy:
       fail-fast: false
@@ -19,12 +47,23 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go build ./...
-      # The cmd/tailcat e2e tests build a child tailcat binary with
-      # the release build tags, which shares no build cache with the
-      # untagged build above and takes about a minute cold, hence the
-      # long timeout. actions/setup-go's caches keep warm runs fast.
       - run: go test -count=1 -timeout 600s ./...
       - run: go vet ./...
+  race:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: race detector for MASQUE transport and core
+        run: go test -race -count=1 -timeout 900s -run 'Masque|StreamForwarder|ReceiveStreamDatagram' .
+      - name: race detector for masquecat-relay
+        run: go test -race -count=1 -timeout 900s ./cmd/masquecat-relay
   tidy:
     runs-on: ubuntu-latest
     steps:
@@ -43,11 +82,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      # Cross-build every GoReleaser release target with the release
-      # build tags, using build-tags.txt the same way third-party
-      # packagers do. (A test keeps that file in sync with
-      # internal/buildtags.ReleaseTags; darwin builds are covered by
-      # the macOS test job, whose e2e tests build a tagged binary.)
       - name: cross-build cmd/tailcat with release build tags
         run: |
           tags=$(cat build-tags.txt)

@@ -1,627 +1,310 @@
-<p align="center">
-  <img src="tailcat.png" alt="Tailcat" width="149" height="176">
-</p>
+# MasqueCat
 
-<p align="center"><em>"Tailscale without Tailscale, by Tailscale"</em></p>
+MasqueCat is a Tailcat fork that keeps Tailcat's userspace WireGuard + gVisor
+application model while replacing the normal runtime transport with explicit
+HTTP/3 MASQUE CONNECT-UDP paths.
 
-# Tailcat
+The goal is an **in-place Tailcat CLI replacement**: keep the `tailcat` binary,
+command shape, server/client workflow, SSH/file-transfer integration, and saved
+key behavior as close to upstream Tailcat as practical, while using `mc...`
+connection tokens and MASQUE direct/relay transport.
 
-Tailcat is a remix of Tailscale open source pieces to act like
-[netcat](https://en.wikipedia.org/wiki/Netcat), but over Tailscale's data plane,
-without Tailscale's control plane. Tailscale's data plane (`magicsock`,
-internally) gives you point-to-point WireGuard®-encrypted tunnels between two
-machines with DERP as the NAT-hole-punching communication side channel and the
-ultimate relay-of-last-resort if NAT traversal fails. Instead of using the
-Tailscale control plane, all `tailcat` connection metadata is exchanged out of
-band, however you want.
+The original `tc...` client path is still supported for compatibility. Starting
+a legacy DERP/STUN/disco server is explicit with `--legacy-derp`; MasqueCat does
+not silently fall back to public Tailscale DERP infrastructure.
 
-The `tailcat` CLI (in `cmd/tailcat`) is built on the `tailcat` Go library
-(importable as [`github.com/tailscale/tailcat`](https://pkg.go.dev/github.com/tailscale/tailcat)).
+## Build
 
-Whether you use `tailcat` as a CLI tool or library, one side runs a `tailcat`
-server (listener) and gets back a short connection token. The other side passes
-that token to `tailcat`'s client side to connect. All traffic between the two is
-encrypted end-to-end with WireGuard. The initial connection bootstraps through
-a DERP server ([see below](#bring-your-own-derp-relay)), and then magicsock performs NAT traversal to
-upgrade to a direct peer-to-peer UDP connection when possible (usually!).
-
-You don't need a Tailscale account, root/admin access on the machine
-(it doesn't alter your machine's routing tables, DNS, etc.). It's just
-a userspace library and CLI tool.
-
-And it's all open source.
-
-You can use our free rate-limited DERP relays (the default DERP map is
-https://tailcat.dev/derpmap.json) or you can [run your own](https://github.com/tailscale/tailscale/tree/main/cmd/derper#derp).
-
-There's also an experimental in-browser web demo (tailcat compiled to
-WebAssembly) at https://tailscale.github.io/tailcat/ that can send and
-receive files or text, interoperating with the CLI. Browser traffic is
-relayed over DERP only, with no direct connections until WebRTC
-support ([#4](https://github.com/tailscale/tailcat/issues/4)).
-
-## Install
-
-Prebuilt binaries are on the
-[Releases page](https://github.com/tailscale/tailcat/releases): static
-Linux binaries (tar.gz) plus Debian (.deb) and RPM (.rpm) packages for
-amd64, arm64, and armv7, and Windows binaries (zip) for amd64 and
-arm64.
-
-There's also a
-[container image](https://github.com/tailscale/tailcat/pkgs/container/tailcat):
+This branch is experimental and currently has no release artifact. Build the two
+user-facing executables explicitly:
 
 ```sh
-$ docker pull ghcr.io/tailscale/tailcat:v0.1.0  # or :latest
-$ docker run --rm -it ghcr.io/tailscale/tailcat:latest
+git clone https://github.com/knowlet/tailcat.git
+cd tailcat
+git checkout feat/masquecat-masque-transport
+
+mkdir -p bin
+go build -o ./bin/tailcat ./cmd/tailcat
+go build -o ./bin/masquecat-relay ./cmd/masquecat-relay
+
+./bin/tailcat version
+./bin/tailcat --help
 ```
 
-For macOS, install with [Homebrew](https://brew.sh/):
+`go build ./...` is useful as a compile check, but it matches multiple packages.
+Go builds those packages into its build cache and does **not** leave a
+`./tailcat` executable in the current directory. Use `go build -o ...
+./cmd/tailcat` when you want a binary you can run.
+
+To test the whole repository:
 
 ```sh
-$ brew install tailcat
+go test ./...
 ```
 
-Or build from source with a Go toolchain:
+## Quick start: relay-only
+
+MasqueCat deliberately has no built-in public relay. A normal relay-only setup
+therefore has three steps: run your relay, point the server at it, then give the
+printed `mc...` token to the client.
+
+### 1. Run the relay
+
+The relay terminates HTTP/3 itself and must receive **UDP/443**. A TCP-only
+HTTP/1.1 or HTTP/2 reverse proxy cannot carry this protocol.
 
 ```sh
-$ go install github.com/tailscale/tailcat/cmd/tailcat@latest
+sudo ./bin/masquecat-relay \
+  -listen :443 \
+  -cert /etc/masquecat/tls/fullchain.pem \
+  -key /etc/masquecat/tls/privkey.pem
 ```
 
-Or with Nix flakes, run it directly or install it:
+Use a certificate whose hostname matches the relay URL used by peers.
+
+### 2. Start a Tailcat-compatible server
+
+Set the relay once in the environment:
 
 ```sh
-$ nix run github:tailscale/tailcat
-$ nix profile install github:tailscale/tailcat
+export MASQUECAT_RELAY_URL=https://relay.example.com
+./bin/tailcat
 ```
 
-Or from archlinux AUR:
+With no positional arguments, `tailcat` enters server mode just like upstream
+Tailcat. It prints both the configured MASQUE endpoint and the connection token,
+for example:
 
-[![tailcat on AUR](https://img.shields.io/aur/version/tailcat?label=tailcat)](https://aur.archlinux.org/packages/tailcat/)
-[![tailcat-bin on AUR](https://img.shields.io/aur/version/tailcat-bin?label=tailcat-bin)](https://aur.archlinux.org/packages/tailcat-bin/)
-
-```bash
-# Build release package from source
-yay -S tailcat
-
-# OR install the binary release
-yay -S tailcat-bin
+```text
+# MASQUE relay server: https://relay.example.com
+# 🐈 Server listening with new address: mc...
 ```
 
-### Packaging from source
+Because this fork intentionally has no default public relay, running `tailcat`
+with neither a relay nor a direct endpoint configured fails closed with a clear
+configuration error instead of silently reverting to DERP.
 
-The official binaries are built with a list of build tags that omits
-unused Tailscale features, making them about 16% smaller. The
-recommended tag list is checked in as
-[build-tags.txt](./build-tags.txt) (and kept accurate by a CI test),
-so packagers (Homebrew, AUR, NixOS, etc.) can build the same way:
+The flag form is equivalent:
 
 ```sh
-$ go build -tags "$(cat build-tags.txt)" -ldflags "-s -w" ./cmd/tailcat
+./bin/tailcat --relay-url https://relay.example.com
 ```
 
-See [build-tags.md](./build-tags.md) for the details.
+### 3. Connect with the printed token
 
-## Usage
-
-### Pipe stdin/stdout between two machines
-
-Server starts, printing out its ephemeral address:
-```sh
-$ tailcat
-# Selected bootstrap relay region 302, San Francisco
-# 🐈 Server listening with new address: tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
-(hangs, waiting...)
-```
-
-And then the client can:
+The basic Tailcat pipe interface is unchanged:
 
 ```sh
-$ echo hello | tailcat tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
-$ 
+# Default pipe mode.
+echo 'hello' | ./bin/tailcat 'mc...'
+
+# Connect to a TCP port exposed by the peer.
+./bin/tailcat 'mc...' 8000
+
+# Diagnostics.
+./bin/tailcat ping 'mc...'
+./bin/tailcat parse 'mc...'
+./bin/tailcat resolve 'mc...'
 ```
 
-Then the server unblocks:
+`resolve` simply validates and reprints an `mc...` token because MASQUE tokens
+already contain their exact direct/relay URLs; there is no DERP-map expansion.
+
+## Serve local ports
+
+The upstream `serve` syntax is retained:
 
 ```sh
-$ tailcat
-# Selected bootstrap relay region 302, San Francisco
-# 🐈 Server listening with new address: tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
-hello
-$
+export MASQUECAT_RELAY_URL=https://relay.example.com
+
+# Proxy incoming peer traffic to local TCP ports 80 and 443.
+./bin/tailcat serve 80,443
+
+# Ranges work too.
+./bin/tailcat serve 8000-8999
 ```
 
-### Expose local ports through the tunnel
-
-Or you can serve a local TCP port, forwarded to localhost:
+Then a client can use the same token with the desired port:
 
 ```sh
-$ tailcat serve 8080,8443 # or: tailcat serve all
-# 🐈 Server listening with new address: tcXXXXXXXXX
+./bin/tailcat 'mc...' 80
 ```
 
-And then the client:
+## SSH
+
+The built-in auth-free SSH server is retained. The WireGuard peer identity is
+the authentication boundary, as in Tailcat.
+
+Server:
 
 ```sh
-$ tailcat tcXXXXXXXXX 8080
-GET / HTTP/1.1
-Host: foo
-
-HTTP/1.1 200 OK
-....
+export MASQUECAT_RELAY_URL=https://relay.example.com
+./bin/tailcat serve no-auth-ssh
 ```
 
-### Auth-free SSH server
-
-On Linux and macOS, you can run an SSH server too with no auth. (If you want auth, you can just `tailcat serve 22` and proxy to your system SSH server)
+Client:
 
 ```sh
-$ tailcat serve no-auth-ssh
-# 🐈 Server listening with new address: tcXXXXXXXXX
+./bin/tailcat ssh 'mc...'
+./bin/tailcat ssh 'mc...' uname -a
 ```
 
-And on the client side:
+`tailcat ssh` continues to use the current `tailcat` executable as OpenSSH's
+`ProxyCommand`. Because the root pipe mode now understands `mc...`, SSH uses the
+same MASQUE carrier without a separate MasqueCat SSH command.
+
+The upstream `cp` / `ls` commands follow the same ProxyCommand path when the
+server enables the corresponding SSH/files service.
+
+## Saved server and client keys
+
+Without `--key`, server mode uses a saved key named `default` if it exists;
+otherwise it uses a new ephemeral key. To keep a stable server identity/token:
 
 ```sh
-$ tailcat ssh tcXXXXXXXXX
-$ tailcat ssh tcXXXXXXXXX ls -la
+export MASQUECAT_RELAY_URL=https://relay.example.com
+./bin/tailcat genkey --key=default
+./bin/tailcat
 ```
 
-### Send and receive files
-
-To receive files, run a drop box and share the printed address:
+For a persistent client identity:
 
 ```sh
-$ tailcat recv ~/inbox
-# 🐈 Server listening with new address: tcXXXXXXXXX
+./bin/tailcat genkey --client --key=client-default
 ```
 
-The sender then runs:
+Client commands automatically load `client-default` when it exists.
+
+## Direct MASQUE mode
+
+A directly reachable server can advertise its own HTTP/3 endpoint. Direct mode
+requires an externally reachable UDP listener and a normal TLS certificate:
 
 ```sh
-$ tailcat cp report.pdf tcXXXXXXXXX:
+./bin/tailcat \
+  --direct-url https://mc.example.com \
+  --direct-listen :443 \
+  --tls-cert /etc/masquecat/tls/fullchain.pem \
+  --tls-key /etc/masquecat/tls/privkey.pem
 ```
 
-`tailcat cp` runs the system `scp` with the connection routed through
-tailcat, so you get its usual progress display, and `-r` for
-directory trees. The drop box is write-only: senders can't list the
-directory, read anything back, or touch existing files.
-
-To offer files instead, serve a directory read-only (the default) or
-read-write:
+You can configure both direct and relay endpoints:
 
 ```sh
-$ tailcat serve files                  # current directory, read-only
-$ tailcat serve --files=/pub:rw files  # a given directory, read-write
+./bin/tailcat \
+  --direct-url https://mc.example.com \
+  --direct-listen :443 \
+  --tls-cert /etc/masquecat/tls/fullchain.pem \
+  --tls-key /etc/masquecat/tls/privkey.pem \
+  --relay-url https://relay.example.com
 ```
+
+At startup a client tries the explicit direct endpoint first and the explicit
+relay if direct setup fails. Runtime direct-to-relay migration after an already
+established path fails is not implemented yet.
+
+## MASQUE CLI options and environment
+
+| CLI option | Environment | Purpose |
+| --- | --- | --- |
+| `--relay-url URL` | `MASQUECAT_RELAY_URL` | Explicit MasqueCat relay URL |
+| `--direct-url URL` | `MASQUECAT_DIRECT_URL` | Public URL advertised for direct MASQUE |
+| `--direct-listen ADDR` | `MASQUECAT_DIRECT_LISTEN` | UDP listener for direct HTTP/3, e.g. `:443` |
+| `--tls-cert FILE` | `MASQUECAT_TLS_CERT` | Direct endpoint TLS certificate |
+| `--tls-key FILE` | `MASQUECAT_TLS_KEY` | Direct endpoint TLS private key |
+| `--insecure-skip-verify` | `MASQUECAT_INSECURE_SKIP_VERIFY=1` | Development-only outer TLS verification bypass |
+| `--legacy-derp` | `TAILCAT_LEGACY_DERP=1` | Use the original Tailcat DERP/STUN/disco server/genkey path |
+
+Production deployments should use normal TLS hostname and certificate
+verification. `--insecure-skip-verify` is for development only.
+
+## Legacy Tailcat compatibility
+
+Existing `tc...` tokens continue to dispatch to the upstream Tailcat client
+implementation automatically:
 
 ```sh
-$ tailcat ls -l tcXXXXXXXXX
-$ tailcat cp tcXXXXXXXXX:report.pdf .
+./bin/tailcat 'tc...'
+./bin/tailcat ping 'tc...'
+./bin/tailcat ssh 'tc...'
 ```
 
-`tailcat ls` speaks SFTP natively, so it works even without OpenSSH
-installed.
-
-The server confines all paths to the served directory (via Go's
-`os.Root`), so neither `..` nor symlinks escape it. The file service
-speaks SFTP, so the stock `sftp` and `scp` clients also work against
-it, given a ProxyCommand that pipes through tailcat (the same trick
-`tailcat cp` and `tailcat ssh` use). A `no-auth-ssh` server serves
-SFTP too, with the same access as the shell.
-
-Transfers are not compressed: the SFTP protocol has no compression
-of its own, and the SSH transport here doesn't either (Go's SSH
-stack omits it; transport compression has a history of security
-problems, and TLS dropped it too). Compress files before sending
-if it matters.
-
-### Misc commands 
-
-Ping to test connectivity; each pong reports whether it arrived via a
-DERP relay or a direct path. `--until-direct` keeps pinging (up to
-`--timeout`, default 10s) until a direct path works, exiting non-zero
-if one doesn't:
+To deliberately start the original Tailcat server instead of MasqueCat:
 
 ```sh
-$ tailcat ping --until-direct <token>
-pong in 42.1ms via DERP(sfo)
-pong in 1.2ms via 203.0.113.7:41641
+./bin/tailcat --legacy-derp
 ```
 
-Run a command through a SOCKS5 proxy routed over the tunnel:
+DERP-specific options such as DERP-map/region selection belong to this legacy
+mode. MasqueCat itself never needs STUN, netcheck, disco CallMeMaybe, endpoint
+probing, UDP hole punching, or a raw peer WireGuard UDP socket.
 
-```sh
-$ tailcat socks <token> curl http://server.tailcat:8081/
+## Data plane
+
+```text
+application / SSH / forwarded TCP
+              |
+        gVisor netstack
+              |
+     wireguard-go Device
+              |
+          MasqueBind
+              |
+      MasqueCat framing
+              |
+      HTTP/3 CONNECT-UDP
+              |
+        QUIC / UDP 443
+        /           \
+ direct MASQUE     MasqueCat relay
+ endpoint          endpoint
 ```
 
-Tokens also work directly as URL hostnames: the SOCKS proxy recognizes
-and dials them, so the token argument is optional. (Tokens are
-case-sensitive; this works with curl and most CLI tools, but not with
-browsers, which lowercase hostnames.)
+`MasqueBind` is a `wireguard-go/conn.Bind` implementation. WireGuard sees each
+peer as a logical node-key endpoint; the bind selects a configured MASQUE path
+instead of opening a WireGuard UDP socket or delegating transport to magicsock.
 
-```sh
-$ tailcat socks curl http://<token>:8081/
-```
+## No built-in infrastructure
 
-Act as an exit node so the client can reach the server's network:
+MasqueCat has no built-in public relay, map service, control plane, or default
+external hostname. Every Internet-facing endpoint is operator supplied:
 
-```sh
-$ tailcat serve exit-node
-```
+- `DirectURL` advertises an explicitly reachable peer MASQUE endpoint.
+- `RelayURL` configures an explicit MasqueCat relay.
+- relay-only deployments require outbound QUIC/UDP 443 from both peers.
+- direct deployments require an explicitly reachable QUIC/UDP endpoint.
 
-Parse a connection token and print its contents (the server's WireGuard
-public key and DERP info) as JSON, without connecting to anything:
+There is no MasqueCat fallback to an upstream Tailscale DERP or DERP map.
 
-```sh
-$ tailcat parse tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
-{
-    "ServerPublic": "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34",
-    "RegionID": 302
-}
-```
+## Security model
 
-Resolve a short token (which references a DERP region by ID, requiring
-clients to fetch the DERP map) into a longer self-contained one with the
-DERP server info embedded, letting clients connect more quickly:
+Application traffic is protected by two layers:
 
-```sh
-$ tailcat resolve tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu
-tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFygaFhToGjYWhudGMzMDJhLmlwbi5kZXZhNG0yMDguMTExLjM5LjM4YTZzMjYwNzpmNzQwOjA6M2Y6OjcyMA
-```
+1. WireGuard provides end-to-end encryption between MasqueCat peers.
+2. QUIC/TLS 1.3 protects the outer HTTP/3 connection to the direct endpoint or
+   relay.
 
-Parsing that resolved token shows the embedded DERP info:
+A relay terminates the outer TLS connection but forwards opaque WireGuard
+ciphertext. It can observe peer node keys and traffic metadata but cannot decrypt
+the inner WireGuard session.
 
-```sh
-$ tailcat parse tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFygaFhToGjYWhudGMzMDJhLmlwbi5kZXZhNG0yMDguMTExLjM5LjM4YTZzMjYwNzpmNzQwOjA6M2Y6OjcyMA
-{
-    "ServerPublic": "nodekey:9c8d2e6728da80a1dd37e275a82595b42d9a838610bc53f74a7670d1610f2e34",
-    "Region": [
-        {
-            "Nodes": [
-                {
-                    "HostName": "tc302a.ipn.dev",
-                    "IPv4": "208.111.39.38",
-                    "IPv6": "2607:f740:0:3f::720"
-                }
-            ]
-        }
-    ]
-}
-```
+Direct and relay CONNECT-UDP registration uses a one-time challenge and proof of
+possession of the advertised node private key. Duplicate live registrations are
+rejected rather than silently replacing the current peer.
 
-A server can print the long self-contained form directly with the
-`tailcat serve --full-address` flag.
+This transport design is not an anonymity guarantee. A network observer can
+still see QUIC traffic, endpoint addresses, packet sizes, timing, and connection
+lifetimes.
 
-## Key Management
+## Go API
 
-A server's address (connection token) is derived from its WireGuard key, so
-the key you use determines who can reach you:
+The CLI is the normal entry point, but the transport is also available as a Go
+API through `tailcat.MasqueServer` and `tailcat.MasqueClient`. Useful client
+operations include `Ping`, `DialTCPPort`, `DialTCP`, `Dial`, `DrainTCP`, `Path`,
+and `Close`.
 
-* **Ephemeral keys (the default):** each server run generates a fresh key in
-  memory and prints an address nobody has ever seen. When the process exits,
-  the key is discarded and the address is dead forever. This is the safe
-  default: sharing that address only ever refers to that one run.
+For deeper protocol/design notes and relay deployment details, see:
 
-* **Saved keys:** `tailcat genkey` generates a key saved to disk so the
-  address stays stable across restarts. The flip side: anyone you've *ever*
-  shared that address with can connect to any future server using that key,
-  unless you restrict clients with `tailcat serve --allow` (see
-  `tailcat genkey --client`).
-
-The CLI says at startup which kind it's using, so you know whether you're
-starting a fresh single-use server or re-listening on an address you may
-have shared in the past.
-
-```sh
-$ tailcat genkey --key=default --region=nyc
-# prints the token; key saved to ~/.config/tailcat/keys/default.private.json
-
-# later; the key named "default" is used automatically once it exists:
-$ tailcat serve 8080
-# 🐈 Server listening with saved key "default": tcXXXXXXXXX
-
-# ... unless you force a one-off ephemeral key:
-$ tailcat serve --key=new 8080
-# 🐈 Server listening with new address: tcXXXXXXXXX
-```
-
-That is, `default` is a magic key name: once it exists, plain `tailcat`
-silently uses it instead of generating an ephemeral key, and the startup
-line above is what tells you which happened. Use `--key=new` to get an
-ephemeral key anyway, `--key=<name>` to use a different saved key, or
-`tailcat genkey --delete --key=default` to remove the saved default key.
-`tailcat genkey --list` lists your saved keys.
-
-Tokens can also be published as DNS TXT records and looked up by name;
-a DNS name works anywhere the CLI takes a token:
-
-```sh
-# If example.com has a TXT record "tailcat=tc..."
-$ tailcat example.com 8080
-$ tailcat ssh example.com
-$ tailcat ping example.com
-```
-
-## Examples
-
-### Protected SSH server over DNS
-
-Who needs port forwarding or port knocking? This runs an SSH server
-reachable from anywhere by name, with no open inbound ports on the
-server, where WireGuard authenticates the client before the SSH
-server ever sees a packet.
-
-On the client machine, generate a client identity keypair. It prints
-the public key, which is all the server needs to know:
-
-```sh
-client$ tailcat genkey --client --key=client-default
-# wrote file to ~/.config/tailcat/keys/client-default.private.json
-nodekey:cfb6bfa77a0654d7450947fd6acef17d2cd848da1d30b2540b13dac272ddfd16
-```
-
-On the server, generate a server keypair pinned to its nearest DERP
-region (see why below), then serve SSH to only that client:
-
-```sh
-server$ tailcat genkey --key=default --fixed-region
-# wrote file to ~/.config/tailcat/keys/default.private.json
-tcXXXXXXXXX
-
-server$ tailcat serve --allow=nodekey:cfb6bf...ddfd16 22
-# 🐈 Server listening with saved key "default": tcXXXXXXXXX
-```
-
-Publish the token in DNS as a TXT record:
-
-```
-my-server.example.com. 300 IN TXT "tailcat=tcXXXXXXXXX"
-```
-
-And then the client side is just:
-
-```sh
-client$ tailcat ssh my-server.example.com
-```
-
-Client modes automatically use the saved `client-default` key when it
-exists, so no extra flags are needed to present the allowed identity.
-Anyone else's handshake is silently ignored: they can't reach the SSH
-server, or even learn that one is running.
-
-Why `--fixed-region`: it discovers the nearest DERP region once, at
-genkey time, and bakes its ID into both the printed token and the
-saved key file, so server restarts bind to the same region (keeping
-the published token valid) without re-probing. Otherwise genkey
-defaults to `--region=auto`, which instead bakes in "pick at
-startup": fine for one-off use, but a token published in DNS should
-name a fixed region so clients and future server restarts all
-rendezvous in the same place. (`--region=<name>` pins an explicit one
-instead; `--region=list` shows the choices.)
-
-TODO: make the client more robust here if the DERP map changes over
-time: https://github.com/tailscale/tailcat/issues/7
-
-### Bring your own DERP relay
-
-Nothing requires Tailscale's relays: [run your own DERP
-server](https://github.com/tailscale/tailscale/tree/main/cmd/derper#derp)
-(it needs a hostname with a TLS certificate, which derper can get
-itself via Let's Encrypt), then generate a server key that uses it by
-passing its hostname (or several, comma-separated) as the region:
-
-```sh
-server$ tailcat genkey --key=default --region=derp.example.com
-tcomFwWCCAIsKOqPUux6ClG2RM4A_vOq4VBzGgHGGjq9OsJuFKSWFygaFhToGhYWhwZGVycC5leGFtcGxlLmNvbQ
-
-server$ tailcat serve 22
-```
-
-The token embeds your relay's hostname:
-
-```sh
-$ tailcat parse tcomFwWCCAIsKOqPUux6ClG2RM4A_vOq4VBzGgHGGjq9OsJuFKSWFygaFhToGhYWhwZGVycC5leGFtcGxlLmNvbQ
-{
-    "ServerPublic": "nodekey:8022c28ea8f52ec7a0a51b644ce00fef3aae150731a01c61a3abd3ac26e14a49",
-    "Region": [
-        {
-            "Nodes": [
-                {
-                    "HostName": "derp.example.com"
-                }
-            ]
-        }
-    ]
-}
-```
-
-so clients need no extra flags and never contact Tailscale's DERP map
-server or relays, and the only rate limits are yours. Alternatively,
-if you run a whole fleet of relays, serve your own DERP map JSON and
-point both sides at it with `--derpmap-url`.
-
-### Go library
-
-A minimal server that answers any TCP port through the tunnel and
-prints its token. The zero value Server picks defaults for anything
-unset: a fresh ephemeral key, the nearest region of the default DERP
-map, and `log.Printf` logging (set `Logf` to `logger.Discard` for
-quiet):
-
-```go
-package main
-
-import (
-	"fmt"
-	"log"
-	"net"
-
-	"github.com/tailscale/tailcat"
-)
-
-func main() {
-	s := &tailcat.Server{
-		OnTCP: func(port uint16) func(net.Conn) {
-			return func(c net.Conn) {
-				fmt.Fprintf(c, "hello from port %v\n", port)
-				c.Close()
-			}
-		},
-	}
-	if err := s.Start(); err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println(s.ConnBlob())
-	select {}
-}
-```
-
-And a minimal client that dials it, given that token as its argument.
-Like Server, the Client zero value works with just its Server token
-field set (`tailcat.NewClient` is shorthand for exactly that), and
-the tunnel is established lazily by the first dial:
-
-```go
-package main
-
-import (
-	"context"
-	"io"
-	"log"
-	"os"
-
-	"github.com/tailscale/tailcat"
-)
-
-func main() {
-	cl := tailcat.NewClient(tailcat.ConnBlob(os.Args[1]))
-	defer cl.Close()
-	c, err := cl.DialTCPPort(context.Background(), 80)
-	if err != nil {
-		log.Fatal(err)
-	}
-	io.Copy(os.Stdout, c)
-}
-```
-
-```sh
-$ ./client tcomFwWCAWf933BLELdzd3RkHiOufJ...
-hello from port 80
-```
-
-## How it works
-
-### Connection tokens
-
-A Tailcat server is identified by a **connection token** (called a
-ConnBlob internally). It looks like `tcXYZ...` and is a `"tc"` prefix
-followed by base64-encoded [CBOR](https://cbor.io/) containing:
-
-- The server's WireGuard public key (Curve25519, 32 bytes)
-- A separate path-discovery public key (Curve25519, 32 bytes)
-- DERP info. Either:
-  1. a small integer referencing one of the default [Tailscale-run tailcat servers](https://tailcat.dev/derpmap.json), or
-  2. full DERP server metadata, to either use a custom DERP server, or to avoid the client needing a potential round-trip to fetch the latest DERP map (the `tailcat serve --full-address` flag and the `tailcat resolve` subcommand produce this form)
-
-A typical token with just an integer region ID is around 95 bytes. With embedded
-DERP node details it's longer but self-contained.
-
-### Network stack
-
-Tailcat reuses Tailscale's client networking components but
-without the control plane.
-
-- **WireGuard** -- a userspace WireGuard
-  implementation for encrypting all tunnel traffic. It doesn't use a kernel TUN/TAP device (nor does it configure any networking routes or DNS settings), so `root` isn't required.
-- **magicsock** -- Tailscale's transport layer that multiplexes traffic
-  over direct UDP and DERP relays. It handles STUN-based endpoint
-  discovery and UDP hole-punching for NAT traversal.
-- **Netstack** (gVisor) -- a userspace TCP/IP stack that terminates
-  TCP connections inside the process. This is what lets Tailcat
-  accept inbound connections and dial outbound ones without any OS
-  network configuration.
-- **DERP relay** -- Tailscale's encrypted relay protocol, used as a
-  rendezvous channel and as a fallback data path when direct
-  connectivity isn't possible.
-
-### Connection flow
-
-1. **Server starts.** It generates (or loads) a WireGuard keypair,
-   connects to a DERP relay, and prints its connection token to stderr.
-   It then waits for clients.
-
-2. **Client parses the token** to learn the server's public key and
-   path-discovery key, plus its DERP region. It generates its own ephemeral
-   keypair and connects to the same DERP relay. The separate path-discovery
-   key can appear in cleartext direct-path disco frames without revealing the
-   WireGuard public key that acts as the unlisted connection capability.
-
-3. **Discovery handshake.** The client sends a "**Meow**" ping message
-  to the server through the
-   DERP relay. This message carries the client's node public key. The
-   server receives it, adds the client to its WireGuard peer list and
-   network map, reconfigures the WireGuard engine, and replies with a
-   "**Meowed**" acknowledgment.
-
-4. **WireGuard tunnel.** With both sides configured as WireGuard
-   peers, the standard WireGuard handshake proceeds (routed through
-   DERP initially). Once complete, the tunnel is up and encrypted
-   traffic can flow.
-
-5. **NAT traversal.** In parallel, each side advertises its UDP
-   endpoints (public IP:port learned via STUN, plus local interface
-   addresses) to the other in disco call-me-maybe messages over DERP,
-   re-advertising whenever they change. Both sides then run Tailscale's
-   disco protocol and attempt UDP hole-punching. If
-   successful, traffic upgrades from the DERP relay to a direct
-   peer-to-peer path. If hole-punching fails, DERP continues as a
-   fallback and the connection still works, just with rate-limited throughput if you're using our public hosted DERP relays.
-
-6. **Data transfer.** The client dials a TCP port on the server
-   through the tunnel. gVisor's TCP/IP stack on both sides handles
-   connection setup. On the server, the incoming connection is
-   dispatched to a handler based on the port: forwarding to localhost,
-   piping to stdout, running an SSH session, etc.
-
-### Addressing
-
-Each peer currently derives a deterministic IPv6 address from its WireGuard
-public key, but that's an implementation detail not exposed to end users and
-might change. (e.g. we might remove those bytes from the IP headers entirely and
-recover that redundant MTU)
-
-## Stability
-
-Tailcat is free to use, but it comes with no API or CLI stability
-promises: the Go API, the CLI flags and output, and the wire format may
-all change. The public rate-limited Tailcat DERP relays have no uptime
-SLAs or throughput targets, and we may revoke access to them at any
-time, for any reason. Everything is provided best effort, without a
-contractual relationship (e.g. dedicated DERP relays and/or support)
-saying otherwise.
-
-## Contact Sales?
-
-If you don't want to run and support things on your own, or want any
-help, [contact sales](https://tailscale.com/contact/sales) and we can
-exchange money for [goods and
-services](https://www.youtube.com/watch?v=A81DYZh6KaQ).
-
-## History
-
-Tailcat began life in September 2023 as "derpcat", written on a long
-flight while catching up on bad movies: the first sketch was commit
-[9e4d925cc](https://github.com/tailscale/tailcat/commit/9e4d925cc)
-("cmd/dc: start of derpcat tool"), and it first worked in commit
-[911915fbb](https://github.com/tailscale/tailcat/commit/911915fbb)
-("derpcat: it's alive!", whose commit message notes "UA 605 PDX-ORD
-en route to Ireland. yay not buying the wifi."). Back then it lived
-inside a fork of the
-[tailscale.com](https://github.com/tailscale/tailscale) repo and it
-bitrot several times as the Tailscale internals moved on without it.
-We've since brought it back to life and refactored it to be a regular
-Go module client of the tailscale.com repo instead of a fork of it.
-
-It was open sourced August 2026 at the
-[TailscaleUp conference](https://tailscale.com/tailscaleup).
+- [`docs/masquecat.md`](./docs/masquecat.md)
+- [`cmd/masquecat-relay/README.md`](./cmd/masquecat-relay/README.md)
+- [`docs/masquecat-relay-deployment.md`](./docs/masquecat-relay-deployment.md)

@@ -30,6 +30,19 @@ import (
 // auth-free SSH server.
 func SupportsSSHServer() bool { return true }
 
+// sshLogf logs an SSH/SFTP error through the Server logger when available and
+// falls back to the legacy localBackend logger. MasqueServer intentionally does
+// not create a localBackend, so callers must never dereference s.lb directly.
+func (s *Server) sshLogf(format string, args ...any) {
+	logf := s.Logf
+	if logf == nil && s.lb != nil {
+		logf = s.lb.logf
+	}
+	if logf != nil {
+		logf(format, args...)
+	}
+}
+
 // HandleTailscaleSSHConn handles an incoming TCP connection as an SSH session
 // with a shell enabled. See [Server.SSHConnHandler] for the details.
 func (s *Server) HandleTailscaleSSHConn(c net.Conn) {
@@ -51,7 +64,7 @@ func (s *Server) SSHConnHandler(opts SSHOptions) func(net.Conn) {
 	return func(c net.Conn) {
 		keys, err := getHostKeys()
 		if err != nil {
-			s.lb.logf("SSH host keys: %v", err)
+			s.sshLogf("SSH host keys: %v", err)
 			c.Close()
 			return
 		}

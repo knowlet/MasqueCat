@@ -36,7 +36,7 @@ func (s *Server) sftpSubsystemHandler(opts SSHOptions) ssh.SubsystemHandler {
 		if opts.Files != nil {
 			rsrv, root, err := newRootedSFTPServer(sess, opts.Files)
 			if err != nil {
-				s.lb.logf("sftp session: %v", err)
+				s.sshLogf("sftp session: %v", err)
 				sess.Exit(1)
 				return
 			}
@@ -45,7 +45,7 @@ func (s *Server) sftpSubsystemHandler(opts SSHOptions) ssh.SubsystemHandler {
 		} else {
 			fsrv, err := newFullSFTPServer(sess)
 			if err != nil {
-				s.lb.logf("sftp session: %v", err)
+				s.sshLogf("sftp session: %v", err)
 				sess.Exit(1)
 				return
 			}
@@ -60,7 +60,7 @@ func (s *Server) sftpSubsystemHandler(opts SSHOptions) ssh.SubsystemHandler {
 		// scp report failure for successful transfers. Close still
 		// runs afterwards to release any handles a client left open.
 		if err != nil {
-			s.lb.logf("sftp session: %v", err)
+			s.sshLogf("sftp session: %v", err)
 			sess.Exit(1)
 		} else {
 			sess.Exit(0)
