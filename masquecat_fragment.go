@@ -113,7 +113,7 @@ func (r *masqueWGReassembler) sourceAssemblyCountLocked(src key.NodePublic) int 
 		if k.src == src {
 			count++
 		}
-t}
+	}
 	return count
 }
 
