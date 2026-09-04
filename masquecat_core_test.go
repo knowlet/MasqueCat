@@ -174,6 +174,9 @@ func (f *injectingMasqueForwarder) ForwardPacket(src, _ key.NodePublic, payload 
 	return f.dst.Inject(src, payload)
 }
 
+// Regression: the shared ping control address must be local only on the server.
+// If the client owns it too, gVisor can route the ping back to itself instead of
+// sending the SYN through WireGuard to the peer.
 func TestMasqueCorePingControlAddress(t *testing.T) {
 	client, err := newMasqueCore(key.NewNode(), masqueCoreOptions{}, t.Logf)
 	if err != nil {
