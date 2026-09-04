@@ -38,7 +38,7 @@ func TestMasqueConnBlobAutomaticDirectMarker(t *testing.T) {
 		Version:           1,
 		ServerPublic:      priv.Public(),
 		ServerDiscoPublic: DiscoPublicForNode(priv).DiscoPublic,
-		DirectURL:         "https://192.0.2.10:4433",
+		DirectURL:         "https://192.0.2.10:4433#sha256=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 		AutomaticDirect:   true,
 	}
 	blob, err := ci.ConnBlob()
@@ -56,6 +56,27 @@ func TestMasqueConnBlobAutomaticDirectMarker(t *testing.T) {
 	ci.RelayURL = "https://relay.example:443"
 	if _, err := ci.ConnBlob(); err == nil || !strings.Contains(err.Error(), "direct-only") {
 		t.Fatalf("automatic direct + relay error = %v, want direct-only validation error", err)
+	}
+}
+
+func TestMasqueConnBlobAutomaticDirectRequiresCertificatePin(t *testing.T) {
+	priv := key.NewNode()
+	base := MasqueConnInfo{
+		Version:           1,
+		ServerPublic:      priv.Public(),
+		ServerDiscoPublic: DiscoPublicForNode(priv).DiscoPublic,
+		AutomaticDirect:   true,
+	}
+
+	ci := base
+	ci.DirectURL = "https://192.0.2.10:4433"
+	if _, err := ci.ConnBlob(); err == nil || !strings.Contains(err.Error(), "certificate pin") {
+		t.Fatalf("missing-pin error = %v, want certificate pin validation error", err)
+	}
+
+	ci.DirectURL = "https://192.0.2.10:4433#sha256=too-short"
+	if _, err := ci.ConnBlob(); err == nil || !strings.Contains(err.Error(), "certificate pin") {
+		t.Fatalf("bad-pin error = %v, want certificate pin validation error", err)
 	}
 }
 
