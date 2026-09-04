@@ -14,6 +14,7 @@ import (
 	"time"
 	_ "unsafe"
 
+	"github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/yosida95/uritemplate/v3"
