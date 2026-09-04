@@ -20,6 +20,10 @@ const (
 
 type masqueTLSCertPin [sha256.Size]byte
 
+func (pin masqueTLSCertPin) matchesCertificate(raw []byte) bool {
+	return sha256.Sum256(raw) == pin
+}
+
 // MasqueConnBlob is a self-contained MasqueCat server address.
 // It carries the server's WireGuard identity and the explicitly configured
 // MASQUE paths that a client may use. It intentionally contains no discovered
