@@ -204,12 +204,14 @@ func (b *masqueBind) SetPath(peer key.NodePublic, path masquePacketForwarder) {
 	b.paths[peer] = path
 }
 
-func (b *masqueBind) RemovePath(peer key.NodePublic, path masquePacketForwarder) {
+func (b *masqueBind) RemovePath(peer key.NodePublic, path masquePacketForwarder) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if current := b.paths[peer]; current == path {
 		delete(b.paths, peer)
+		return true
 	}
+	return false
 }
 
 func (b *masqueBind) Inject(src key.NodePublic, payload []byte) error {
@@ -474,17 +476,15 @@ func (c *masqueCore) AddAllowedClient(peer key.NodePublic) {
 
 func nodePublicHex(k key.NodePublic) string { return hex.EncodeToString(k.AppendTo(nil)) }
 
-func (c *masqueCore) AddPeer(peer key.NodePublic) error {
-	if peer.IsZero() {
-		return errors.New("masquecat: zero peer key")
+// addPeerLocked admits and configures a peer while c.mu is held. Existing peers
+// are grandfathered: runtime allowlist changes govern new admissions, not
+// already-established sessions.
+func (c *masqueCore) addPeerLocked(peer key.NodePublic) error {
+	if c.peers[peer] {
+		return nil
 	}
 	if !c.peerAllowed(peer) {
 		return fmt.Errorf("masquecat: peer %v is not allowed", peer.ShortString())
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.peers[peer] {
-		return nil
 	}
 	allowed := pfxOf(tcAddrForKey(peer)).String()
 	if !c.isServer {
@@ -502,8 +502,22 @@ func (c *masqueCore) AddPeer(peer key.NodePublic) error {
 	return nil
 }
 
+func (c *masqueCore) AddPeer(peer key.NodePublic) error {
+	if peer.IsZero() {
+		return errors.New("masquecat: zero peer key")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.addPeerLocked(peer)
+}
+
 func (c *masqueCore) SetPath(peer key.NodePublic, path masquePacketForwarder) error {
-	if err := c.AddPeer(peer); err != nil {
+	if peer.IsZero() {
+		return errors.New("masquecat: zero peer key")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.addPeerLocked(peer); err != nil {
 		return err
 	}
 	c.bind.SetPath(peer, path)
@@ -511,7 +525,17 @@ func (c *masqueCore) SetPath(peer key.NodePublic, path masquePacketForwarder) er
 }
 
 func (c *masqueCore) RemovePath(peer key.NodePublic, path masquePacketForwarder) {
-	c.bind.RemovePath(peer, path)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.bind.RemovePath(peer, path) || !c.peers[peer] {
+		return
+	}
+	peerHex := nodePublicHex(peer)
+	if err := c.wg.IpcSet("public_key=" + peerHex + "\nremove=true\n\n"); err != nil {
+		c.logf("masquecat: remove WireGuard peer %v after path close: %v", peer.ShortString(), err)
+		return
+	}
+	delete(c.peers, peer)
 }
 
 func (c *masqueCore) Inject(src key.NodePublic, payload []byte) error {
