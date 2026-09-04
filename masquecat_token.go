@@ -1,6 +1,7 @@
 package tailcat
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -12,9 +13,12 @@ import (
 )
 
 const (
-	masqueConnBlobPrefix = "mc"
-	maxMasqueConnBlobLen = 8 << 10
+	masqueConnBlobPrefix           = "mc"
+	maxMasqueConnBlobLen           = 8 << 10
+	masqueTLSCertPinFragmentPrefix = "sha256="
 )
+
+type masqueTLSCertPin [sha256.Size]byte
 
 // MasqueConnBlob is a self-contained MasqueCat server address.
 // It carries the server's WireGuard identity and the explicitly configured
@@ -32,10 +36,9 @@ type MasqueConnInfo struct {
 	RelayURL          string
 
 	// AutomaticDirect marks the direct-only endpoint as one synthesized by the
-	// tailcat CLI with its local self-signed carrier certificate. Clients may use
-	// this explicit marker to relax only the outer direct TLS verification while
-	// still authenticating the peer with ServerPublic. URL shape alone must not
-	// be used to infer this property.
+	// tailcat CLI with its local self-signed carrier certificate. Automatic
+	// direct URLs must carry an exact SHA-256 certificate pin in their fragment;
+	// the marker alone never authorizes generic TLS verification bypass.
 	AutomaticDirect bool
 }
 
@@ -122,6 +125,15 @@ func (ci MasqueConnInfo) validate() error {
 			return err
 		}
 	}
+	if ci.AutomaticDirect {
+		_, pinned, err := masqueTLSCertPinFromURL(ci.DirectURL)
+		if err != nil {
+			return fmt.Errorf("MasqueCat automatic-direct TLS pin: %w", err)
+		}
+		if !pinned {
+			return errors.New("MasqueCat automatic-direct endpoint requires a SHA-256 TLS certificate pin")
+		}
+	}
 	return nil
 }
 
@@ -139,8 +151,41 @@ func validateMasqueURL(kind, raw string) error {
 	if u.User != nil {
 		return fmt.Errorf("%s MASQUE URL must not contain userinfo", kind)
 	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("%s MASQUE URL must not contain query or fragment", kind)
+	if u.RawQuery != "" {
+		return fmt.Errorf("%s MASQUE URL must not contain query", kind)
+	}
+	if u.Fragment != "" {
+		if kind != "direct" {
+			return fmt.Errorf("%s MASQUE URL must not contain fragment", kind)
+		}
+		if _, ok, err := masqueTLSCertPinFromURL(raw); err != nil {
+			return fmt.Errorf("direct MASQUE URL has invalid TLS certificate pin: %w", err)
+		} else if !ok {
+			return errors.New("direct MASQUE URL fragment must contain a SHA-256 TLS certificate pin")
+		}
 	}
 	return nil
+}
+
+func masqueTLSCertPinFromURL(raw string) (pin masqueTLSCertPin, ok bool, err error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return pin, false, err
+	}
+	if u.Fragment == "" {
+		return pin, false, nil
+	}
+	encoded, found := strings.CutPrefix(u.Fragment, masqueTLSCertPinFragmentPrefix)
+	if !found || encoded == "" {
+		return pin, false, fmt.Errorf("fragment must be %s<base64url-sha256>", masqueTLSCertPinFragmentPrefix)
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return pin, false, fmt.Errorf("decode SHA-256 certificate pin: %w", err)
+	}
+	if len(decoded) != len(pin) {
+		return pin, false, fmt.Errorf("SHA-256 certificate pin is %d bytes, want %d", len(decoded), len(pin))
+	}
+	copy(pin[:], decoded)
+	return pin, true, nil
 }
