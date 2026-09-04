@@ -56,6 +56,7 @@ type MasqueServer struct {
 	core       *masqueCore
 	relayPath  *masquePath
 	directHTTP *http3.Server
+	directH2   *masqueHTTP2Server
 	directPC   net.PacketConn
 	cancel     context.CancelFunc
 	blob       MasqueConnBlob
@@ -123,6 +124,9 @@ func (s *MasqueServer) Start() error {
 		if s.directHTTP != nil {
 			_ = s.directHTTP.Close()
 		}
+		if s.directH2 != nil {
+			_ = s.directH2.Close()
+		}
 		if s.directPC != nil {
 			_ = s.directPC.Close()
 		}
@@ -132,6 +136,7 @@ func (s *MasqueServer) Start() error {
 		_ = core.Close()
 		s.cancel = nil
 		s.directHTTP = nil
+		s.directH2 = nil
 		s.directPC = nil
 		s.relayPath = nil
 		s.core = nil
@@ -152,11 +157,13 @@ func (s *MasqueServer) Start() error {
 			cleanup()
 			return fmt.Errorf("derive direct HTTP/2 MASQUE listen address: %w", err)
 		}
-		if err := startMasqueHTTP2(ctx, h2Addr, s.DirectTLSConfig, handler, logf); err != nil {
+		h2, err := startMasqueHTTP2(ctx, h2Addr, s.DirectTLSConfig, handler, logf)
+		if err != nil {
 			_ = pc.Close()
 			cleanup()
 			return fmt.Errorf("start direct HTTP/2 MASQUE: %w", err)
 		}
+		s.directH2 = h2
 		conf := http3.ConfigureTLSConfig(s.DirectTLSConfig.Clone())
 		conf.MinVersion = tls.VersionTLS13
 		h3 := &http3.Server{
@@ -271,6 +278,10 @@ func (s *MasqueServer) Close() error {
 	if s.directHTTP != nil {
 		errs = append(errs, s.directHTTP.Close())
 		s.directHTTP = nil
+	}
+	if s.directH2 != nil {
+		errs = append(errs, s.directH2.Close())
+		s.directH2 = nil
 	}
 	if s.directPC != nil {
 		errs = append(errs, s.directPC.Close())

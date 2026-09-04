@@ -187,9 +187,9 @@ func newMasqueHTTP2Transport(tlsConfig *tls.Config) *http2.Transport {
 	h2TLS := tlsConfig.Clone()
 	h2TLS.NextProtos = []string{http2.NextProtoTLS}
 	return &http2.Transport{
-		TLSClientConfig: h2TLS,
-		ReadIdleTimeout: masqueH2ReadIdleTimeout,
-		PingTimeout:     masqueH2PingTimeout,
+		TLSClientConfig:  h2TLS,
+		ReadIdleTimeout:  masqueH2ReadIdleTimeout,
+		PingTimeout:      masqueH2PingTimeout,
 		WriteByteTimeout: masqueH2WriteTimeout,
 	}
 }
@@ -516,18 +516,18 @@ type masqueHTTP2Conn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	writeMu sync.Mutex
-	flowMu  sync.Mutex
-	flowCh  chan struct{}
-	done    chan struct{}
+	writeMu  sync.Mutex
+	flowMu   sync.Mutex
+	flowCh   chan struct{}
+	done     chan struct{}
 	doneOnce sync.Once
 
-	peerConnWindow     int64
-	peerStreamWindow   int64
-	peerInitialWindow  int64
-	peerMaxFrameSize   uint32
-	streamID           uint32
-	bodyW              *io.PipeWriter
+	peerConnWindow    int64
+	peerStreamWindow  int64
+	peerInitialWindow int64
+	peerMaxFrameSize  uint32
+	streamID          uint32
+	bodyW             *io.PipeWriter
 }
 
 func (s *masqueHTTP2Server) serveConn(conn net.Conn) error {
@@ -555,16 +555,16 @@ func (s *masqueHTTP2Server) serveConn(conn net.Conn) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &masqueHTTP2Conn{
-		conn:               conn,
-		handler:            s.Handler,
-		ctx:                ctx,
-		cancel:             cancel,
-		flowCh:             make(chan struct{}, 1),
-		done:               make(chan struct{}),
-		peerConnWindow:     65535,
-		peerStreamWindow:   65535,
-		peerInitialWindow:  65535,
-		peerMaxFrameSize:   16384,
+		conn:              conn,
+		handler:           s.Handler,
+		ctx:               ctx,
+		cancel:            cancel,
+		flowCh:            make(chan struct{}, 1),
+		done:              make(chan struct{}),
+		peerConnWindow:    65535,
+		peerStreamWindow:  65535,
+		peerInitialWindow: 65535,
+		peerMaxFrameSize:  16384,
 	}
 	defer c.close()
 	c.fr = http2.NewFramer(conn, conn)
@@ -802,7 +802,7 @@ func masqueH2RequestFromFields(ctx context.Context, tlsConn *tls.Conn, body io.R
 		u.Scheme = scheme
 	}
 	state := tlsConn.ConnectionState()
-	return &http.Request{
+	req := &http.Request{
 		Method:        method,
 		URL:           u,
 		Proto:         "HTTP/2.0",
@@ -815,7 +815,8 @@ func masqueH2RequestFromFields(ctx context.Context, tlsConn *tls.Conn, body io.R
 		RemoteAddr:    tlsConn.RemoteAddr().String(),
 		RequestURI:    path,
 		TLS:           &state,
-	}.WithContext(ctx), nil
+	}
+	return req.WithContext(ctx), nil
 }
 
 type masqueH2ResponseWriter struct {
@@ -994,14 +995,14 @@ func startMasqueHTTP2(
 	tlsConfig *tls.Config,
 	handler http.Handler,
 	logf logger.Logf,
-) error {
+) (*masqueHTTP2Server, error) {
 	srv, err := newMasqueHTTP2Server(tlsConfig, handler)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen for HTTP/2 MASQUE: %w", err)
+		return nil, fmt.Errorf("listen for HTTP/2 MASQUE: %w", err)
 	}
 	tlsLn := tls.NewListener(ln, srv.TLSConfig)
 	go func() {
@@ -1013,7 +1014,7 @@ func startMasqueHTTP2(
 		<-ctx.Done()
 		_ = srv.Close()
 	}()
-	return nil
+	return srv, nil
 }
 
 // ServeMasque serves the same CONNECT-UDP handler on UDP/HTTP/3 and
