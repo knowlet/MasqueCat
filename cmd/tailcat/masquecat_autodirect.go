@@ -145,14 +145,18 @@ func configureAutoMasqueDirect() error {
 		return err
 	}
 
-	directURL := "https://" + net.JoinHostPort(addr.String(), autoMasqueDirectPort)
+	baseURL := "https://" + net.JoinHostPort(addr.String(), autoMasqueDirectPort)
+	directURL, err := autoMasqueDirectURLWithPin(baseURL, certPath, keyPath)
+	if err != nil {
+		return err
+	}
 	_ = os.Setenv("MASQUECAT_DIRECT_URL", directURL)
 	_ = os.Setenv("MASQUECAT_DIRECT_LISTEN", ":"+autoMasqueDirectPort)
 	_ = os.Setenv("MASQUECAT_TLS_CERT", certPath)
 	_ = os.Setenv("MASQUECAT_TLS_KEY", keyPath)
 	_ = os.Setenv(autoMasqueDirectMarkerEnv, "1")
 
-	fmt.Fprintf(os.Stderr, "# No MASQUE relay URL configured; starting direct-only mode at %s (UDP %s).\n", directURL, autoMasqueDirectPort)
+	fmt.Fprintf(os.Stderr, "# No MASQUE relay URL configured; starting direct-only mode at %s (UDP %s).\n", baseURL, autoMasqueDirectPort)
 	if addr.IsPrivate() {
 		fmt.Fprintln(os.Stderr, "# The automatic endpoint is a private/local address. It is reachable only on a network that can route to it; for Internet/NAT use an explicit --direct-url with a reachable UDP endpoint or configure --relay-url.")
 	} else {
