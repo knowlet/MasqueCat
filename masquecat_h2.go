@@ -3,6 +3,7 @@
 package tailcat
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -10,15 +11,19 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
-	_ "unsafe"
 
 	"github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/yosida95/uritemplate/v3"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -27,26 +32,12 @@ const (
 	masqueConnectUDPProtocol = "connect-udp"
 	masqueDatagramCapsule    = uint64(0)
 	maxMasqueCapsuleSize     = 64 << 10
+
+	masqueH2InitialWindow   = uint32(1 << 20)
+	masqueH2ReadIdleTimeout = 30 * time.Second
+	masqueH2PingTimeout     = 15 * time.Second
+	masqueH2WriteTimeout    = 30 * time.Second
 )
-
-// x/net/http2 has full RFC 8441 Extended CONNECT support, but currently keeps
-// it behind GODEBUG=http2xconnect=1 because enabling it for arbitrary HTTP
-// servers can change WebSocket behavior. MasqueCat owns the HTTP/2 servers it
-// creates and needs Extended CONNECT unconditionally for RFC 9298.
-//
-// Keep this workaround isolated here so it can be deleted as soon as x/net
-// exposes a per-server switch. It affects only x/net/http2, not net/http's
-// bundled HTTP/2 implementation.
-//go:linkname http2DisableExtendedConnectProtocol golang.org/x/net/http2.disableExtendedConnectProtocol
-var http2DisableExtendedConnectProtocol bool
-
-var masqueH2ExtendedConnectOnce sync.Once
-
-func enableMasqueH2ExtendedConnect() {
-	masqueH2ExtendedConnectOnce.Do(func() {
-		http2DisableExtendedConnectProtocol = false
-	})
-}
 
 type masqueCapsuleStream struct {
 	r io.ReadCloser
@@ -110,6 +101,9 @@ func (s *masqueCapsuleStream) ReceiveDatagram(ctx context.Context) ([]byte, erro
 			return nil, err
 		}
 		if capsuleType != masqueDatagramCapsule {
+			if capsuleLen > maxMasqueCapsuleSize {
+				return nil, fmt.Errorf("masquecat: HTTP/2 capsule too large: %d", capsuleLen)
+			}
 			if _, err := io.CopyN(io.Discard, s.r, int64(capsuleLen)); err != nil {
 				return nil, err
 			}
@@ -189,6 +183,17 @@ type masqueH2Addr struct{}
 func (masqueH2Addr) Network() string { return "masque-h2" }
 func (masqueH2Addr) String() string  { return "masque-h2" }
 
+func newMasqueHTTP2Transport(tlsConfig *tls.Config) *http2.Transport {
+	h2TLS := tlsConfig.Clone()
+	h2TLS.NextProtos = []string{http2.NextProtoTLS}
+	return &http2.Transport{
+		TLSClientConfig: h2TLS,
+		ReadIdleTimeout: masqueH2ReadIdleTimeout,
+		PingTimeout:     masqueH2PingTimeout,
+		WriteByteTimeout: masqueH2WriteTimeout,
+	}
+}
+
 // newMasquePathWithFallback keeps HTTP/3 as the preferred carrier and retries
 // the exact same authenticated CONNECT-UDP exchange over HTTP/2 when QUIC is
 // unavailable. The dial function is retained on masquePath so reconnects also
@@ -223,7 +228,7 @@ func newMasquePathWithFallback(
 	}
 
 	dial := func(dialCtx context.Context) (net.PacketConn, error) {
-		h3, h3Err := dialMasquePacketConn(dialCtx, tmpl, target, local, mode, tlsConfig)
+		h3, h3Err := dialMasquePacketConn(dialCtx, tmpl, rawURL, target, local, mode, tlsConfig)
 		if h3Err == nil {
 			return h3, nil
 		}
@@ -258,9 +263,7 @@ func dialMasqueH2PacketConn(
 	if err != nil {
 		return nil, err
 	}
-	h2TLS := tlsConfig.Clone()
-	h2TLS.NextProtos = []string{http2.NextProtoTLS}
-	tr := &http2.Transport{TLSClientConfig: h2TLS}
+	tr := newMasqueHTTP2Transport(tlsConfig)
 
 	dial := func(proof string) (*masqueH2PacketConn, *http.Response, error) {
 		pr, pw := io.Pipe()
@@ -311,7 +314,7 @@ func dialMasqueH2PacketConn(
 		if proofErr != nil {
 			return nil, fmt.Errorf("masquecat: authenticate HTTP/2 CONNECT-UDP: %w", proofErr)
 		}
-		tr = &http2.Transport{TLSClientConfig: h2TLS}
+		tr = newMasqueHTTP2Transport(tlsConfig)
 		conn, resp, err = dial(proof)
 		if err != nil {
 			tr.CloseIdleConnections()
@@ -343,7 +346,8 @@ func expandMasqueTargetURL(tmpl *uritemplate.Template, target string) (string, e
 
 // parseConnectUDPRequestAny normalizes HTTP/2's :protocol pseudo-header into
 // the representation masque-go expects for HTTP/3 before reusing the existing
-// path-template validation logic.
+// path-template validation logic. Go exposes RFC 8441's :protocol value to
+// handlers through Request.Header[":protocol"].
 func parseConnectUDPRequestAny(w http.ResponseWriter, r *http.Request, tmpl *uritemplate.Template) (*masque.ProxyRequest, bool) {
 	if r.ProtoMajor != 2 {
 		return parseConnectUDPRequest(w, r, tmpl)
@@ -385,21 +389,588 @@ func acceptMasqueH2Stream(w http.ResponseWriter, r *http.Request) (masqueDatagra
 	}, nil
 }
 
-func newMasqueHTTP2Server(tlsConfig *tls.Config, handler http.Handler) (*http.Server, error) {
+// masqueHTTP2Server is a deliberately small HTTP/2 server dedicated to the
+// long-lived RFC 8441 Extended CONNECT stream used by CONNECT-UDP. Go 1.27
+// does not yet expose a per-server EnableConnectProtocol switch, so using the
+// standard net/http HTTP/2 server would require mutating a package-global
+// GODEBUG-controlled flag. Owning this narrow frontend lets MasqueCat advertise
+// SETTINGS_ENABLE_CONNECT_PROTOCOL without affecting unrelated HTTP/2 servers
+// in the same process.
+type masqueHTTP2Server struct {
+	TLSConfig *tls.Config
+	Handler   http.Handler
+
+	mu        sync.Mutex
+	closed    bool
+	listeners map[net.Listener]struct{}
+	conns     map[net.Conn]struct{}
+	wg        sync.WaitGroup
+}
+
+func newMasqueHTTP2Server(tlsConfig *tls.Config, handler http.Handler) (*masqueHTTP2Server, error) {
 	if tlsConfig == nil {
 		return nil, errors.New("masquecat: nil HTTP/2 TLS config")
 	}
-	enableMasqueH2ExtendedConnect()
+	if handler == nil {
+		return nil, errors.New("masquecat: nil HTTP/2 handler")
+	}
 	conf := tlsConfig.Clone()
 	conf.MinVersion = tls.VersionTLS13
-	srv := &http.Server{TLSConfig: conf, Handler: handler}
-	if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
-		return nil, fmt.Errorf("masquecat: configure HTTP/2 server: %w", err)
+	conf.NextProtos = []string{http2.NextProtoTLS}
+	return &masqueHTTP2Server{
+		TLSConfig: conf,
+		Handler:   handler,
+		listeners: make(map[net.Listener]struct{}),
+		conns:     make(map[net.Conn]struct{}),
+	}, nil
+}
+
+func (s *masqueHTTP2Server) Serve(ln net.Listener) error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return http.ErrServerClosed
 	}
-	// This listener is specifically for the RFC 9298 fallback. Do not silently
-	// downgrade the fallback socket to HTTP/1.1.
-	srv.TLSConfig.NextProtos = []string{http2.NextProtoTLS}
-	return srv, nil
+	s.listeners[ln] = struct{}{}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.listeners, ln)
+		s.mu.Unlock()
+		s.wg.Done()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			s.mu.Lock()
+			closed := s.closed
+			s.mu.Unlock()
+			if closed || errors.Is(err, net.ErrClosed) {
+				return http.ErrServerClosed
+			}
+			return err
+		}
+
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return http.ErrServerClosed
+		}
+		s.conns[conn] = struct{}{}
+		s.wg.Add(1)
+		s.mu.Unlock()
+		go func(c net.Conn) {
+			defer func() {
+				_ = c.Close()
+				s.mu.Lock()
+				delete(s.conns, c)
+				s.mu.Unlock()
+				s.wg.Done()
+			}()
+			_ = s.serveConn(c)
+		}(conn)
+	}
+}
+
+func (s *masqueHTTP2Server) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.wg.Wait()
+		return nil
+	}
+	s.closed = true
+	listeners := make([]net.Listener, 0, len(s.listeners))
+	for ln := range s.listeners {
+		listeners = append(listeners, ln)
+	}
+	conns := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+	s.mu.Unlock()
+
+	var errs []error
+	for _, ln := range listeners {
+		if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	for _, conn := range conns {
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	s.wg.Wait()
+	return errors.Join(errs...)
+}
+
+type masqueHTTP2Conn struct {
+	conn    net.Conn
+	fr      *http2.Framer
+	handler http.Handler
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	writeMu sync.Mutex
+	flowMu  sync.Mutex
+	flowCh  chan struct{}
+	done    chan struct{}
+	doneOnce sync.Once
+
+	peerConnWindow     int64
+	peerStreamWindow   int64
+	peerInitialWindow  int64
+	peerMaxFrameSize   uint32
+	streamID           uint32
+	bodyW              *io.PipeWriter
+}
+
+func (s *masqueHTTP2Server) serveConn(conn net.Conn) error {
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return errors.New("masquecat: HTTP/2 listener accepted a non-TLS connection")
+	}
+	handshakeCtx, cancelHandshake := context.WithTimeout(context.Background(), masqueH2WriteTimeout)
+	err := tlsConn.HandshakeContext(handshakeCtx)
+	cancelHandshake()
+	if err != nil {
+		return err
+	}
+	if tlsConn.ConnectionState().NegotiatedProtocol != http2.NextProtoTLS {
+		return fmt.Errorf("masquecat: HTTP/2 listener negotiated %q", tlsConn.ConnectionState().NegotiatedProtocol)
+	}
+
+	var preface [len(http2.ClientPreface)]byte
+	if _, err := io.ReadFull(conn, preface[:]); err != nil {
+		return err
+	}
+	if string(preface[:]) != http2.ClientPreface {
+		return errors.New("masquecat: invalid HTTP/2 client preface")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &masqueHTTP2Conn{
+		conn:               conn,
+		handler:            s.Handler,
+		ctx:                ctx,
+		cancel:             cancel,
+		flowCh:             make(chan struct{}, 1),
+		done:               make(chan struct{}),
+		peerConnWindow:     65535,
+		peerStreamWindow:   65535,
+		peerInitialWindow:  65535,
+		peerMaxFrameSize:   16384,
+	}
+	defer c.close()
+	c.fr = http2.NewFramer(conn, conn)
+	c.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+
+	if err := c.writeSettings(); err != nil {
+		return err
+	}
+	return c.readLoop(tlsConn)
+}
+
+func (c *masqueHTTP2Conn) close() {
+	c.doneOnce.Do(func() {
+		close(c.done)
+		c.cancel()
+		if c.bodyW != nil {
+			_ = c.bodyW.CloseWithError(net.ErrClosed)
+		}
+		select {
+		case c.flowCh <- struct{}{}:
+		default:
+		}
+	})
+}
+
+func (c *masqueHTTP2Conn) writeFrame(fn func() error) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if err := c.conn.SetWriteDeadline(time.Now().Add(masqueH2WriteTimeout)); err != nil {
+		return err
+	}
+	err := fn()
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+func (c *masqueHTTP2Conn) writeSettings() error {
+	if err := c.writeFrame(func() error {
+		return c.fr.WriteSettings(
+			http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1},
+			http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1},
+			http2.Setting{ID: http2.SettingInitialWindowSize, Val: masqueH2InitialWindow},
+		)
+	}); err != nil {
+		return err
+	}
+	return c.writeFrame(func() error {
+		return c.fr.WriteWindowUpdate(0, masqueH2InitialWindow-65535)
+	})
+}
+
+func (c *masqueHTTP2Conn) readLoop(tlsConn *tls.Conn) error {
+	for {
+		frame, err := c.fr.ReadFrame()
+		if err != nil {
+			return err
+		}
+		switch f := frame.(type) {
+		case *http2.SettingsFrame:
+			if err := c.handleSettings(f); err != nil {
+				return err
+			}
+		case *http2.PingFrame:
+			if !f.IsAck() {
+				if err := c.writeFrame(func() error { return c.fr.WritePing(true, f.Data) }); err != nil {
+					return err
+				}
+			}
+		case *http2.WindowUpdateFrame:
+			if err := c.handleWindowUpdate(f); err != nil {
+				return err
+			}
+		case *http2.MetaHeadersFrame:
+			if c.streamID != 0 {
+				if f.StreamID != c.streamID {
+					_ = c.writeFrame(func() error { return c.fr.WriteRSTStream(f.StreamID, http2.ErrCodeRefusedStream) })
+					continue
+				}
+				if f.StreamEnded() && c.bodyW != nil {
+					_ = c.bodyW.Close()
+				}
+				continue
+			}
+			if err := c.startRequest(tlsConn, f); err != nil {
+				return err
+			}
+		case *http2.DataFrame:
+			if f.StreamID != c.streamID || c.bodyW == nil {
+				continue
+			}
+			data := f.Data()
+			if len(data) != 0 {
+				if _, err := c.bodyW.Write(data); err != nil {
+					return err
+				}
+				inc := uint32(len(data))
+				if err := c.writeFrame(func() error { return c.fr.WriteWindowUpdate(0, inc) }); err != nil {
+					return err
+				}
+				if err := c.writeFrame(func() error { return c.fr.WriteWindowUpdate(c.streamID, inc) }); err != nil {
+					return err
+				}
+			}
+			if f.StreamEnded() {
+				_ = c.bodyW.Close()
+			}
+		case *http2.RSTStreamFrame:
+			if f.StreamID == c.streamID {
+				return fmt.Errorf("masquecat: HTTP/2 CONNECT stream reset: %s", f.ErrCode)
+			}
+		case *http2.GoAwayFrame:
+			return io.EOF
+		}
+	}
+}
+
+func (c *masqueHTTP2Conn) handleSettings(f *http2.SettingsFrame) error {
+	if f.IsAck() {
+		return nil
+	}
+	if err := f.ForeachSetting(func(s http2.Setting) error {
+		c.flowMu.Lock()
+		defer c.flowMu.Unlock()
+		switch s.ID {
+		case http2.SettingInitialWindowSize:
+			delta := int64(s.Val) - c.peerInitialWindow
+			c.peerInitialWindow = int64(s.Val)
+			if c.streamID != 0 {
+				c.peerStreamWindow += delta
+			}
+		case http2.SettingMaxFrameSize:
+			c.peerMaxFrameSize = s.Val
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	select {
+	case c.flowCh <- struct{}{}:
+	default:
+	}
+	return c.writeFrame(c.fr.WriteSettingsAck)
+}
+
+func (c *masqueHTTP2Conn) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
+	c.flowMu.Lock()
+	defer c.flowMu.Unlock()
+	if f.StreamID == 0 {
+		c.peerConnWindow += int64(f.Increment)
+	} else if f.StreamID == c.streamID {
+		c.peerStreamWindow += int64(f.Increment)
+	}
+	if c.peerConnWindow > (1<<31)-1 || c.peerStreamWindow > (1<<31)-1 {
+		return errors.New("masquecat: HTTP/2 flow-control window overflow")
+	}
+	select {
+	case c.flowCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (c *masqueHTTP2Conn) startRequest(tlsConn *tls.Conn, f *http2.MetaHeadersFrame) error {
+	if f.StreamID == 0 || f.StreamID%2 == 0 {
+		return errors.New("masquecat: invalid HTTP/2 CONNECT stream id")
+	}
+	bodyR, bodyW := io.Pipe()
+	req, err := masqueH2RequestFromFields(c.ctx, tlsConn, bodyR, f.Fields)
+	if err != nil {
+		_ = bodyR.Close()
+		_ = bodyW.Close()
+		return err
+	}
+	c.flowMu.Lock()
+	c.streamID = f.StreamID
+	c.peerStreamWindow = c.peerInitialWindow
+	c.flowMu.Unlock()
+	c.bodyW = bodyW
+	if f.StreamEnded() {
+		_ = bodyW.Close()
+	}
+
+	rw := &masqueH2ResponseWriter{
+		conn:     c,
+		streamID: f.StreamID,
+		header:   make(http.Header),
+	}
+	go func() {
+		defer func() {
+			if recover() != nil {
+				_ = rw.finish()
+			}
+			_ = rw.finish()
+			_ = bodyW.Close()
+			c.cancel()
+			_ = c.conn.Close()
+		}()
+		c.handler.ServeHTTP(rw, req)
+	}()
+	return nil
+}
+
+func masqueH2RequestFromFields(ctx context.Context, tlsConn *tls.Conn, body io.ReadCloser, fields []hpack.HeaderField) (*http.Request, error) {
+	var method, scheme, authority, path, protocol string
+	hdr := make(http.Header)
+	for _, field := range fields {
+		switch field.Name {
+		case ":method":
+			method = field.Value
+		case ":scheme":
+			scheme = field.Value
+		case ":authority":
+			authority = field.Value
+		case ":path":
+			path = field.Value
+		case ":protocol":
+			protocol = field.Value
+		default:
+			if !strings.HasPrefix(field.Name, ":") {
+				hdr.Add(http.CanonicalHeaderKey(field.Name), field.Value)
+			}
+		}
+	}
+	if method == "" || authority == "" || path == "" {
+		return nil, errors.New("masquecat: incomplete HTTP/2 request pseudo-headers")
+	}
+	if protocol != "" {
+		hdr.Set(":protocol", protocol)
+	}
+	u, err := url.ParseRequestURI(path)
+	if err != nil {
+		return nil, fmt.Errorf("masquecat: parse HTTP/2 :path: %w", err)
+	}
+	if scheme != "" {
+		u.Scheme = scheme
+	}
+	state := tlsConn.ConnectionState()
+	return &http.Request{
+		Method:        method,
+		URL:           u,
+		Proto:         "HTTP/2.0",
+		ProtoMajor:    2,
+		ProtoMinor:    0,
+		Header:        hdr,
+		Body:          body,
+		ContentLength: -1,
+		Host:          authority,
+		RemoteAddr:    tlsConn.RemoteAddr().String(),
+		RequestURI:    path,
+		TLS:           &state,
+	}.WithContext(ctx), nil
+}
+
+type masqueH2ResponseWriter struct {
+	conn     *masqueHTTP2Conn
+	streamID uint32
+	header   http.Header
+
+	mu          sync.Mutex
+	wroteHeader bool
+	ended       bool
+}
+
+func (w *masqueH2ResponseWriter) Header() http.Header { return w.header }
+
+func (w *masqueH2ResponseWriter) WriteHeader(statusCode int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_ = w.writeHeaderLocked(statusCode)
+}
+
+func (w *masqueH2ResponseWriter) writeHeaderLocked(statusCode int) error {
+	if w.wroteHeader || w.ended {
+		return nil
+	}
+	block, err := encodeMasqueH2ResponseHeaders(statusCode, w.header)
+	if err != nil {
+		return err
+	}
+	if err := w.conn.writeFrame(func() error {
+		return w.conn.fr.WriteHeaders(http2.HeadersFrameParam{
+			StreamID:      w.streamID,
+			BlockFragment: block,
+			EndHeaders:    true,
+		})
+	}); err != nil {
+		return err
+	}
+	w.wroteHeader = true
+	return nil
+}
+
+func (w *masqueH2ResponseWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ended {
+		return 0, net.ErrClosed
+	}
+	if err := w.writeHeaderLocked(http.StatusOK); err != nil {
+		return 0, err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := w.conn.writeData(w.streamID, p, false); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (w *masqueH2ResponseWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	_ = w.writeHeaderLocked(http.StatusOK)
+}
+
+func (w *masqueH2ResponseWriter) finish() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.ended {
+		return nil
+	}
+	if err := w.writeHeaderLocked(http.StatusOK); err != nil {
+		return err
+	}
+	w.ended = true
+	return w.conn.writeData(w.streamID, nil, true)
+}
+
+func encodeMasqueH2ResponseHeaders(statusCode int, header http.Header) ([]byte, error) {
+	var block bytes.Buffer
+	enc := hpack.NewEncoder(&block)
+	if err := enc.WriteField(hpack.HeaderField{Name: ":status", Value: strconv.Itoa(statusCode)}); err != nil {
+		return nil, err
+	}
+	keys := make([]string, 0, len(header))
+	for key := range header {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		name := strings.ToLower(key)
+		if strings.HasPrefix(name, ":") || name == "connection" || name == "keep-alive" || name == "proxy-connection" || name == "transfer-encoding" || name == "upgrade" {
+			continue
+		}
+		for _, value := range header[key] {
+			if err := enc.WriteField(hpack.HeaderField{Name: name, Value: value}); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return block.Bytes(), nil
+}
+
+func (c *masqueHTTP2Conn) reserveWriteWindow(want int) (int, error) {
+	deadline := time.NewTimer(masqueH2WriteTimeout)
+	defer deadline.Stop()
+	for {
+		c.flowMu.Lock()
+		available := c.peerConnWindow
+		if c.peerStreamWindow < available {
+			available = c.peerStreamWindow
+		}
+		maxFrame := int64(c.peerMaxFrameSize)
+		if maxFrame < available {
+			available = maxFrame
+		}
+		if int64(want) < available {
+			available = int64(want)
+		}
+		if available > 0 {
+			c.peerConnWindow -= available
+			c.peerStreamWindow -= available
+			c.flowMu.Unlock()
+			return int(available), nil
+		}
+		c.flowMu.Unlock()
+
+		select {
+		case <-c.flowCh:
+			continue
+		case <-c.done:
+			return 0, net.ErrClosed
+		case <-deadline.C:
+			return 0, errors.New("masquecat: HTTP/2 flow-control write timeout")
+		}
+	}
+}
+
+func (c *masqueHTTP2Conn) writeData(streamID uint32, p []byte, endStream bool) error {
+	if len(p) == 0 {
+		return c.writeFrame(func() error { return c.fr.WriteData(streamID, endStream, nil) })
+	}
+	for len(p) != 0 {
+		n, err := c.reserveWriteWindow(len(p))
+		if err != nil {
+			return err
+		}
+		last := n == len(p)
+		chunk := p[:n]
+		if err := c.writeFrame(func() error { return c.fr.WriteData(streamID, endStream && last, chunk) }); err != nil {
+			return err
+		}
+		p = p[n:]
+	}
+	return nil
 }
 
 func masqueHTTP2CompanionAddr(configured string, udpAddr net.Addr) (string, error) {
@@ -441,7 +1012,6 @@ func startMasqueHTTP2(
 	go func() {
 		<-ctx.Done()
 		_ = srv.Close()
-		_ = ln.Close()
 	}()
 	return nil
 }
