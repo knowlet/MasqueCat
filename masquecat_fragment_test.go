@@ -95,7 +95,7 @@ func TestMasqueBindReassemblesOutOfOrderWireGuardFragments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer recvBind.Close()
+	defer func() { _ = recvBind.Close() }()
 
 	if err := recvBind.Inject(sender, forwarder.packets[1]); err != nil {
 		t.Fatal(err)

@@ -62,7 +62,7 @@ func clientLSMode(logf logger.Logf, long bool, args []string) error {
 	}
 
 	cl := newCLITCPClient(logf, addrBlobArg(host), clientKey())
-	defer closeCLITCPClient(cl)
+	defer func() { _ = closeCLITCPClient(cl) }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

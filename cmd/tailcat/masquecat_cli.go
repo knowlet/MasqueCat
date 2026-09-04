@@ -75,7 +75,7 @@ func newMasqueCLIClient(logf logger.Logf, blob string, priv key.NodePrivate) *ta
 func masqueClientMode(logf logger.Logf, connStr, optDest string) error {
 	priv := clientKey()
 	cl := newMasqueCLIClient(logf, connStr, priv)
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	var dial func(context.Context) (net.Conn, error)
 	switch {
@@ -112,9 +112,9 @@ func masqueClientMode(logf logger.Logf, connStr, optDest string) error {
 	defer cancel()
 	c, err := dial(ctx)
 	if err != nil {
-		return fmt.Errorf("Dial: %w", err)
+		return fmt.Errorf("dial: %w", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 	go func() {
 		if _, err := io.Copy(c, os.Stdin); err != nil {
 			log.Printf("stdin copy: %v", err)
@@ -280,7 +280,7 @@ func masqueServer(logf logger.Logf, serveSpec string) error {
 
 	sshServices := services.Contains("no-auth-ssh") || services.Contains("files")
 	if sshServices && !tailcat.SupportsSSHServer() {
-		return fmt.Errorf("Tailscale SSH server not supported on this platform")
+		return fmt.Errorf("tailscale SSH server not supported on this platform")
 	}
 	if !oneShotStdout && !services.Contains("exit-node") {
 		ports := slices.Sorted(maps.Keys(portSet))
@@ -361,7 +361,7 @@ func masqueServer(logf logger.Logf, serveSpec string) error {
 	if err := s.Start(); err != nil {
 		return fmt.Errorf("MasqueServer.Start: %w", err)
 	}
-	defer s.Close()
+	defer func() { _ = s.Close() }()
 	if *flagMasqueRelayURL != "" {
 		fmt.Fprintf(os.Stderr, "# MASQUE relay server: %v\n", *flagMasqueRelayURL)
 	}
