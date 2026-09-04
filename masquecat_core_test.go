@@ -51,6 +51,29 @@ func TestMasqueBindSendUsesExplicitPeerPath(t *testing.T) {
 	}
 }
 
+func TestMasqueBindRemovePathDoesNotRetireReplacement(t *testing.T) {
+	local := key.NewNode().Public()
+	peer := key.NewNode().Public()
+	b := newMasqueBind(local)
+	oldPath := new(recordingMasqueForwarder)
+	newPath := new(recordingMasqueForwarder)
+
+	b.SetPath(peer, oldPath)
+	b.SetPath(peer, newPath)
+	if b.RemovePath(peer, oldPath) {
+		t.Fatal("stale path removal retired the replacement path")
+	}
+	if !b.RemovePath(peer, newPath) {
+		t.Fatal("current path removal was not recognized")
+	}
+	b.mu.RLock()
+	_, ok := b.paths[peer]
+	b.mu.RUnlock()
+	if ok {
+		t.Fatal("current path still present after removal")
+	}
+}
+
 func TestMasqueBindInjectFeedsWireGuardReceive(t *testing.T) {
 	local := key.NewNode().Public()
 	peer := key.NewNode().Public()
@@ -100,6 +123,22 @@ func TestMasqueCoreAddAllowedClientTightensLivePolicy(t *testing.T) {
 	}
 	if c.peerAllowed(other) {
 		t.Fatal("first live allowlist addition must switch the server to explicit admission")
+	}
+}
+
+func TestMasqueCoreExistingPeerSurvivesAllowlistTightening(t *testing.T) {
+	existing := key.NewNode().Public()
+	allowed := key.NewNode().Public()
+	c := &masqueCore{
+		isServer:       true,
+		peers:          map[key.NodePublic]bool{existing: true},
+		allowedClients: map[key.NodePublic]bool{allowed: true},
+	}
+	if c.peerAllowed(existing) {
+		t.Fatal("existing peer should not satisfy the tightened admission policy")
+	}
+	if err := c.AddPeer(existing); err != nil {
+		t.Fatalf("existing admitted peer was evicted by runtime policy tightening: %v", err)
 	}
 }
 
