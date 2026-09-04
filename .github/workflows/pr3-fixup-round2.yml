@@ -1,0 +1,40 @@
+name: PR 3 round-2 fixup
+
+on:
+  push:
+    branches: [feat/masquecat-h2-fallback]
+
+permissions:
+  contents: write
+
+jobs:
+  fixup:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feat/masquecat-h2-fallback
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - name: Apply review and CI fixups
+        run: python3 .github/scripts/pr3_fixup_round2.py
+      - name: Format and verify targeted H2 tests
+        run: |
+          gofmt -w masquecat.go masquecat_h2.go masquecat_h2_client.go masquecat_h2_test.go
+          go mod tidy
+          go run ./tool/updateflakes
+          go test -count=1 -timeout 120s -run 'TestMasqueHTTP2|TestMasqueCapsule' .
+          go vet ./...
+      - name: Commit fixes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add masquecat.go masquecat_h2.go masquecat_h2_client.go masquecat_h2_test.go go.mod go.sum flakehashes.json flake.nix
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'fix: wire RFC 8441 fallback and address H2 review findings'
+          git push origin HEAD:feat/masquecat-h2-fallback
