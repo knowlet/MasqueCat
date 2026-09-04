@@ -27,7 +27,7 @@ import (
 const selfSignedValidity = 24 * time.Hour
 
 func main() {
-	listen := flag.String("listen", ":443", "UDP address for HTTP/3 MASQUE")
+	listen := flag.String("listen", ":443", "TCP/UDP address for HTTP/3 MASQUE with HTTP/2 fallback")
 	certFile := flag.String("cert", "", "TLS certificate PEM file")
 	keyFile := flag.String("key", "", "TLS private key PEM file")
 	flag.Parse()
@@ -41,7 +41,7 @@ func main() {
 	}
 
 	relay := &tailcat.MasqueRelay{Logf: log.Printf}
-	if err := tailcat.ServeMasqueHTTP3(*listen, &tls.Config{Certificates: []tls.Certificate{cert}}, relay.Handler()); err != nil {
+	if err := tailcat.ServeMasque(*listen, &tls.Config{Certificates: []tls.Certificate{cert}}, relay.Handler()); err != nil {
 		log.Fatal(err)
 	}
 }
