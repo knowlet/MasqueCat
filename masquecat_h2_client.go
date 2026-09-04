@@ -160,6 +160,7 @@ func dialMasqueH2ExtendedConnect(
 		peerStreamWindow:  65535,
 		peerInitialWindow: 65535,
 		peerMaxFrameSize:  16384,
+		streamID:          1,
 		bodyR:             bodyR,
 		bodyW:             bodyW,
 		settingsCh:        make(chan error, 1),
@@ -248,7 +249,6 @@ func (c *masqueH2ClientConn) writeExtendedConnectHeaders(u *url.URL, headers htt
 		return err
 	}
 	c.flowMu.Lock()
-	c.streamID = 1
 	c.peerStreamWindow = c.peerInitialWindow
 	c.flowMu.Unlock()
 	return c.writeFrame(func() error {

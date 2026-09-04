@@ -322,6 +322,20 @@ func newMasqueHTTP2Server(tlsConfig *tls.Config, handler http.Handler) (*masqueH
 	conf := tlsConfig.Clone()
 	conf.MinVersion = tls.VersionTLS13
 	conf.NextProtos = []string{http2.NextProtoTLS}
+	if getConfigForClient := conf.GetConfigForClient; getConfigForClient != nil {
+		conf.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			selected, err := getConfigForClient(hello)
+			if err != nil || selected == nil {
+				return selected, err
+			}
+			selected = selected.Clone()
+			if selected.MinVersion < tls.VersionTLS13 {
+				selected.MinVersion = tls.VersionTLS13
+			}
+			selected.NextProtos = []string{http2.NextProtoTLS}
+			return selected, nil
+		}
+	}
 	return &masqueHTTP2Server{
 		TLSConfig: conf,
 		Handler:   handler,

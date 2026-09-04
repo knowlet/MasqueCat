@@ -147,6 +147,46 @@ func TestMasqueHTTP2ExtendedConnectDatagram(t *testing.T) {
 	}
 }
 
+func TestMasqueHTTP2DynamicTLSConfigPreservesH2(t *testing.T) {
+	selected := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
+	}
+	base := &tls.Config{
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			return selected, nil
+		},
+	}
+
+	srv, err := newMasqueHTTP2Server(base, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.TLSConfig.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("top-level MinVersion = %x, want TLS 1.3", srv.TLSConfig.MinVersion)
+	}
+	if len(srv.TLSConfig.NextProtos) != 1 || srv.TLSConfig.NextProtos[0] != "h2" {
+		t.Fatalf("top-level NextProtos = %v, want [h2]", srv.TLSConfig.NextProtos)
+	}
+
+	got, err := srv.TLSConfig.GetConfigForClient(&tls.ClientHelloInfo{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("dynamic TLS callback returned nil config")
+	}
+	if got.MinVersion != tls.VersionTLS13 {
+		t.Fatalf("dynamic MinVersion = %x, want TLS 1.3", got.MinVersion)
+	}
+	if len(got.NextProtos) != 1 || got.NextProtos[0] != "h2" {
+		t.Fatalf("dynamic NextProtos = %v, want [h2]", got.NextProtos)
+	}
+	if selected.MinVersion != tls.VersionTLS12 || len(selected.NextProtos) != 1 || selected.NextProtos[0] != "http/1.1" {
+		t.Fatalf("caller-owned TLS config was mutated: MinVersion=%x NextProtos=%v", selected.MinVersion, selected.NextProtos)
+	}
+}
+
 func TestMasqueHTTP2CompanionAddrUsesUDPPortForEphemeralListen(t *testing.T) {
 	got, err := masqueHTTP2CompanionAddr("127.0.0.1:0", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 43210})
 	if err != nil {

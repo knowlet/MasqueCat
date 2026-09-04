@@ -224,9 +224,10 @@ System services are non-interactive, so explicitly configure `-cert` and `-key`.
 
 The repository does not currently ship a dedicated relay container image or a
 relay-specific Dockerfile. A container can run the binary, but the deployment
-must publish the port as **UDP**, not TCP, and should mount certificate/key
-files. Most container launches are non-interactive, so the automatic
-self-signed prompt is intentionally unavailable there.
+must publish the configured port as **both UDP and TCP**: UDP carries the
+preferred HTTP/3 path and TCP carries the HTTP/2 fallback. It should also mount
+certificate/key files. Most container launches are non-interactive, so the
+automatic self-signed prompt is intentionally unavailable there.
 
 See the deployment guide for a reproducible multi-stage example.
 
