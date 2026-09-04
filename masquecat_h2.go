@@ -19,17 +19,18 @@ import (
 	"github.com/yosida95/uritemplate/v3"
 	"golang.org/x/net/http2"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 )
 
 const (
 	masqueConnectUDPProtocol = "connect-udp"
 	masqueDatagramCapsule    = uint64(0)
-	maxMasqueCapsuleSize     = 1 << 20
+	maxMasqueCapsuleSize     = 64 << 10
 )
 
 // x/net/http2 has full RFC 8441 Extended CONNECT support, but currently keeps
 // it behind GODEBUG=http2xconnect=1 because enabling it for arbitrary HTTP
-// servers can change WebSocket behavior. MasqueCat owns the HTTP/2 server it
+// servers can change WebSocket behavior. MasqueCat owns the HTTP/2 servers it
 // creates and needs Extended CONNECT unconditionally for RFC 9298.
 //
 // Keep this workaround isolated here so it can be deleted as soon as x/net
@@ -38,14 +39,17 @@ const (
 //go:linkname http2DisableExtendedConnectProtocol golang.org/x/net/http2.disableExtendedConnectProtocol
 var http2DisableExtendedConnectProtocol bool
 
+var masqueH2ExtendedConnectOnce sync.Once
+
 func enableMasqueH2ExtendedConnect() {
-	http2DisableExtendedConnectProtocol = false
+	masqueH2ExtendedConnectOnce.Do(func() {
+		http2DisableExtendedConnectProtocol = false
+	})
 }
 
 type masqueCapsuleStream struct {
-	ctx context.Context
-	r   io.ReadCloser
-	w   io.Writer
+	r io.ReadCloser
+	w io.Writer
 
 	closeWriter func() error
 	flush       func()
@@ -174,15 +178,72 @@ func (c *masqueH2PacketConn) Close() error {
 	return err
 }
 
-func (*masqueH2PacketConn) LocalAddr() net.Addr                { return masqueH2Addr{} }
-func (*masqueH2PacketConn) SetDeadline(time.Time) error        { return nil }
-func (*masqueH2PacketConn) SetReadDeadline(time.Time) error    { return nil }
-func (*masqueH2PacketConn) SetWriteDeadline(time.Time) error   { return nil }
+func (*masqueH2PacketConn) LocalAddr() net.Addr              { return masqueH2Addr{} }
+func (*masqueH2PacketConn) SetDeadline(time.Time) error      { return nil }
+func (*masqueH2PacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*masqueH2PacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 type masqueH2Addr struct{}
 
 func (masqueH2Addr) Network() string { return "masque-h2" }
 func (masqueH2Addr) String() string  { return "masque-h2" }
+
+// newMasquePathWithFallback keeps HTTP/3 as the preferred carrier and retries
+// the exact same authenticated CONNECT-UDP exchange over HTTP/2 when QUIC is
+// unavailable. The dial function is retained on masquePath so reconnects also
+// re-evaluate H3 first and can recover back to it automatically.
+func newMasquePathWithFallback(
+	ctx context.Context,
+	rawURL string,
+	target key.NodePublic,
+	local key.NodePrivate,
+	mode string,
+	insecureSkipVerify bool,
+	logf logger.Logf,
+) (*masquePath, error) {
+	if local.IsZero() {
+		return nil, errors.New("masquecat: zero local node private key")
+	}
+	if target.IsZero() {
+		return nil, errors.New("masquecat: zero MASQUE target node key")
+	}
+	tmpl, err := masqueTemplateFor(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig, err := masqueTLSClientConfig(rawURL, insecureSkipVerify)
+	if err != nil {
+		return nil, err
+	}
+	if insecureSkipVerify && logf != nil {
+		logf("WARNING: MASQUE TLS verification disabled for %s", rawURL)
+	} else if tlsConfig.InsecureSkipVerify && len(tlsConfig.Certificates) == 0 && logf != nil {
+		logf("MASQUE TLS certificate pinning enabled for %s", rawURL)
+	}
+
+	dial := func(dialCtx context.Context) (net.PacketConn, error) {
+		h3, h3Err := dialMasquePacketConn(dialCtx, tmpl, target, local, mode, tlsConfig)
+		if h3Err == nil {
+			return h3, nil
+		}
+		h2, h2Err := dialMasqueH2PacketConn(dialCtx, tmpl, target, local, mode, tlsConfig)
+		if h2Err == nil {
+			if logf != nil {
+				logf("MASQUE HTTP/3 unavailable; using HTTP/2 CONNECT-UDP fallback for %s: %v", rawURL, h3Err)
+			}
+			return h2, nil
+		}
+		return nil, errors.Join(
+			fmt.Errorf("HTTP/3 CONNECT-UDP: %w", h3Err),
+			fmt.Errorf("HTTP/2 CONNECT-UDP: %w", h2Err),
+		)
+	}
+	conn, err := dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &masquePath{local: local.Public(), logf: logf, dial: dial, pc: conn}, nil
+}
 
 func dialMasqueH2PacketConn(
 	ctx context.Context,
@@ -229,7 +290,6 @@ func dialMasqueH2PacketConn(
 			return nil, resp, fmt.Errorf("masquecat: CONNECT-UDP fallback negotiated %s instead of HTTP/2", resp.Proto)
 		}
 		str := &masqueCapsuleStream{
-			ctx:         ctx,
 			r:           resp.Body,
 			w:           pw,
 			closeWriter: pw.Close,
@@ -244,8 +304,9 @@ func dialMasqueH2PacketConn(
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		challenge := resp.Header.Get(masqueChallengeHeader)
+		verifierText := resp.Header.Get(masqueVerifierHeader)
 		_ = conn.Close()
-		proof, proofErr := masqueProofForChallenge(local, challenge, target, mode)
+		proof, proofErr := masqueProofForChallenge(local, challenge, verifierText, target, mode)
 		if proofErr != nil {
 			return nil, fmt.Errorf("masquecat: authenticate HTTP/2 CONNECT-UDP: %w", proofErr)
 		}
@@ -279,6 +340,29 @@ func expandMasqueTargetURL(tmpl *uritemplate.Template, target string) (string, e
 	return u, nil
 }
 
+// parseConnectUDPRequestAny normalizes HTTP/2's :protocol pseudo-header into
+// the representation masque-go expects for HTTP/3 before reusing the existing
+// path-template validation logic.
+func parseConnectUDPRequestAny(w http.ResponseWriter, r *http.Request, tmpl *uritemplate.Template) (*masque.ProxyRequest, bool) {
+	if r.ProtoMajor != 2 {
+		return parseConnectUDPRequest(w, r, tmpl)
+	}
+	if r.Method != http.MethodConnect || r.Header.Get(":protocol") != masqueConnectUDPProtocol {
+		http.Error(w, "expected HTTP/2 extended CONNECT-UDP", http.StatusNotImplemented)
+		return nil, false
+	}
+	clone := r.Clone(r.Context())
+	clone.Proto = masqueConnectUDPProtocol
+	return parseConnectUDPRequest(w, clone, tmpl)
+}
+
+func acceptMasqueAnyStream(w http.ResponseWriter, r *http.Request) (masqueDatagramStream, error) {
+	if r.ProtoMajor == 2 {
+		return acceptMasqueH2Stream(w, r)
+	}
+	return acceptMasqueStream(w)
+}
+
 func acceptMasqueH2Stream(w http.ResponseWriter, r *http.Request) (masqueDatagramStream, error) {
 	if r.ProtoMajor != 2 || r.Header.Get(":protocol") != masqueConnectUDPProtocol {
 		return nil, errors.New("masquecat: request is not HTTP/2 CONNECT-UDP")
@@ -294,7 +378,6 @@ func acceptMasqueH2Stream(w http.ResponseWriter, r *http.Request) (masqueDatagra
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 	return &masqueCapsuleStream{
-		ctx:   r.Context(),
 		r:     r.Body,
 		w:     w,
 		flush: flusher.Flush,
@@ -316,4 +399,95 @@ func newMasqueHTTP2Server(tlsConfig *tls.Config, handler http.Handler) (*http.Se
 	// downgrade the fallback socket to HTTP/1.1.
 	srv.TLSConfig.NextProtos = []string{http2.NextProtoTLS}
 	return srv, nil
+}
+
+func masqueHTTP2CompanionAddr(configured string, udpAddr net.Addr) (string, error) {
+	host, port, err := net.SplitHostPort(configured)
+	if err != nil {
+		return "", err
+	}
+	if port != "0" {
+		return configured, nil
+	}
+	_, actualPort, err := net.SplitHostPort(udpAddr.String())
+	if err != nil {
+		return "", err
+	}
+	return net.JoinHostPort(host, actualPort), nil
+}
+
+func startMasqueHTTP2(
+	ctx context.Context,
+	addr string,
+	tlsConfig *tls.Config,
+	handler http.Handler,
+	logf logger.Logf,
+) error {
+	srv, err := newMasqueHTTP2Server(tlsConfig, handler)
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for HTTP/2 MASQUE: %w", err)
+	}
+	tlsLn := tls.NewListener(ln, srv.TLSConfig)
+	go func() {
+		if err := srv.Serve(tlsLn); err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) && ctx.Err() == nil && logf != nil {
+			logf("HTTP/2 MASQUE listener stopped: %v", err)
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+		_ = ln.Close()
+	}()
+	return nil
+}
+
+// ServeMasque serves the same CONNECT-UDP handler on UDP/HTTP/3 and
+// TCP/HTTP/2. HTTP/3 remains the preferred client path; HTTP/2 exists for
+// networks and intermediaries that block or fail QUIC.
+func ServeMasque(addr string, tlsConfig *tls.Config, handler http.Handler) error {
+	if !hasMasqueServerCertificate(tlsConfig) {
+		return fmt.Errorf("MASQUE server requires a TLS certificate")
+	}
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for HTTP/3 MASQUE: %w", err)
+	}
+	defer pc.Close()
+
+	h2Addr, err := masqueHTTP2CompanionAddr(addr, pc.LocalAddr())
+	if err != nil {
+		return fmt.Errorf("derive HTTP/2 MASQUE listen address: %w", err)
+	}
+	h2, err := newMasqueHTTP2Server(tlsConfig, handler)
+	if err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", h2Addr)
+	if err != nil {
+		return fmt.Errorf("listen for HTTP/2 MASQUE: %w", err)
+	}
+	defer ln.Close()
+
+	h3TLS := http3.ConfigureTLSConfig(tlsConfig.Clone())
+	h3TLS.MinVersion = tls.VersionTLS13
+	h3 := &http3.Server{
+		TLSConfig:       h3TLS,
+		Handler:         handler,
+		EnableDatagrams: true,
+	}
+	defer h3.Close()
+	defer h2.Close()
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- h3.Serve(pc) }()
+	go func() { errCh <- h2.Serve(tls.NewListener(ln, h2.TLSConfig)) }()
+	err = <-errCh
+	if errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
 }
