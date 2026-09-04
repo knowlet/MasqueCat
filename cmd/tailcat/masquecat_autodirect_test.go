@@ -26,7 +26,13 @@ func TestShouldConfigureAutoMasqueDirect(t *testing.T) {
 
 	for _, args := range [][]string{
 		{"tailcat"},
+		{"tailcat", "--json"},
+		{"tailcat", "--verbose"},
+		{"tailcat", "--key=new"},
+		{"tailcat", "--key", "new"},
+		{"tailcat", "--json", "--key", "new"},
 		{"tailcat", "serve", "22"},
+		{"tailcat", "--verbose", "serve", "22"},
 		{"tailcat", "recv", "."},
 		{"tailcat", "--serve=22"},
 		{"tailcat", "--serve", "22"},
@@ -40,6 +46,9 @@ func TestShouldConfigureAutoMasqueDirect(t *testing.T) {
 		{"tailcat", "serve", "22", "--relay-url=https://relay.example.test"},
 		{"tailcat", "--direct-url", "https://server.example.test", "serve", "22"},
 		{"tailcat", "ping", "mc-invalid"},
+		{"tailcat", "--json", "ping", "mc-invalid"},
+		{"tailcat", "--key=new", "mc-invalid"},
+		{"tailcat", "--unknown"},
 		{"tailcat", "--help"},
 		{"tailcat", "serve", "--help"},
 		{"tailcat", "--serve", "--help"},
