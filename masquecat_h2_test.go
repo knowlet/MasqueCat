@@ -16,7 +16,6 @@ import (
 
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
-	"golang.org/x/net/http2"
 )
 
 func TestMasqueCapsuleStreamRoundTrip(t *testing.T) {
@@ -102,29 +101,23 @@ func TestMasqueHTTP2ExtendedConnectDatagram(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
+	defer func() { _ = ln.Close() }()
 	go func() { _ = srv.Serve(tls.NewListener(ln, srv.TLSConfig)) }()
-	defer srv.Close()
+	defer func() { _ = srv.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	pr, pw := io.Pipe()
-	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+ln.Addr().String()+"/.well-known/masque/udp/test.invalid/1/", pr)
+	headers := make(http.Header)
+	headers.Set(http3.CapsuleProtocolHeader, "?1")
+	cc, resp, err := dialMasqueH2ExtendedConnect(
+		ctx,
+		"https://"+ln.Addr().String()+"/.well-known/masque/udp/test.invalid/1/",
+		headers,
+		&tls.Config{InsecureSkipVerify: true}, // test-only ephemeral certificate
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set(":protocol", masqueConnectUDPProtocol)
-	req.Header.Set(http3.CapsuleProtocolHeader, "?1")
-	tr := &http2.Transport{TLSClientConfig: &tls.Config{
-		InsecureSkipVerify: true, // test-only ephemeral certificate
-		NextProtos:         []string{http2.NextProtoTLS},
-	}}
-	defer tr.CloseIdleConnections()
-	resp, err := tr.RoundTrip(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || resp.ProtoMajor != 2 {
 		t.Fatalf("response = %s over %s", resp.Status, resp.Proto)
 	}
@@ -132,7 +125,12 @@ func TestMasqueHTTP2ExtendedConnectDatagram(t *testing.T) {
 		t.Fatalf("Capsule-Protocol = %q, want ?1", got)
 	}
 
-	client := &masqueCapsuleStream{r: resp.Body, w: pw, closeWriter: pw.Close}
+	client := &masqueCapsuleStream{
+		r:           resp.Body,
+		w:           &masqueH2ClientBodyWriter{conn: cc},
+		closeWriter: cc.closeRequestStream,
+	}
+	defer func() { _ = client.Close() }()
 	requestDatagram := append(append([]byte(nil), contextIDZero...), []byte("hello")...)
 	if err := client.SendDatagram(requestDatagram); err != nil {
 		t.Fatal(err)

@@ -159,11 +159,13 @@ func (s *MasqueServer) Start() error {
 		}
 		h2, err := startMasqueHTTP2(ctx, h2Addr, s.DirectTLSConfig, handler, logf)
 		if err != nil {
-			_ = pc.Close()
-			cleanup()
-			return fmt.Errorf("start direct HTTP/2 MASQUE: %w", err)
+			// DirectListen was historically UDP-only. Do not regress existing
+			// deployments that intentionally share the numeric port with a TCP
+			// service such as nginx; keep H3 available and disable only fallback.
+			logf("direct MASQUE HTTP/2 fallback disabled on %s: %v", h2Addr, err)
+		} else {
+			s.directH2 = h2
 		}
-		s.directH2 = h2
 		conf := http3.ConfigureTLSConfig(s.DirectTLSConfig.Clone())
 		conf.MinVersion = tls.VersionTLS13
 		h3 := &http3.Server{

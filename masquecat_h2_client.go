@@ -213,7 +213,7 @@ func (c *masqueH2ClientConn) writeClientPrefaceAndSettings() error {
 	if err := c.conn.SetWriteDeadline(time.Now().Add(masqueH2WriteTimeout)); err != nil {
 		return err
 	}
-	defer c.conn.SetWriteDeadline(time.Time{})
+	defer func() { _ = c.conn.SetWriteDeadline(time.Time{}) }()
 	if _, err := io.WriteString(c.conn, http2.ClientPreface); err != nil {
 		return err
 	}
@@ -387,7 +387,8 @@ func (c *masqueH2ClientConn) readLoop() {
 					err = pipeErr
 					return
 				}
-				increment := uint32(len(data))
+			}
+			if increment := f.Header().Length; increment != 0 {
 				if windowErr := c.writeFrame(func() error { return c.fr.WriteWindowUpdate(0, increment) }); windowErr != nil {
 					err = windowErr
 					return
@@ -467,9 +468,10 @@ func (c *masqueH2ClientConn) handleSettings(f *http2.SettingsFrame) error {
 func (c *masqueH2ClientConn) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 	c.flowMu.Lock()
 	defer c.flowMu.Unlock()
-	if f.StreamID == 0 {
+	switch f.StreamID {
+	case 0:
 		c.peerConnWindow += int64(f.Increment)
-	} else if f.StreamID == c.streamID {
+	case c.streamID:
 		c.peerStreamWindow += int64(f.Increment)
 	}
 	if c.peerConnWindow > (1<<31)-1 || c.peerStreamWindow > (1<<31)-1 {
@@ -495,7 +497,7 @@ func (c *masqueH2ClientConn) handleResponseHeaders(f *http2.MetaHeadersFrame) er
 			continue
 		}
 		if !strings.HasPrefix(field.Name, ":") {
-			headers.Add(http.CanonicalHeaderKey(field.Name), field.Value)
+			headers.Add(field.Name, field.Value)
 		}
 	}
 	if statusCode == 0 {
