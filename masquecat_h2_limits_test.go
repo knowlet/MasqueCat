@@ -48,9 +48,11 @@ func readH2MetaHeaders(t *testing.T, block []byte) (*http2.MetaHeadersFrame, err
 }
 
 func TestMasqueH2FramerRejectsOversizeHeaderString(t *testing.T) {
+	// http2.Framer.readMetaFrame bounds each decoded HPACK string using
+	// MaxHeaderListSize, overriding any lower decoder-local string limit.
 	block := encodeH2HeaderBlock(t, []hpack.HeaderField{{
 		Name:  "x-oversize",
-		Value: strings.Repeat("a", masqueH2MaxHeaderStringLength+1),
+		Value: strings.Repeat("a", int(masqueH2MaxHeaderListSize)+1),
 	}})
 	meta, err := readH2MetaHeaders(t, block)
 	if err == nil && (meta == nil || !meta.Truncated) {
