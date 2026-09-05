@@ -59,11 +59,6 @@ replace_once(
     "client MetaHeaders handling",
 )
 
-client = Path("masquecat_h2_client.go")
-text = client.read_text()
-text = text.replace('\n\t"golang.org/x/net/http2/hpack"', '')
-client.write_text(text)
-
 Path("masquecat_h2_limits_test.go").write_text(r'''//go:build !js
 
 package tailcat
