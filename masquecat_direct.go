@@ -50,7 +50,7 @@ func directMasqueCoreHandler(localPriv key.NodePrivate, core *masqueCore, logf l
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		req, ok := parseConnectUDPRequest(w, r, tmpl)
+		req, ok := parseConnectUDPRequestAny(w, r, tmpl)
 		if !ok {
 			return
 		}
@@ -85,7 +85,7 @@ func directMasqueCoreHandler(localPriv key.NodePrivate, core *masqueCore, logf l
 		}
 		defer reservations.release(src)
 
-		str, err := acceptMasqueStream(w)
+		str, err := acceptMasqueAnyStream(w, r)
 		if err != nil {
 			logf("accept direct MASQUE stream: %v", err)
 			return
