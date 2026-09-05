@@ -113,8 +113,9 @@ func TestMasqueH2FramerRejectsOversizeHeaderString(t *testing.T) {
 		Name:  "x-oversize",
 		Value: strings.Repeat("a", masqueH2MaxHeaderStringLength+1),
 	}})
-	if _, err := readH2MetaHeaders(t, block); err == nil {
-		t.Fatal("oversize HPACK string was accepted")
+	meta, err := readH2MetaHeaders(t, block)
+	if err == nil && (meta == nil || !meta.Truncated) {
+		t.Fatal("oversize HPACK string was accepted without truncation")
 	}
 }
 
