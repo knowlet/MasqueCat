@@ -36,7 +36,7 @@ const (
 
 	masqueH2InitialWindow         = uint32(1 << 20)
 	masqueH2MaxHeaderListSize     = uint32(64 << 10)
-	masqueH2MaxHeaderStringLength = 16 << 10
+	masqueH2MaxHeaderStringLength = 64 << 10
 	masqueH2ReadIdleTimeout       = 30 * time.Second
 	masqueH2PingTimeout           = 15 * time.Second
 	masqueH2WriteTimeout          = 30 * time.Second
