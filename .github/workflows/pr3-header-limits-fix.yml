@@ -1,0 +1,38 @@
+name: PR3 H2 Header Limits Fix
+
+on:
+  push:
+    branches:
+      - feat/masquecat-h2-fallback
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: feat/masquecat-h2-fallback
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+      - name: Apply H2 header limits
+        run: python3 .github/scripts/pr3_header_limits_fix.py
+      - name: Verify header limits and fallback
+        run: |
+          gofmt -w masquecat_h2.go masquecat_h2_client.go masquecat_h2_limits_test.go
+          go test -count=1 -run '^(TestMasqueH2FramerRejectsOversizeHeaderString|TestMasqueH2FramerTruncatesOversizeHeaderList|TestMasqueHTTP2ExtendedConnectDatagramRoundTrip|TestMasqueCorePingControlAddress)$' .
+          go test -race -count=1 -run '^TestMasqueHTTP2ExtendedConnectDatagramRoundTrip$' .
+          go vet ./...
+      - name: Commit fix
+        run: |
+          rm .github/workflows/pr3-header-limits-fix.yml
+          rm .github/scripts/pr3_header_limits_fix.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add masquecat_h2.go masquecat_h2_client.go masquecat_h2_limits_test.go .github/workflows/pr3-header-limits-fix.yml .github/scripts/pr3_header_limits_fix.py
+          git diff --cached --check
+          git commit -m 'fix: bound HTTP/2 header decoding'
+          git push origin HEAD:feat/masquecat-h2-fallback
