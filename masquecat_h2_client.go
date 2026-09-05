@@ -501,7 +501,7 @@ func (c *masqueH2ClientConn) handleResponseHeaders(f *http2.MetaHeadersFrame) er
 			continue
 		}
 		if !strings.HasPrefix(field.Name, ":") {
-			headers.Add(http.CanonicalHeaderKey(field.Name), field.Value)
+			headers.Add(field.Name, field.Value)
 		}
 	}
 	if statusCode == 0 {
