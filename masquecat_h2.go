@@ -34,10 +34,12 @@ const (
 	masqueDatagramCapsule    = uint64(0)
 	maxMasqueCapsuleSize     = 64 << 10
 
-	masqueH2InitialWindow   = uint32(1 << 20)
-	masqueH2ReadIdleTimeout = 30 * time.Second
-	masqueH2PingTimeout     = 15 * time.Second
-	masqueH2WriteTimeout    = 30 * time.Second
+	masqueH2InitialWindow         = uint32(1 << 20)
+	masqueH2MaxHeaderListSize     = uint32(64 << 10)
+	masqueH2MaxHeaderStringLength = 16 << 10
+	masqueH2ReadIdleTimeout       = 30 * time.Second
+	masqueH2PingTimeout           = 15 * time.Second
+	masqueH2WriteTimeout          = 30 * time.Second
 )
 
 type masqueCapsuleStream struct {
@@ -504,8 +506,7 @@ func (s *masqueHTTP2Server) serveConn(conn net.Conn) error {
 		peerMaxFrameSize:  16384,
 	}
 	defer c.close()
-	c.fr = http2.NewFramer(conn, conn)
-	c.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	c.fr = newMasqueH2Framer(conn, conn)
 
 	if err := c.writeSettings(); err != nil {
 		return err
@@ -538,12 +539,22 @@ func (c *masqueHTTP2Conn) writeFrame(fn func() error) error {
 	return err
 }
 
+func newMasqueH2Framer(w io.Writer, r io.Reader) *http2.Framer {
+	fr := http2.NewFramer(w, r)
+	decoder := hpack.NewDecoder(4096, nil)
+	decoder.SetMaxStringLength(masqueH2MaxHeaderStringLength)
+	fr.ReadMetaHeaders = decoder
+	fr.MaxHeaderListSize = masqueH2MaxHeaderListSize
+	return fr
+}
+
 func (c *masqueHTTP2Conn) writeSettings() error {
 	if err := c.writeFrame(func() error {
 		return c.fr.WriteSettings(
 			http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1},
 			http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1},
 			http2.Setting{ID: http2.SettingInitialWindowSize, Val: masqueH2InitialWindow},
+			http2.Setting{ID: http2.SettingMaxHeaderListSize, Val: masqueH2MaxHeaderListSize},
 		)
 	}); err != nil {
 		return err
@@ -610,6 +621,9 @@ func (c *masqueHTTP2Conn) readLoop(tlsConn *tls.Conn) error {
 				return err
 			}
 		case *http2.MetaHeadersFrame:
+			if f.Truncated {
+				return errors.New("masquecat: HTTP/2 request headers exceed configured limit")
+			}
 			if c.streamID != 0 {
 				if f.StreamID != c.streamID {
 					_ = c.writeFrame(func() error { return c.fr.WriteRSTStream(f.StreamID, http2.ErrCodeRefusedStream) })
