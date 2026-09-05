@@ -59,8 +59,81 @@ replace_once(
     "client MetaHeaders handling",
 )
 
-# hpack is now used by the shared framer helper in masquecat_h2.go only.
 client = Path("masquecat_h2_client.go")
 text = client.read_text()
 text = text.replace('\n\t"golang.org/x/net/http2/hpack"', '')
 client.write_text(text)
+
+Path("masquecat_h2_limits_test.go").write_text(r'''//go:build !js
+
+package tailcat
+
+import (
+	"bytes"
+	"io"
+	"strings"
+	"testing"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+)
+
+func encodeH2HeaderBlock(t *testing.T, fields []hpack.HeaderField) []byte {
+	t.Helper()
+	var block bytes.Buffer
+	enc := hpack.NewEncoder(&block)
+	for _, field := range fields {
+		if err := enc.WriteField(field); err != nil {
+			t.Fatalf("encode header field: %v", err)
+		}
+	}
+	return block.Bytes()
+}
+
+func readH2MetaHeaders(t *testing.T, block []byte) (*http2.MetaHeadersFrame, error) {
+	t.Helper()
+	var wire bytes.Buffer
+	writer := http2.NewFramer(&wire, nil)
+	if err := writer.WriteHeaders(http2.HeadersFrameParam{
+		StreamID:      1,
+		BlockFragment: block,
+		EndHeaders:    true,
+	}); err != nil {
+		t.Fatalf("write HEADERS: %v", err)
+	}
+	reader := newMasqueH2Framer(io.Discard, &wire)
+	frame, err := reader.ReadFrame()
+	if err != nil {
+		return nil, err
+	}
+	meta, ok := frame.(*http2.MetaHeadersFrame)
+	if !ok {
+		t.Fatalf("frame type = %T, want *http2.MetaHeadersFrame", frame)
+	}
+	return meta, nil
+}
+
+func TestMasqueH2FramerRejectsOversizeHeaderString(t *testing.T) {
+	block := encodeH2HeaderBlock(t, []hpack.HeaderField{{
+		Name:  "x-oversize",
+		Value: strings.Repeat("a", masqueH2MaxHeaderStringLength+1),
+	}})
+	if _, err := readH2MetaHeaders(t, block); err == nil {
+		t.Fatal("oversize HPACK string was accepted")
+	}
+}
+
+func TestMasqueH2FramerTruncatesOversizeHeaderList(t *testing.T) {
+	fields := make([]hpack.HeaderField, 2000)
+	for i := range fields {
+		fields[i] = hpack.HeaderField{Name: "x", Value: "y"}
+	}
+	meta, err := readH2MetaHeaders(t, encodeH2HeaderBlock(t, fields))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meta.Truncated {
+		t.Fatal("oversize HTTP/2 header list was not marked truncated")
+	}
+}
+''')
