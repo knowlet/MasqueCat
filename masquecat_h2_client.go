@@ -166,8 +166,7 @@ func dialMasqueH2ExtendedConnect(
 		settingsCh:        make(chan error, 1),
 		responseCh:        make(chan masqueH2ClientResult, 1),
 	}
-	cc.fr = http2.NewFramer(nc, nc)
-	cc.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	cc.fr = newMasqueH2Framer(nc, nc)
 
 	if err := cc.writeClientPrefaceAndSettings(); err != nil {
 		cc.closeWithError(err)
@@ -221,6 +220,7 @@ func (c *masqueH2ClientConn) writeClientPrefaceAndSettings() error {
 	if err := c.fr.WriteSettings(
 		http2.Setting{ID: http2.SettingInitialWindowSize, Val: masqueH2InitialWindow},
 		http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1},
+		http2.Setting{ID: http2.SettingMaxHeaderListSize, Val: masqueH2MaxHeaderListSize},
 	); err != nil {
 		return err
 	}
@@ -370,6 +370,10 @@ func (c *masqueH2ClientConn) readLoop() {
 				return
 			}
 		case *http2.MetaHeadersFrame:
+			if f.Truncated {
+				err = errors.New("masquecat: HTTP/2 response headers exceed configured limit")
+				return
+			}
 			if f.StreamID != c.streamID || c.streamID == 0 {
 				continue
 			}
@@ -497,7 +501,7 @@ func (c *masqueH2ClientConn) handleResponseHeaders(f *http2.MetaHeadersFrame) er
 			continue
 		}
 		if !strings.HasPrefix(field.Name, ":") {
-			headers.Add(field.Name, field.Value)
+			headers.Add(http.CanonicalHeaderKey(field.Name), field.Value)
 		}
 	}
 	if statusCode == 0 {
