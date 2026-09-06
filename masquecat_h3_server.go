@@ -48,7 +48,8 @@ func (r *MasqueRelay) authenticator() *masqueAuthenticator {
 	return r.auth
 }
 
-// Handler returns the HTTP/3 handler for a MasqueCat relay.
+// Handler returns the HTTP handler for a MasqueCat relay. The same handler is
+// used by both the preferred HTTP/3 carrier and the HTTP/2 fallback.
 func (r *MasqueRelay) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		logf := r.logf()
@@ -57,7 +58,7 @@ func (r *MasqueRelay) Handler() http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		proxyReq, ok := parseConnectUDPRequest(w, req, tmpl)
+		proxyReq, ok := parseConnectUDPRequestAny(w, req, tmpl)
 		if !ok {
 			return
 		}
@@ -89,7 +90,7 @@ func (r *MasqueRelay) Handler() http.Handler {
 		}
 		defer r.unregister(peer)
 
-		str, err := acceptMasqueStream(w)
+		str, err := acceptMasqueAnyStream(w, req)
 		if err != nil {
 			logf("accept relay MASQUE stream: %v", err)
 			return
@@ -202,7 +203,8 @@ func (r *MasqueRelay) lookup(k key.NodePublic) *relayPeer {
 }
 
 // ServeMasqueHTTP3 serves handler over HTTP/3 with CONNECT-UDP datagrams.
-// It blocks until the server stops.
+// It blocks until the server stops. New deployments should prefer ServeMasque,
+// which also exposes the RFC 9298 HTTP/2 fallback on the same port number.
 func ServeMasqueHTTP3(addr string, tlsConfig *tls.Config, handler http.Handler) error {
 	if !hasMasqueServerCertificate(tlsConfig) {
 		return fmt.Errorf("MASQUE HTTP/3 server requires a TLS certificate")

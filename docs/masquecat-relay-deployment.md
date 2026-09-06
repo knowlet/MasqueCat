@@ -16,7 +16,7 @@ API usage, see [`masquecat.md`](./masquecat.md).
 
 ## 1. What the relay does
 
-`masquecat-relay` terminates HTTP/3 / QUIC and forwards MasqueCat datagrams
+`masquecat-relay` accepts HTTP/3 / QUIC and RFC 9298 HTTP/2 / TCP CONNECT-UDP and forwards MasqueCat datagrams
 between authenticated peer identities.
 
 ```text
@@ -64,7 +64,7 @@ Current flags:
 
 | Flag | Default | Required | Description |
 | --- | --- | --- | --- |
-| `-listen` | `:443` | no | UDP listen address used by HTTP/3 / QUIC |
+| `-listen` | `:443` | no | shared address/port: UDP for HTTP/3 and TCP for HTTP/2 fallback |
 | `-cert` | empty | together with `-key` for non-interactive/production use | certificate PEM file |
 | `-key` | empty | together with `-cert` for non-interactive/production use | private-key PEM file |
 
@@ -142,40 +142,40 @@ every restart.
 
 ## 5. Firewall requirements
 
-The external transport is QUIC, so the important rule is **UDP**, not TCP.
-
-Minimum inbound rule for the conventional port:
+The relay listens on the same configured port using **both UDP and TCP**:
 
 ```text
-UDP/443 -> masquecat-relay
+UDP/443 -> HTTP/3 / QUIC (preferred)
+TCP/443 -> HTTP/2 CONNECT-UDP fallback
 ```
 
 UFW:
 
 ```sh
 sudo ufw allow 443/udp
+sudo ufw allow 443/tcp
 ```
 
 firewalld:
 
 ```sh
 sudo firewall-cmd --permanent --add-port=443/udp
+sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --reload
 ```
 
-Cloud security groups / network ACLs need a matching UDP rule.
-
-The binary does not create a TCP/443 listener. Opening only TCP/443 will not
-make the relay reachable.
+Cloud security groups / network ACLs should expose both protocols. UDP keeps the
+preferred H3 path available; TCP makes the fallback useful on networks that
+block QUIC.
 
 ## 6. NAT and port forwarding
 
-A relay should normally have a stable public endpoint.
-
-If it is behind NAT, configure a static UDP port-forward:
+A relay should normally have a stable public endpoint. If it is behind NAT,
+forward both transports to the same internal port:
 
 ```text
 public UDP/443 -> relay-host UDP/443
+public TCP/443 -> relay-host TCP/443
 ```
 
 Do not rely on STUN or automatic port mapping; `masquecat-relay` does not
@@ -183,34 +183,19 @@ perform them.
 
 ## 7. Reverse proxies and load balancers
 
-A normal TCP-only reverse proxy cannot proxy this relay.
+HTTP/3 uses UDP/QUIC and the fallback uses HTTP/2 over TCP/TLS. Layer-4
+pass-through for both UDP and TCP is the simplest deployment model. A TCP-only
+path can still carry the H2 fallback, but loses H3.
 
-Examples that are insufficient by themselves:
-
-- HTTP/1.1 reverse proxy listening only on TCP/443;
-- HTTP/2 reverse proxy listening only on TCP/443;
-- TLS terminator that does not accept HTTP/3 / QUIC on UDP.
-
-The simplest supported topology is UDP pass-through:
-
-```text
-Internet UDP/443
-      |
-      v
-UDP-capable load balancer / firewall
-      |
-      v
-masquecat-relay UDP/443
-```
+A layer-7 HTTP/2 reverse proxy is suitable only if it preserves RFC 8441
+Extended CONNECT and RFC 9298 CONNECT-UDP semantics; generic HTTP/2 proxying is
+not enough. Likewise, an HTTP/3 proxy must support CONNECT-UDP rather than only
+ordinary requests.
 
 Because the relay keeps an in-memory map of connected peer identities, naive
-horizontal load balancing across multiple independent relay processes is not a
-shared-state cluster. Two peers that land on different relay instances cannot
-assume a common peer registry.
-
-Until federation/shared state is implemented, use one relay process per relay
-URL, or provide external connection affinity that guarantees the application
-semantics you require.
+horizontal load balancing across independent relay processes does not create a
+shared-state cluster. Use one relay process per relay URL or connection affinity
+until shared state/federation exists.
 
 ## 8. systemd deployment
 
@@ -229,7 +214,7 @@ Example `/etc/systemd/system/masquecat-relay.service`:
 
 ```ini
 [Unit]
-Description=MasqueCat HTTP/3 CONNECT-UDP relay
+Description=MasqueCat CONNECT-UDP relay (HTTP/3 + HTTP/2 fallback)
 After=network-online.target
 Wants=network-online.target
 
@@ -295,11 +280,12 @@ COPY --from=build /out/masquecat-relay /masquecat-relay
 ENTRYPOINT ["/masquecat-relay"]
 ```
 
-Run it with the relay port published as UDP:
+Run it with the relay port published as both UDP and TCP:
 
 ```sh
 docker run --rm \
   -p 443:443/udp \
+  -p 443:443/tcp \
   -v /etc/masquecat/tls:/tls:ro \
   IMAGE \
   -listen :443 \
@@ -309,7 +295,7 @@ docker run --rm \
 
 Important:
 
-- `-p 443:443/tcp` is not sufficient;
+- publish both UDP and TCP if you want both H3 and H2 fallback paths;
 - the certificate mount should be read-only;
 - the container example does not add health checks because the binary has no
   health endpoint yet;
@@ -321,6 +307,7 @@ Example:
 ```sh
 docker run --rm \
   -p 443:8443/udp \
+  -p 443:8443/tcp \
   -v /etc/masquecat/tls:/tls:ro \
   IMAGE \
   -listen :8443 \
@@ -335,11 +322,11 @@ A typical relay-only installation looks like this:
 ```text
 private server / CGNAT                         client / laptop
         |                                            |
-        | outbound UDP/443                           | outbound UDP/443
+        | outbound UDP/443 or TCP/443                           | outbound UDP/443 or TCP/443
         +----------------------+  +------------------+
                                v  v
                          relay.example.com
-                              UDP/443
+                         UDP/443 + TCP/443
 ```
 
 Server configuration:
@@ -363,7 +350,7 @@ The private server does not need a public inbound port in this topology.
 The outer layer is:
 
 ```text
-peer <-> QUIC/TLS 1.3 <-> relay
+peer <-> HTTP/3(QUIC) or HTTP/2(TCP), TLS <-> relay
 ```
 
 The inner layer is:
@@ -424,7 +411,7 @@ Not currently implemented:
 - distributed tracing.
 
 For now, process liveness should be supervised by the service manager. A future
-health endpoint should verify that the QUIC listener is active without exposing
+health endpoint should verify that the UDP/H3 and TCP/H2 listeners are active without exposing
 peer-registry contents.
 
 ## 13. Resource and abuse controls
@@ -447,13 +434,14 @@ These are important blockers for an Internet-scale public relay.
 
 ### Client times out immediately
 
-Check that UDP, not just TCP, is open:
+Check both the preferred UDP/H3 path and the TCP/H2 fallback:
 
 ```sh
 sudo ss -u -l -n -p | grep ':443'
+sudo ss -t -l -n -p | grep ':443'
 ```
 
-Also verify the cloud firewall/security group allows UDP/443.
+Also verify the cloud firewall/security group allows both UDP/443 and TCP/443.
 
 ### TLS / hostname verification fails
 
@@ -468,15 +456,16 @@ Confirm:
 
 Typical causes:
 
-- UDP/443 not forwarded through NAT;
-- cloud provider security group only permits TCP/443;
+- UDP/443 and TCP/443 are not both forwarded through NAT;
+- cloud provider security group permits neither UDP/443 nor the TCP fallback;
 - upstream network blocks QUIC/UDP;
 - AAAA record points to an unreachable IPv6 address.
 
 ### TCP reverse proxy shows no requests
 
-Expected if the proxy listens only on TCP. MasqueCat relay traffic is HTTP/3 over
-QUIC/UDP.
+A TCP path can carry the HTTP/2 fallback, but a layer-7 proxy must support RFC
+8441 Extended CONNECT and RFC 9298 CONNECT-UDP. Use TCP pass-through if the
+proxy does not implement those semantics.
 
 ### Peers connected to different relay instances cannot find each other
 

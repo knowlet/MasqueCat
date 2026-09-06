@@ -1,9 +1,9 @@
 # masquecat-relay
 
-`masquecat-relay` is the self-hosted HTTP/3 / MASQUE relay used by MasqueCat
+`masquecat-relay` is the self-hosted MASQUE relay used by MasqueCat
 when two peers cannot use an explicitly configured direct MASQUE endpoint.
 
-It terminates the **outer** QUIC/TLS 1.3 connection and forwards MasqueCat
+It accepts HTTP/3 over QUIC and an RFC 9298 HTTP/2-over-TCP fallback, both over TLS, and forwards MasqueCat
 framed datagrams between connected peer identities. The inner WireGuard tunnel
 remains end-to-end between the MasqueCat peers; the relay does not receive a
 WireGuard private key and is not intended to decrypt application traffic.
@@ -95,7 +95,7 @@ go build -o masquecat-relay ./cmd/masquecat-relay
 
 | Flag | Default | Required | Meaning |
 | --- | --- | --- | --- |
-| `-listen` | `:443` | no | UDP listen address for HTTP/3 / QUIC |
+| `-listen` | `:443` | no | shared port/address: UDP for HTTP/3 and TCP for HTTP/2 fallback |
 | `-cert` | empty | together with `-key` for non-interactive/production use | TLS certificate PEM file |
 | `-key` | empty | together with `-cert` for non-interactive/production use | TLS private-key PEM file |
 
@@ -169,19 +169,18 @@ For a normal production-like deployment the relay needs:
 
 - a stable DNS name, for example `relay.example.com`;
 - a certificate valid for that DNS name;
-- inbound **UDP** on the configured listen port, normally UDP/443;
-- return traffic allowed for established QUIC sessions.
+- inbound **UDP and TCP** on the configured listen port, normally 443;
+- return traffic allowed for established QUIC and TCP/TLS sessions.
+
+HTTP/3 over UDP remains the preferred carrier. When QUIC is blocked or
+unavailable, clients retry RFC 9298 CONNECT-UDP over HTTP/2 on the same port.
+A layer-4 TCP pass-through proxy can carry the H2 fallback. A layer-7 HTTP/2
+proxy must explicitly support RFC 8441 Extended CONNECT and CONNECT-UDP; an
+ordinary HTTP/2 reverse proxy is not automatically sufficient.
 
 For local self-signed testing, a public DNS name is not required, but clients
 must either trust the generated certificate or explicitly opt into
 `InsecureSkipVerify`.
-
-There is no TCP listener in the current relay. A conventional HTTP/1.1 or
-HTTP/2 reverse proxy in front of the process is therefore not sufficient.
-
-If a load balancer or firewall sits in front of the relay, it must preserve
-QUIC/UDP traffic to the relay process. UDP pass-through is the simplest model
-for the current implementation.
 
 ## TLS
 
@@ -201,17 +200,19 @@ UFW:
 
 ```sh
 sudo ufw allow 443/udp
+sudo ufw allow 443/tcp
 ```
 
 firewalld:
 
 ```sh
 sudo firewall-cmd --permanent --add-port=443/udp
+sudo firewall-cmd --permanent --add-port=443/tcp
 sudo firewall-cmd --reload
 ```
 
-Cloud firewalls / security groups must allow the same UDP port in addition to
-the host firewall.
+Cloud firewalls / security groups should allow both protocols on the configured
+port. UDP enables the preferred HTTP/3 path; TCP enables the HTTP/2 fallback.
 
 ## systemd
 
@@ -223,9 +224,10 @@ System services are non-interactive, so explicitly configure `-cert` and `-key`.
 
 The repository does not currently ship a dedicated relay container image or a
 relay-specific Dockerfile. A container can run the binary, but the deployment
-must publish the port as **UDP**, not TCP, and should mount certificate/key
-files. Most container launches are non-interactive, so the automatic
-self-signed prompt is intentionally unavailable there.
+must publish the configured port as **both UDP and TCP**: UDP carries the
+preferred HTTP/3 path and TCP carries the HTTP/2 fallback. It should also mount
+certificate/key files. Most container launches are non-interactive, so the
+automatic self-signed prompt is intentionally unavailable there.
 
 See the deployment guide for a reproducible multi-stage example.
 

@@ -56,6 +56,7 @@ type MasqueServer struct {
 	core       *masqueCore
 	relayPath  *masquePath
 	directHTTP *http3.Server
+	directH2   *masqueHTTP2Server
 	directPC   net.PacketConn
 	cancel     context.CancelFunc
 	blob       MasqueConnBlob
@@ -123,6 +124,9 @@ func (s *MasqueServer) Start() error {
 		if s.directHTTP != nil {
 			_ = s.directHTTP.Close()
 		}
+		if s.directH2 != nil {
+			_ = s.directH2.Close()
+		}
 		if s.directPC != nil {
 			_ = s.directPC.Close()
 		}
@@ -132,6 +136,7 @@ func (s *MasqueServer) Start() error {
 		_ = core.Close()
 		s.cancel = nil
 		s.directHTTP = nil
+		s.directH2 = nil
 		s.directPC = nil
 		s.relayPath = nil
 		s.core = nil
@@ -145,11 +150,27 @@ func (s *MasqueServer) Start() error {
 			cleanup()
 			return fmt.Errorf("listen for direct MASQUE: %w", err)
 		}
+		handler := directMasqueCoreHandler(priv, core, logf)
+		h2Addr, err := masqueHTTP2CompanionAddr(s.DirectListen, pc.LocalAddr())
+		if err != nil {
+			_ = pc.Close()
+			cleanup()
+			return fmt.Errorf("derive direct HTTP/2 MASQUE listen address: %w", err)
+		}
+		h2, err := startMasqueHTTP2(ctx, h2Addr, s.DirectTLSConfig, handler, logf)
+		if err != nil {
+			// DirectListen was historically UDP-only. Do not regress existing
+			// deployments that intentionally share the numeric port with a TCP
+			// service such as nginx; keep H3 available and disable only fallback.
+			logf("direct MASQUE HTTP/2 fallback disabled on %s: %v", h2Addr, err)
+		} else {
+			s.directH2 = h2
+		}
 		conf := http3.ConfigureTLSConfig(s.DirectTLSConfig.Clone())
 		conf.MinVersion = tls.VersionTLS13
 		h3 := &http3.Server{
 			TLSConfig:       conf,
-			Handler:         directMasqueCoreHandler(priv, core, logf),
+			Handler:         handler,
 			EnableDatagrams: true,
 		}
 		s.directPC, s.directHTTP = pc, h3
@@ -161,7 +182,7 @@ func (s *MasqueServer) Start() error {
 	}
 
 	if s.RelayURL != "" {
-		path, err := newMasquePathWithTLS(ctx, s.RelayURL, local, priv, masqueModeRelay, s.InsecureSkipVerify, logf)
+		path, err := newMasquePathWithFallback(ctx, s.RelayURL, local, priv, masqueModeRelay, s.InsecureSkipVerify, logf)
 		if err != nil {
 			cleanup()
 			return fmt.Errorf("connect MASQUE relay: %w", err)
@@ -260,6 +281,10 @@ func (s *MasqueServer) Close() error {
 		errs = append(errs, s.directHTTP.Close())
 		s.directHTTP = nil
 	}
+	if s.directH2 != nil {
+		errs = append(errs, s.directH2.Close())
+		s.directH2 = nil
+	}
 	if s.directPC != nil {
 		errs = append(errs, s.directPC.Close())
 		s.directPC = nil
@@ -356,7 +381,7 @@ func (c *MasqueClient) ensureStartedLocked(ctx context.Context) error {
 			return nil, err
 		}
 		dialCtx, finishDial := masqueDialContext(childCtx, ctx)
-		p, err := newMasquePathWithTLS(dialCtx, rawURL, target, priv, mode, insecureSkipVerify, logf)
+		p, err := newMasquePathWithFallback(dialCtx, rawURL, target, priv, mode, insecureSkipVerify, logf)
 		operationActive := finishDial(err == nil)
 		if !operationActive {
 			if p != nil {

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,16 +26,19 @@ const (
 	autoMasqueDirectMarkerEnv = "MASQUECAT_AUTO_DIRECT"
 )
 
-var nonPublicMasqueDirectPrefixes = []netip.Prefix{
-	netip.MustParsePrefix("100.64.0.0/10"),  // RFC 6598 shared address space
-	netip.MustParsePrefix("192.0.0.0/24"),   // IETF protocol assignments
-	netip.MustParsePrefix("192.0.2.0/24"),   // TEST-NET-1
-	netip.MustParsePrefix("198.18.0.0/15"),  // benchmarking
-	netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
-	netip.MustParsePrefix("203.0.113.0/24"), // TEST-NET-3
-	netip.MustParsePrefix("240.0.0.0/4"),    // reserved
-	netip.MustParsePrefix("2001:db8::/32"),  // IPv6 documentation
-}
+var (
+	autoMasqueCertificateMu sync.Mutex
+	nonPublicMasqueDirectPrefixes = []netip.Prefix{
+		netip.MustParsePrefix("100.64.0.0/10"),  // RFC 6598 shared address space
+		netip.MustParsePrefix("192.0.0.0/24"),   // IETF protocol assignments
+		netip.MustParsePrefix("192.0.2.0/24"),   // TEST-NET-1
+		netip.MustParsePrefix("198.18.0.0/15"),  // benchmarking
+		netip.MustParsePrefix("198.51.100.0/24"), // TEST-NET-2
+		netip.MustParsePrefix("203.0.113.0/24"), // TEST-NET-3
+		netip.MustParsePrefix("240.0.0.0/4"),    // reserved
+		netip.MustParsePrefix("2001:db8::/32"),  // IPv6 documentation
+	}
+)
 
 // initMasqueAutoDirect restores the original Tailcat zero-argument UX for the
 // MasqueCat transport: a server can be started without first provisioning a
@@ -228,6 +232,9 @@ func preferredMasqueDirectAddr() (netip.Addr, error) {
 }
 
 func ensureAutoMasqueCertificate() (certPath, keyPath string, err error) {
+	autoMasqueCertificateMu.Lock()
+	defer autoMasqueCertificateMu.Unlock()
+
 	configDir, err := os.UserConfigDir()
 	if err != nil {
 		return "", "", fmt.Errorf("find user config directory: %w", err)
