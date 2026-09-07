@@ -26,7 +26,12 @@ func TestMasqueRelayH2RequestRestoresAuthorityForTemplateMatch(t *testing.T) {
 	// server request. masque-go v0.4.0 matches the full URI template against
 	// r.URL.String(), so passing this shape through unchanged used to fail with
 	// 400 "expected target_host and target_port" before authentication ran.
-	req := httptest.NewRequest(http.MethodConnect, expanded, nil)
+	//
+	// Build the absolute URL as a normal request first. httptest.NewRequest has
+	// special CONNECT request-target parsing that would otherwise treat the
+	// scheme as an authority and would not model masqueH2RequestFromFields.
+	req := httptest.NewRequest(http.MethodGet, expanded, nil)
+	req.Method = http.MethodConnect
 	req.Proto = "HTTP/2.0"
 	req.ProtoMajor = 2
 	req.ProtoMinor = 0
