@@ -61,7 +61,7 @@ func clientLSMode(logf logger.Logf, long bool, args []string) error {
 		path = "."
 	}
 
-	cl := newCLITCPClient(logf, addrBlobArg(host), clientKey())
+	cl := newCLITCPClient(logf, tailcatAddrArg(host), clientKey())
 	defer closeCLITCPClient(cl)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

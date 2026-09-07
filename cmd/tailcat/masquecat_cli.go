@@ -220,7 +220,7 @@ func loadMasqueServerKey() (priv key.NodePrivate, keyName string, err error) {
 	return conf.Private, *flagKey, nil
 }
 
-func masqueServer(logf logger.Logf, serveSpec string) error {
+func masqueServer(logf logger.Logf, serveSpec string, execArgs []string) error {
 	if *flagMasqueRelayURL == "" && *flagMasqueDirectURL == "" {
 		return fmt.Errorf("MasqueCat server needs an explicit endpoint: set MASQUECAT_RELAY_URL or --relay-url, or configure --direct-url/--direct-listen/--tls-cert/--tls-key; use --legacy-derp for the original Tailcat transport")
 	}

@@ -703,7 +703,7 @@ func main() {
 }
 
 // tailcatAddrArg interprets a CLI destination argument as either a
-// "tc"-prefixed tailcat address or a DNS name whose "tailcat=" TXT
+// "tc"/"mc"-prefixed tailcat address or a DNS name whose "tailcat=" TXT
 // record holds one. It exits the process on failure.
 func tailcatAddrArg(arg string) tailcat.Addr {
 	addr, dnsName, err := classifyTailcatAddrArg(arg)
@@ -725,8 +725,24 @@ func tailcatAddrArg(arg string) tailcat.Addr {
 		}
 		log.Fatalf("no \"tailcat=\" TXT record found for %q", dnsName)
 	}
-	if !strings.HasPrefix(arg, "tc") && !strings.HasPrefix(arg, "mc") {
-		log.Fatalf("argument %q is neither a \"tc\"/\"mc\"-prefixed address blob nor a DNS name", arg)
+	return addr
+}
+
+// addrBlobArg is the pre-Addr-rename compatibility name used by the
+// MasqueCat dispatch seams. ConnBlob is now an upstream alias of Addr.
+func addrBlobArg(arg string) tailcat.Addr { return tailcatAddrArg(arg) }
+
+// classifyTailcatAddrArg classifies arg without performing a DNS lookup.
+func classifyTailcatAddrArg(arg string) (addr tailcat.Addr, dnsName string, err error) {
+	if isMasqueBlob(arg) {
+		if _, err := tailcat.ParseMasqueConnBlob(tailcat.MasqueConnBlob(arg)); err != nil {
+			return "", "", fmt.Errorf("invalid MasqueCat address %q: %w", arg, err)
+		}
+		return tailcat.Addr(arg), "", nil
+	}
+	addr = tailcat.Addr(arg)
+	if _, err := tailcat.ParseAddr(addr); err == nil {
+		return addr, "", nil
 	}
 	if !strings.Contains(arg, ".") {
 		return "", "", fmt.Errorf("argument %q is neither a valid tailcat address nor a DNS name", arg)
@@ -736,6 +752,11 @@ func tailcatAddrArg(arg string) tailcat.Addr {
 	for label := range strings.SplitSeq(name, ".") {
 		if _, err := tailcat.ParseAddr(tailcat.Addr(label)); err == nil {
 			return "", "", errors.New("argument contains a valid tailcat address as a DNS label; refusing DNS lookup")
+		}
+		if isMasqueBlob(label) {
+			if _, err := tailcat.ParseMasqueConnBlob(tailcat.MasqueConnBlob(label)); err == nil {
+				return "", "", errors.New("argument contains a valid MasqueCat address as a DNS label; refusing DNS lookup")
+			}
 		}
 	}
 	if err := validateDNSName(name); err != nil {
@@ -1209,9 +1230,25 @@ func clientResolveMode(args []string) error {
 	return nil
 }
 
-func server(logf logger.Logf, serveSpec string) {
+// splitExecArgs separates the positional arguments ff left over
+// into those before and after a "--" separator, the latter being the
+// command for the exec service and the SSH services' forced command.
+func splitExecArgs(args []string) (positional, execArgs []string) {
+	i := slices.Index(os.Args, "--")
+	if i < 0 {
+		return args, nil
+	}
+	execArgs = os.Args[i+1:]
+	positional = args[:len(args)-len(execArgs)]
+	if n := len(positional); n > 0 && positional[n-1] == "--" {
+		positional = positional[:n-1]
+	}
+	return positional, execArgs
+}
+
+func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	if flagLegacyDERP != nil && !*flagLegacyDERP {
-		if err := masqueServer(logf, serveSpec); err != nil {
+		if err := masqueServer(logf, serveSpec, execArgs); err != nil {
 			log.Fatal(err)
 		}
 		return

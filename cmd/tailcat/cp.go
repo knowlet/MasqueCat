@@ -104,14 +104,17 @@ func clientCPMode(recursive, preserve bool, portOrIPPort string, args []string) 
 	if err != nil {
 		log.Fatalf("no scp found in $PATH: %v", err)
 	}
-	insecureSkipVerify := flagMasqueInsecureSkipVerify != nil && *flagMasqueInsecureSkipVerify
+	proxyCommand, err := sshProxyCommand(exe, *flagKey, *flagDERPMapURL, addr, portOrIPPort)
+	if err != nil {
+		return err
+	}
 	argv := []string{
 		scpExe,
 		"-o", "UpdateHostKeys no",
 		"-o", "StrictHostKeyChecking no",
 		"-o", "UserKnownHostsFile " + os.DevNull,
 		"-o", "LogLevel ERROR",
-		"-o", "ProxyCommand=" + sshProxyCommand(exe, *flagKey, *flagDERPMapURL, insecureSkipVerify, blob, portOrIPPort),
+		"-o", "ProxyCommand=" + proxyCommand,
 	}
 	if recursive {
 		argv = append(argv, "-r")

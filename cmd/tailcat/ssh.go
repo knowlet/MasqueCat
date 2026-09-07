@@ -113,14 +113,18 @@ func clientSSHMode(portOrIPPort string, skipDNSCheck bool, args []string) error 
 	if sshUser != "" {
 		sshDst = sshUser + "@" + sshDst
 	}
-	insecureSkipVerify := flagMasqueInsecureSkipVerify != nil && *flagMasqueInsecureSkipVerify
+	proxyCommand, err := sshProxyCommand(exe, *flagKey, *flagDERPMapURL, addrStr, portOrIPPort)
+	if err != nil {
+		return err
+	}
 	argv := []string{
 		sshExe,
 		"-o", "UpdateHostKeys no",
 		"-o", "StrictHostKeyChecking no",
 		"-o", "UserKnownHostsFile " + os.DevNull,
 		"-o", "LogLevel ERROR",
-		"-o", "ProxyCommand=" + sshProxyCommand(exe, *flagKey, *flagDERPMapURL, insecureSkipVerify, connBlobStr, portOrIPPort),
+		"-o", "ProxyCommand=" + proxyCommand,
+		"--",
 		sshDst,
 	}
 	argv = append(argv, cmdArgs...)
@@ -250,28 +254,68 @@ func probeStrangerSSH(ctx context.Context, logf logger.Logf, derpMapURL, addr, p
 // sshProxyCommand returns the command passed to OpenSSH to connect the SSH
 // client to a tailcat server. The command is run by OpenSSH, so values that
 // can contain shell-special characters must be quoted.
-func sshProxyCommand(exe, keyName, derpMapURL string, insecureSkipVerify bool, connBlob, portOrIPPort string) string {
-	if runtime.GOOS == "windows" {
-		// Plain quotes without Go's %q backslash escaping: the
-		// executable is a Windows path whose backslashes must survive
-		// both cmd.exe (which Win32-OpenSSH uses to run ProxyCommand)
-		// and the child's own command line parsing.
-		exe = "\"" + exe + "\""
-	}
-	cmd := exe
-	// No --key flag at all when unset: the shell turns --key="" into
-	// --key=, which ff parses by consuming the next argument (the
-	// address blob) as the flag's value.
+func sshProxyCommand(exe, keyName, derpMapURL, addr, portOrIPPort string) (string, error) {
+	args := []string{exe}
+	// No --key flag at all when unset: ff parses --key= by consuming the
+	// tailcat address as the flag's value.
 	if keyName != "" {
 		args = append(args, "--key="+keyName)
 	}
 	if derpMapURL != tailcat.DefaultDERPMapURL {
 		args = append(args, "--derpmap-url="+derpMapURL)
 	}
-	if insecureSkipVerify {
-		cmd += " --insecure-skip-verify"
+	if flagMasqueInsecureSkipVerify != nil && *flagMasqueInsecureSkipVerify {
+		args = append(args, "--insecure-skip-verify")
 	}
-	return fmt.Sprintf("%s %s %s", cmd, connBlob, portOrIPPort)
+	args = append(args, addr, portOrIPPort)
+	if runtime.GOOS == "windows" {
+		return proxyCommandJoinWindows(args)
+	}
+	return proxyCommandJoinUnix(args)
+}
+
+// proxyCommandJoinUnix quotes args for the POSIX shell OpenSSH uses to run a
+// ProxyCommand. Percent signs are doubled for OpenSSH's own token expansion;
+// it changes %% back to % before handing the command to the shell.
+func proxyCommandJoinUnix(args []string) (string, error) {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		if strings.ContainsAny(arg, "\r\n\x00") {
+			return "", fmt.Errorf("ProxyCommand argument contains a control character: %q", arg)
+		}
+		arg = strings.ReplaceAll(arg, "%", "%%")
+		quoted[i] = "'" + strings.ReplaceAll(arg, "'", `'"'"'`) + "'"
+	}
+	return strings.Join(quoted, " "), nil
+}
+
+// proxyCommandJoinWindows quotes args for cmd.exe, which Win32-OpenSSH uses
+// to run a ProxyCommand. cmd.exe expands %variables% and, depending on
+// configuration, !variables! even inside quotes, so reject those characters
+// rather than claiming they can be safely escaped through both OpenSSH and
+// cmd.exe.
+func proxyCommandJoinWindows(args []string) (string, error) {
+	quoted := make([]string, len(args))
+	for i, arg := range args {
+		if strings.ContainsAny(arg, "\"%!\r\n\x00") {
+			return "", fmt.Errorf("ProxyCommand argument contains a character unsafe for cmd.exe: %q", arg)
+		}
+		quoted[i] = quoteWindowsCommandArg(arg)
+	}
+	return strings.Join(quoted, " "), nil
+}
+
+// quoteWindowsCommandArg always double-quotes arg, protecting cmd.exe
+// metacharacters, and doubles trailing backslashes as required by the Windows
+// argv parser used by the tailcat child. Embedded quotes are rejected above
+// because cmd.exe and that argv parser assign them incompatible meanings.
+func quoteWindowsCommandArg(arg string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	b.WriteString(arg)
+	b.WriteString(strings.Repeat("\\", len(arg)-len(strings.TrimRight(arg, "\\"))))
+	b.WriteByte('"')
+	return b.String()
 }
 
 // sshDestHost returns the hostname to give the system ssh client as the
