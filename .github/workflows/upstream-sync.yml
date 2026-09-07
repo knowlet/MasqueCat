@@ -26,6 +26,14 @@ jobs:
           git remote add upstream https://github.com/tailscale/tailcat.git
           git fetch upstream main
           git merge --no-edit -X ours upstream/main
+          # The repository token used by Actions cannot create/update workflow
+          # files. Carry every upstream change in the merge commit except the
+          # newly-added Nix workflow; the connector adds that exact file back
+          # in a follow-up commit after this merge is pushed.
+          if git ls-files --error-unmatch .github/workflows/nix.yml >/dev/null 2>&1; then
+            git rm .github/workflows/nix.yml
+            git commit --amend --no-edit
+          fi
           git push origin HEAD:chore/sync-upstream-20260907
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
