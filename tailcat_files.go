@@ -18,13 +18,17 @@ const (
 	// FileServeRW serves files read-write.
 	FileServeRW
 
-	// FileServeWO serves files write-only, as a drop box: clients can
-	// upload files and make directories, but can't list the directory
-	// or read anything back. Paths a connection created itself may
-	// still be stat'd, so upload tools that verify their writes keep
-	// working; directories may be stat'd too, so upload destinations
-	// resolve.
+	// FileServeWO serves files write-only, as a flat drop box. Each upload
+	// is stored under a new, server-chosen name, so clients can't use name
+	// collisions to discover existing files. Clients can't make directories,
+	// list the drop box, or read anything back.
 	FileServeWO
+
+	// FileServeWOPlus serves files write-only, as a recursive drop box.
+	// Clients can make and stat directories, which necessarily reveals some
+	// information about existing paths. An upload keeps its requested name
+	// when available and is stored under a new, server-chosen name otherwise.
+	FileServeWOPlus
 )
 
 // FileService describes a rooted SFTP file service. All client paths
@@ -43,6 +47,23 @@ type FileService struct {
 type SSHOptions struct {
 	// Shell enables shell and exec sessions.
 	Shell bool
+
+	// Exec, if non-empty, is a command (program and arguments) that
+	// every session runs instead of a shell or the client's requested
+	// command, with the session as its standard input, output, and
+	// error (through a PTY if the client requests one), like OpenSSH's
+	// ForceCommand. It excludes everything else: there is no login
+	// shell, no client-chosen command, and no SFTP subsystem, so Shell
+	// and Files are ignored. The client's requested command, if any,
+	// is passed in SSH_ORIGINAL_COMMAND, and the peer is described by
+	// the variables of [Server.PeerEnv].
+	Exec []string
+
+	// AuthorizedKeys contains OpenSSH authorized_keys text. Each element may
+	// contain one or more public key lines. Clients authenticate with one of the
+	// listed keys. Authorized-key options are not supported; rejecting them
+	// avoids silently granting broader access than their author intended.
+	AuthorizedKeys []string
 
 	// Files, if non-nil, serves the SFTP subsystem rooted at
 	// Files.Dir, restricted to Files.Mode. If nil and Shell is true,

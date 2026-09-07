@@ -16,13 +16,14 @@ import (
 
 // TestLocalDERPMode runs the built tailcat binary in server mode with
 // TS_DEBUG_TAILCAT_LOCAL_DERP=1, which starts a DERP server on
-// localhost and embeds it in the address blob, then round-trips a
-// payload from a client using that blob. Both sides get a
+// localhost and embeds it in the tailcat address, then round-trips a
+// payload from a client using that address. Both sides get a
 // --derpmap-url pointing at an unreachable address to prove the whole
 // exchange is hermetic. The Homebrew formula test relies on this mode
 // (plus TAILCAT_ADDR_FILE) to test the bottles without network
 // access, so it must not regress.
 func TestLocalDERPMode(t *testing.T) {
+	t.Parallel()
 	bin := buildTailcat(t)
 
 	const derpMapURL = "none"
@@ -32,7 +33,8 @@ func TestLocalDERPMode(t *testing.T) {
 	server.Env = append(append(os.Environ(), cacheEnv(t)...),
 		"TS_DEBUG_TAILCAT_LOCAL_DERP=1",
 		"TAILCAT_ADDR_FILE="+addrFile)
-	var serverOut, serverErr bytes.Buffer
+	var serverOut bytes.Buffer
+	var serverErr lockedBuf
 	server.Stdout = &serverOut
 	server.Stderr = &serverErr
 	if err := server.Start(); err != nil {
@@ -40,10 +42,10 @@ func TestLocalDERPMode(t *testing.T) {
 	}
 	defer server.Process.Kill()
 
-	blob := waitBlob(t, addrFile, &serverErr)
+	addr := waitAddr(t, addrFile, &serverErr)
 
 	const payload = "hello hermetic world"
-	client := exec.Command(bin, "--key=new", "--derpmap-url="+derpMapURL, blob)
+	client := exec.Command(bin, "--key=new", "--derpmap-url="+derpMapURL, addr)
 	client.Env = append(os.Environ(), cacheEnv(t)...)
 	client.Stdin = strings.NewReader(payload)
 	var clientErr bytes.Buffer
@@ -70,12 +72,13 @@ func TestLocalDERPMode(t *testing.T) {
 // TestPipeMode runs the built tailcat binary in its two stdin/stdout
 // pipe modes against a local DERP server, emulating a pipeline like
 // "tailcat | tar -zx" on the server side and "tar -zc | tailcat
-// <blob>" on the client side. Both processes must exit on their own
+// <tc-addr>" on the client side. Both processes must exit on their own
 // once the client's stdin hits EOF: the server must see the client's
 // half-close as EOF, and the client must see the server's close (the
 // server must not exit before its FIN is delivered, which once made
 // clients hang forever).
 func TestPipeMode(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
 
 	server, addrFile := e.serverCmd()
@@ -83,16 +86,16 @@ func TestPipeMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var serverErr bytes.Buffer
+	var serverErr lockedBuf
 	server.Stderr = &serverErr
 	if err := server.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer server.Process.Kill()
 
-	blob := waitBlob(t, addrFile, &serverErr)
+	addr := waitAddr(t, addrFile, &serverErr)
 
-	client := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, blob)
+	client := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, addr)
 	const payload = "pretend this is a tarball"
 	client.Stdin = strings.NewReader(payload)
 	var clientOut, clientErr bytes.Buffer

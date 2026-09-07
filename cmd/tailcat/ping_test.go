@@ -15,11 +15,12 @@ import (
 // find a direct localhost path, the same mechanism "tailcat ping
 // --until-direct" users rely on to verify NAT traversal.
 func TestPing(t *testing.T) {
+	t.Parallel()
 	e := newTestEnv(t)
-	_, blob, _ := e.startServer()
+	_, addr, _ := e.startServer()
 
 	t.Run("ping", func(t *testing.T) {
-		out, err := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, "ping", blob).CombinedOutput()
+		out, err := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, "ping", addr).CombinedOutput()
 		if err != nil {
 			t.Fatalf("ping: %v\n%s", err, out)
 		}
@@ -29,7 +30,7 @@ func TestPing(t *testing.T) {
 	})
 
 	t.Run("until_direct", func(t *testing.T) {
-		out, err := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, "ping", "--until-direct", "--timeout=30s", blob).CombinedOutput()
+		out, err := e.cmd("--key=new", "--derpmap-url="+e.derpMapURL, "ping", "--until-direct", "--timeout=30s", addr).CombinedOutput()
 		if err != nil {
 			t.Fatalf("ping --until-direct: %v\n%s", err, out)
 		}

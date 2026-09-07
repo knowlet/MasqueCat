@@ -6,23 +6,25 @@
 // This is the library behind the "tailcat" CLI command (cmd/tailcat).
 //
 // A [Server] listens for incoming clients via a DERP relay. Clients discover
-// the server through a compact [ConnBlob] (connection blob) that encodes the
-// server's WireGuard and path-discovery public keys and DERP region. DERP is used only for the initial
+// the server through a compact [Addr] (a tailcat address) that encodes the
+// server's WireGuard and path-discovery public keys, optional WireGuard
+// pre-shared key, and DERP region. DERP is used only for the initial
 // bootstrap; once both sides learn each other's endpoints, Tailscale's
 // magicsock layer upgrades to a direct peer-to-peer UDP path whenever possible,
 // just like the normal Tailscale data plane. DERP remains available as a
 // fallback relay if a direct path cannot be established.
 //
-// Once connected, the two sides exchange arbitrary TCP traffic over the
-// WireGuard tunnel with no Tailscale account or coordination server required.
-// Optionally, the server can run an auth-free SSH server on port 22, providing
-// remote shell access over the tunnel.
+// Once connected, the two sides exchange arbitrary TCP streams and UDP
+// datagrams over the WireGuard tunnel with no Tailscale account or coordination
+// server required.
+// Optionally, the server can run an SSH server on port 22, either requiring
+// authorized public keys or relying on the tunnel for client identity.
 //
 // The name "tailcat" is a nod to the classic "netcat" tool, but with
 // Tailscale's WireGuard encryption + NAT traversal.
 //
 // Using Tailscale's DERP servers is not required; you can run your own DERP
-// server and provide its region information in the ConnBlob.
+// server and provide its region information in the tailcat address.
 //
 // This package has no API stability promises: types, functions, and
 // the wire format may all change. See the Stability section of the
@@ -34,8 +36,11 @@ import (
 	"cmp"
 	"context"
 	"crypto/hmac"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,10 +61,13 @@ import (
 	"unsafe"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/tailscale/wireguard-go/device"
 	go4mem "go4.org/mem"
 	"go4.org/netipx"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/waiter"
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
 	"tailscale.com/health"
@@ -69,6 +77,7 @@ import (
 	"tailscale.com/net/dns"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/netns"
+	"tailscale.com/net/tsaddr"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
@@ -76,6 +85,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
+	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/mak"
@@ -133,26 +143,35 @@ var ExpandForServer expandForServer
 
 type expandForServer struct{}
 
-// ConnBlob is a compact, URL-safe string that a server gives to clients so
-// they can connect. It is the "tc"-prefixed base64url encoding of CBOR-encoded
-// [ConnInfo]. A typical ConnBlob looks like "tcomFwWC…".
-type ConnBlob string
+// Addr is a compact, URL-safe tailcat address that a server gives to clients
+// so they can connect. It is the "tc"-prefixed base64url encoding of a
+// CBOR-encoded [ConnInfo]. A typical Addr looks like "tcomFwWC…".
+type Addr string
 
 // ConnInfo describes how to reach a server: its WireGuard and path-discovery
-// public keys and which DERP relay region to use. It is serialized into a [ConnBlob] for exchange,
+// public keys, WireGuard pre-shared key, and which DERP relay region to use. It is serialized into an
+// [Addr] for exchange,
 // via the wire types in wire.go.
 type ConnInfo struct {
 	ServerPublic NodePublic // a key.NodePublic
 	// ServerDiscoPublic is the server's public key for path discovery.
 	// It is deliberately independent from ServerPublic: disco packets carry
 	// this key in cleartext on direct UDP paths, while ServerPublic is the
-	// unguessable part of the server's connection address.
+	// unguessable part of the server's tailcat address.
 	ServerDiscoPublic DiscoPublic // a key.DiscoPublic
+
+	// PresharedKey is mixed into the WireGuard handshake. It is an independent
+	// random secret, providing post-quantum confidentiality and preventing a
+	// DERP operator that observes the peers' node public keys from joining the
+	// tunnel. When non-zero, treat the entire tailcat address as a secret
+	// because it contains this key. The zero value disables the pre-shared-key
+	// layer for compatibility with old clients.
+	PresharedKey PresharedKey
 
 	// Region, if non-empty, lists the regions of a DERPMap.
 	// Either Region or RegionID must be set. If Region is set
 	// the client can avoid doing a lookup to discover the DERP map
-	// but the ConnBlob is longer.
+	// but the tailcat address is longer.
 	//
 	// As of 2023-09-22, a maximum of 1 region may be provided.
 	// In the future, a server might advertise its presence in
@@ -160,7 +179,7 @@ type ConnInfo struct {
 	Region []*tailcfg.DERPRegion `json:",omitempty"`
 
 	// RegionID lists the number of one of Tailscale's provided
-	// DERP servers. If set, Region may be omitted and the ConnBlob
+	// DERP servers. If set, Region may be omitted and the tailcat address
 	// is shorter, at the cost of the client needing to fetch
 	// the derpmap from tailscale.com once at startup.
 	// If -1 (for use when saving a keypair to disk for reuse later), a region
@@ -175,9 +194,75 @@ type NodePublic struct {
 }
 
 // DiscoPublic is a wrapper around key.DiscoPublic that uses its raw 32-byte
-// representation in connection blobs.
+// representation in tailcat addresses.
 type DiscoPublic struct {
 	key.DiscoPublic
+}
+
+const presharedKeyLen = device.NoisePresharedKeySize
+
+// PresharedKey is an optional 256-bit WireGuard pre-shared key. Tailcat
+// addresses generated by current servers always contain a non-zero key. It is
+// a named form of [device.NoisePresharedKey] so it can define the CBOR and JSON
+// encodings used by tailcat addresses and persisted server keys.
+type PresharedKey device.NoisePresharedKey
+
+// NewPresharedKey returns a new cryptographically random WireGuard pre-shared
+// key.
+func NewPresharedKey() (ret PresharedKey) {
+	for ret.IsZero() {
+		if _, err := cryptorand.Read(ret[:]); err != nil {
+			panic(fmt.Sprintf("generating WireGuard pre-shared key: %v", err))
+		}
+	}
+	return ret
+}
+
+// IsZero reports whether p is the zero value.
+func (p PresharedKey) IsZero() bool {
+	var zero PresharedKey
+	return subtle.ConstantTimeCompare(p[:], zero[:]) == 1
+}
+
+// Equal reports whether p and q contain the same key.
+func (p PresharedKey) Equal(q PresharedKey) bool {
+	return subtle.ConstantTimeCompare(p[:], q[:]) == 1
+}
+
+// MarshalBinary implements encoding.BinaryMarshaler for CBOR serialization.
+func (p PresharedKey) MarshalBinary() ([]byte, error) {
+	return append([]byte(nil), p[:]...), nil
+}
+
+// UnmarshalBinary implements encoding.BinaryUnmarshaler for CBOR serialization.
+func (p *PresharedKey) UnmarshalBinary(x []byte) error {
+	if len(x) != presharedKeyLen {
+		return fmt.Errorf("invalid WireGuard pre-shared key length %d, want %d", len(x), presharedKeyLen)
+	}
+	copy(p[:], x)
+	return nil
+}
+
+// MarshalText implements encoding.TextMarshaler for JSON serialization.
+func (p PresharedKey) MarshalText() ([]byte, error) {
+	ret := make([]byte, len("psk:")+hex.EncodedLen(len(p)))
+	copy(ret, "psk:")
+	hex.Encode(ret[len("psk:"):], p[:])
+	return ret, nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler for JSON serialization.
+func (p *PresharedKey) UnmarshalText(x []byte) error {
+	const prefix = "psk:"
+	if len(x) != len(prefix)+hex.EncodedLen(presharedKeyLen) || string(x[:len(prefix)]) != prefix {
+		return fmt.Errorf("invalid WireGuard pre-shared key %q", x)
+	}
+	var ret PresharedKey
+	if _, err := hex.Decode(ret[:], x[len(prefix):]); err != nil {
+		return fmt.Errorf("invalid WireGuard pre-shared key: %w", err)
+	}
+	*p = ret
+	return nil
 }
 
 // Equal reports whether a and b represent the same disco public key.
@@ -220,8 +305,9 @@ func (a NodePublic) Equal(b NodePublic) bool {
 }
 
 // PrivateKey is a node identity: a private key paired with the connection
-// info needed to reach this node. The DERP region in Public must be
-// populated by the caller before the key is usable.
+// info needed to reach this node. Despite its historical name, Public contains
+// the secret WireGuard pre-shared key and must be kept private. Its DERP region
+// must be populated by the caller before the key is usable.
 type PrivateKey struct {
 	Private key.NodePrivate
 	Public  ConnInfo
@@ -236,6 +322,7 @@ func NewPrivateKey() *PrivateKey {
 	}
 	ret.Public.ServerPublic = NodePublic{ret.Private.Public()}
 	ret.Public.ServerDiscoPublic = DiscoPublic{discoPrivateForNode(ret.Private).Public()}
+	ret.Public.PresharedKey = NewPresharedKey()
 	return ret
 }
 
@@ -254,6 +341,7 @@ type locoBackend struct {
 	logf           logger.Logf
 	serverPub      key.NodePublic  // non-zero if we're a client (server's public key)
 	serverDiscoPub key.DiscoPublic // non-zero if we're a client (server's disco key)
+	presharedKey   PresharedKey
 	isServer       bool
 
 	// discoPublic returns the node's disco public key, memoized to
@@ -305,9 +393,9 @@ func (b *locoBackend) Close() error {
 }
 
 // Server listens for clients over a WireGuard tunnel relayed through DERP.
-// Incoming TCP connections are dispatched via [Server.OnTCP] (for connections
-// addressed to the server itself) and [Server.OnTCPForward] (for connections
-// the server relays to other addresses, acting as an exit node).
+// Incoming TCP connections and UDP flows are dispatched via the OnTCP/OnUDP
+// callbacks (for traffic addressed to the server itself) and their Forward
+// counterparts (for traffic the server relays to other addresses).
 //
 // The zero value is a usable server: optionally populate the
 // configuration fields, then call [Server.Start], which picks
@@ -316,6 +404,17 @@ type Server struct {
 	// Key is the server's node identity.
 	// If zero, Start generates a new ephemeral key.
 	Key key.NodePrivate
+
+	// PresharedKey is the WireGuard pre-shared key clients must know to
+	// connect. If zero, Start generates a new ephemeral key and includes it in
+	// [Server.TailcatAddr]. A persistent server must restore this value along
+	// with Key so its address remains usable across restarts.
+	PresharedKey PresharedKey
+
+	// DisablePresharedKey disables the pre-shared-key layer and causes Start to
+	// ignore PresharedKey. This is not recommended, but produces shorter
+	// addresses compatible with tailcat clients v0.5.0 and earlier.
+	DisablePresharedKey bool
 
 	// Logf is the logger used for debug messages.
 	// If nil, log.Printf is used.
@@ -373,6 +472,25 @@ type Server struct {
 	// destination, not just the server's own address.
 	OnTCPForward func(netip.AddrPort) (handler func(net.Conn))
 
+	// OnUDP, if non-nil, specifies a func that returns a handler for an
+	// incoming UDP flow to the provided port. Each handler receives a connected
+	// packet connection for one client source IP:port. Datagram boundaries are
+	// preserved, and LocalAddr and RemoteAddr report the destination and source
+	// of the flow. If nil or if it returns nil, the flow is dropped.
+	//
+	// This only applies to packets addressed directly to the server node and not
+	// when being a subnet router. See OnUDPForward for relayed packets.
+	//
+	// It must be set before calling Start.
+	OnUDP func(port uint16) (handler func(ConnPacketConn))
+
+	// OnUDPForward is like OnUDP for UDP flows addressed through the server to
+	// another IP:port. Setting it also widens the packet filter installed at
+	// Start to admit UDP traffic to any destination.
+	//
+	// It must be set before calling Start.
+	OnUDPForward func(netip.AddrPort) (handler func(ConnPacketConn))
+
 	// ServedTCPPorts, if non-nil, restricts which TCP ports on the
 	// server's own address the packet filter admits new inbound
 	// connections to. If nil, connections to all ports reach OnTCP,
@@ -385,7 +503,38 @@ type Server struct {
 	//
 	// It must be set before calling Start.
 	ServedTCPPorts []filter.PortRange
+
+	// ServedUDPPorts, if non-nil, restricts which UDP ports on the server's own
+	// address the packet filter admits. If nil, packets to all ports reach
+	// OnUDP, which remains the per-flow gate either way.
+	//
+	// It must be set before calling Start.
+	ServedUDPPorts []filter.PortRange
+
+	// UDPIdleTimeout is how long an inactive incoming UDP flow remains open.
+	// A zero value uses [DefaultUDPIdleTimeout]. Successful reads and writes
+	// reset the timeout. It must be set before calling Start.
+	UDPIdleTimeout time.Duration
 }
+
+// ConnPacketConn is a connected datagram socket. Read and Write preserve UDP
+// datagram boundaries, while the net.PacketConn methods are available to code
+// that prefers packet-oriented APIs. LocalAddr and RemoteAddr identify the
+// destination and source endpoints of an incoming server flow.
+type ConnPacketConn interface {
+	net.Conn
+	net.PacketConn
+}
+
+// MaxUDPPayload is the largest UDP payload that fits the tunnel's 1280-byte
+// IPv6 MTU without IP fragmentation (1280 minus 40 bytes of IPv6 header and 8
+// bytes of UDP header). Applications should keep datagrams at or below this
+// size; larger writes are not guaranteed to reach the peer.
+const MaxUDPPayload = 1232
+
+// DefaultUDPIdleTimeout is the amount of inactivity after which an incoming
+// UDP flow is closed.
+const DefaultUDPIdleTimeout = 2 * time.Minute
 
 // Start connects to the DERP relay and begins accepting clients,
 // first picking defaults for any unset configuration fields: a new
@@ -395,6 +544,9 @@ func (s *Server) Start() error {
 	if s.lb != nil {
 		return errors.New("tailcat: Server.Start called twice")
 	}
+	if s.UDPIdleTimeout < 0 {
+		return errors.New("tailcat: Server.UDPIdleTimeout must not be negative")
+	}
 	logf := s.Logf
 	if logf == nil {
 		logf = log.Printf
@@ -402,6 +554,12 @@ func (s *Server) Start() error {
 	priv := s.Key
 	if priv.IsZero() {
 		priv = key.NewNode()
+	}
+	psk := s.PresharedKey
+	if s.DisablePresharedKey {
+		psk = PresharedKey{}
+	} else if psk.IsZero() {
+		psk = NewPresharedKey()
 	}
 	reg := s.Region
 	if reg == nil {
@@ -422,7 +580,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("missing RegionID in %v", logger.AsJSON(reg))
 	}
 
-	lb := newLocoBackend(priv)
+	lb := newLocoBackend(priv, psk)
 	lb.logf = logf
 	lb.dm = &tailcfg.DERPMap{}
 	mak.Set(&lb.dm.Regions, reg.RegionID, reg)
@@ -502,6 +660,26 @@ func (s *Server) Start() error {
 		}
 		return s.OnTCPForward(dst), true
 	}
+	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
+		var h func(ConnPacketConn)
+		if dst.Addr() == lb.addr {
+			if s.OnUDP != nil {
+				h = s.OnUDP(dst.Port())
+			}
+		} else if s.OnUDPForward != nil {
+			if nat64Prefix.Contains(dst.Addr()) {
+				var a4 [4]byte
+				d6 := dst.Addr().As16()
+				copy(a4[:], d6[12:16])
+				dst = netip.AddrPortFrom(netip.AddrFrom4(a4), dst.Port())
+			}
+			h = s.OnUDPForward(dst)
+		}
+		if h == nil {
+			return nil, true
+		}
+		return func(c nettype.ConnPacketConn) { h(newIdlePacketConn(c, s.udpIdleTimeout())) }, true
+	}
 	lb.ns = ns
 	sys.Set(ns)
 
@@ -528,19 +706,26 @@ func (s *Server) Start() error {
 	return nil
 }
 
-var allTCPPorts = filter.PortRange{First: 0, Last: 65535}
+func (s *Server) udpIdleTimeout() time.Duration {
+	if s.UDPIdleTimeout != 0 {
+		return s.UDPIdleTimeout
+	}
+	return DefaultUDPIdleTimeout
+}
 
-// buildFilter returns the packet filter enforcing what the server is
-// configured to serve: new inbound TCP connections are admitted only
-// to the server's own address (limited to ServedTCPPorts if set),
-// plus to any destination when OnTCPForward is set (exit node mode).
+var allPorts = filter.PortRange{First: 0, Last: 65535}
+
+// buildFilter returns the packet filter enforcing what the server is configured
+// to serve: inbound TCP connections and UDP flows are admitted only to the
+// server's own configured ports, plus to any destination for protocols whose
+// Forward callback is set (exit node mode).
 // Everything else from the tunnel is dropped before reaching
 // netstack; the OnTCP/OnTCPForward callbacks remain the
 // per-connection gates behind it.
 func (s *Server) buildFilter() *filter.Filter {
 	lb := s.lb
 
-	selfPorts := []filter.PortRange{allTCPPorts}
+	selfPorts := []filter.PortRange{allPorts}
 	if s.ServedTCPPorts != nil {
 		selfPorts = s.ServedTCPPorts
 	}
@@ -553,19 +738,49 @@ func (s *Server) buildFilter() *filter.Filter {
 		Srcs:    []netip.Prefix{allIPv6},
 		Dsts:    selfDsts,
 	}}
+	if s.OnUDP != nil {
+		udpPorts := []filter.PortRange{allPorts}
+		if s.ServedUDPPorts != nil {
+			udpPorts = s.ServedUDPPorts
+		}
+		udpDsts := make([]filter.NetPortRange, 0, len(udpPorts))
+		for _, pr := range udpPorts {
+			udpDsts = append(udpDsts, filter.NetPortRange{Net: lb.addrPrefix, Ports: pr})
+		}
+		matches = append(matches, filter.Match{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.UDP}),
+			Srcs:    []netip.Prefix{allIPv6},
+			Dsts:    udpDsts,
+		})
+	}
 
 	var localNets netipx.IPSetBuilder
 	localNets.AddPrefix(lb.addrPrefix)
-	if s.OnTCPForward != nil {
+	if s.OnTCPForward != nil || s.OnUDPForward != nil {
 		localNets.AddPrefix(allIPv6)
+	}
+	if s.OnTCPForward != nil {
 		matches = append(matches, filter.Match{
 			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP}),
 			Srcs:    []netip.Prefix{allIPv6},
-			Dsts:    []filter.NetPortRange{{Net: allIPv6, Ports: allTCPPorts}},
+			Dsts:    []filter.NetPortRange{{Net: allIPv6, Ports: allPorts}},
+		})
+	}
+	if s.OnUDPForward != nil {
+		matches = append(matches, filter.Match{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.UDP}),
+			Srcs:    []netip.Prefix{allIPv6},
+			Dsts:    []filter.NetPortRange{{Net: allIPv6, Ports: allPorts}},
 		})
 	}
 	local, _ := localNets.IPSet()
-	return filter.New(matches, nil, local, nil, nil, lb.logf)
+	// The logIPs set lets the filter log the packets it drops (the
+	// engine's tstun wrapper asks for drop logging by default), so a
+	// verbose server reports filtered connection attempts instead of
+	// silently eating them. Both endpoints of a flow must be in the
+	// set for it to be logged, so it spans the whole ULA range that
+	// tcAddrForKey assigns from, not just our own address.
+	return filter.New(matches, nil, local, tailcatULASet(), nil, lb.logf)
 }
 
 // Addr returns the server's IPv6 address derived from its public key.
@@ -690,63 +905,68 @@ func (s *Server) AddAllowedClient(k key.NodePublic) {
 	mak.Set(&s.lb.allowedClients, k, true)
 }
 
-// ConnBlob returns the token that clients use to connect to this
+// TailcatAddr returns the tailcat address that clients use to connect to this
 // server. It embeds the full DERP region, so clients don't need to
 // fetch the DERP map from the network. It must only be called after
 // [Server.Start].
-func (s *Server) ConnBlob() ConnBlob {
-	return s.lb.connBlob()
+func (s *Server) TailcatAddr() Addr {
+	return s.lb.tailcatAddr()
 }
 
-func newLocoBackend(priv key.NodePrivate) *locoBackend {
+func newLocoBackend(priv key.NodePrivate, psk PresharedKey) *locoBackend {
 	pub := priv.Public()
 	addr := tcAddrForKey(pub)
 	addrPrefix := netip.PrefixFrom(addr, addr.BitLen())
 	lb := &locoBackend{
-		logf:       log.Printf,
-		priv:       priv,
-		pub:        pub,
-		addr:       addr,
-		addrPrefix: addrPrefix,
+		logf:         log.Printf,
+		priv:         priv,
+		pub:          pub,
+		addr:         addr,
+		addrPrefix:   addrPrefix,
+		presharedKey: psk,
 	}
 	lb.discoPublic = sync.OnceValue(func() key.DiscoPublic { return discoPrivateForNode(lb.priv).Public() })
 	return lb
 }
 
-var debugConnBlob = envknob.Bool("TS_DEBUG_CONNBLOB")
+var debugAddr = envknob.Bool("TS_DEBUG_ADDR")
 
-func (lb *locoBackend) connBlob() ConnBlob {
+func (lb *locoBackend) tailcatAddr() Addr {
 	if lb.dm == nil {
 		panic("no DERPMap set")
 	}
 	var ci ConnInfo
 	ci.ServerPublic = NodePublic{lb.pub}
 	ci.ServerDiscoPublic = DiscoPublic{lb.discoPublic()}
+	ci.PresharedKey = lb.presharedKey
 	for _, r := range lb.dm.Regions {
 		ci.Region = append(ci.Region, r)
 	}
 	if len(lb.dm.Regions) == 0 {
 		panic("no regions in derpmap")
 	}
-	if debugConnBlob {
-		log.Printf("ConnBlob: %v", logger.AsJSON(ci))
+	if debugAddr {
+		log.Printf("tailcat address: %v", logger.AsJSON(ci))
 	}
-	return ci.ConnBlob()
+	return ci.Addr()
 }
 
-// ConnBlob serializes the ConnInfo into a compact [ConnBlob] string.
+// Addr serializes the ConnInfo into a compact [Addr] string.
 // It is encoded via the wire types (see wire.go), which drop the
 // DERP region fields tailcat doesn't use. Some other fields
 // (RegionID, RegionCode, RegionName, node names that are redundant
 // next to an explicit HostName) are zeroed before encoding to reduce
-// size; [ParseConnBlob] restores them.
-func (ci *ConnInfo) ConnBlob() ConnBlob {
+// size; [ParseAddr] restores them.
+func (ci *ConnInfo) Addr() Addr {
 	w := &wireConnInfo{
 		ServerPublic: ci.ServerPublic,
 		RegionID:     ci.RegionID.Int64(),
 	}
 	if !ci.ServerDiscoPublic.IsZero() {
 		w.ServerDiscoPublic = &ci.ServerDiscoPublic
+	}
+	if !ci.PresharedKey.IsZero() {
+		w.PresharedKey = &ci.PresharedKey
 	}
 	for _, r := range ci.Region {
 		wr := wireRegionOf(r)
@@ -769,45 +989,45 @@ func (ci *ConnInfo) ConnBlob() ConnBlob {
 	if err != nil {
 		panic(err)
 	}
-	if debugConnBlob {
-		log.Printf("ConnBlob: %q", x)
-		log.Printf("ConnBlob: %x", x)
+	if debugAddr {
+		log.Printf("tailcat address: %q", x)
+		log.Printf("tailcat address: %x", x)
 	}
-	return "tc" + ConnBlob(base64.RawURLEncoding.EncodeToString(x))
+	return "tc" + Addr(base64.RawURLEncoding.EncodeToString(x))
 }
 
-// Resolve returns a self-contained equivalent of b with the DERP
-// relay's details embedded, so that later use of the blob requires
-// no network access to fetch the DERP map. It is to a ConnBlob
+// Resolve returns a self-contained equivalent of a with the DERP
+// relay's details embedded, so that later use of the address requires
+// no network access to fetch the DERP map. It is to an Addr
 // roughly what a DNS lookup is to a hostname: the resolved form is
 // longer, works offline, and pins the relay details as they were at
-// resolution time. If b already embeds its relay details, it is
+// resolution time. If a already embeds its relay details, it is
 // returned unchanged. The opts are as documented on [ConnInfo.Expand].
-func (b ConnBlob) Resolve(ctx context.Context, opts ...any) (ConnBlob, error) {
-	ci, err := ParseConnBlob(b)
+func (a Addr) Resolve(ctx context.Context, opts ...any) (Addr, error) {
+	ci, err := ParseAddr(a)
 	if err != nil {
 		return "", err
 	}
 	if len(ci.Region) > 0 {
-		return b, nil
+		return a, nil
 	}
 	if err := ci.Expand(ctx, opts...); err != nil {
 		return "", err
 	}
-	// Keep the blob short: two relay nodes suffice.
+	// Keep the address short: two relay nodes suffice.
 	for _, r := range ci.Region {
 		r.Nodes = r.Nodes[:min(2, len(r.Nodes))]
 	}
 	ci.RegionID = 0
-	return ci.ConnBlob(), nil
+	return ci.Addr(), nil
 }
 
-// parseWire decodes cb into its wire form, without restoring the
-// fields that [ConnInfo.ConnBlob] elides.
-func parseWire(cb ConnBlob) (*wireConnInfo, error) {
-	rest, ok := strings.CutPrefix(string(cb), "tc")
+// parseWire decodes an address into its wire form, without restoring the
+// fields that [ConnInfo.Addr] elides.
+func parseWire(addr Addr) (*wireConnInfo, error) {
+	rest, ok := strings.CutPrefix(string(addr), "tc")
 	if !ok {
-		return nil, errors.New("server address doesn't start with \"tc\"")
+		return nil, errors.New("tailcat address doesn't start with \"tc\"")
 	}
 	x, err := base64.RawURLEncoding.DecodeString(rest)
 	if err != nil {
@@ -820,21 +1040,21 @@ func parseWire(cb ConnBlob) (*wireConnInfo, error) {
 	return w, nil
 }
 
-// ParseConnBlobRaw decodes cb into its wire form, without restoring
-// the implicit fields that [ParseConnBlob] synthesizes (region and
+// ParseAddrRaw decodes an address into its wire form, without restoring
+// the implicit fields that [ParseAddr] synthesizes (region and
 // node IDs, region codes, node names). The returned value is only
 // meant for JSON display, as by the CLI's "parse" subcommand: its
-// JSON form shows just the fields the encoded blob actually carries.
-func ParseConnBlobRaw(cb ConnBlob) (any, error) {
-	return parseWire(cb)
+// JSON form shows just the fields the encoded address actually carries.
+func ParseAddrRaw(addr Addr) (any, error) {
+	return parseWire(addr)
 }
 
-// ParseConnBlob decodes a [ConnBlob] back into a [ConnInfo], restoring
+// ParseAddr decodes an [Addr] back into a [ConnInfo], restoring
 // fields that were stripped during encoding (RegionID, RegionCode,
 // node names).
-func ParseConnBlob(cb ConnBlob) (ConnInfo, error) {
+func ParseAddr(addr Addr) (ConnInfo, error) {
 	var zero ConnInfo
-	w, err := parseWire(cb)
+	w, err := parseWire(addr)
 	if err != nil {
 		return zero, err
 	}
@@ -845,16 +1065,19 @@ func ParseConnBlob(cb ConnBlob) (ConnInfo, error) {
 	if w.ServerDiscoPublic != nil {
 		ci.ServerDiscoPublic = *w.ServerDiscoPublic
 	}
+	if w.PresharedKey != nil {
+		ci.PresharedKey = *w.PresharedKey
+	}
 	for i, wr := range w.Region {
-		// CBOR nulls decode to nil pointers, and blobs come from
+		// CBOR nulls decode to nil pointers, and addresses come from
 		// untrusted places (a pasted address, a "tailcat=" TXT record),
 		// so reject them rather than dereferencing them below.
 		if wr == nil {
-			return zero, fmt.Errorf("invalid connection blob: region %d is null", i)
+			return zero, fmt.Errorf("invalid tailcat address: region %d is null", i)
 		}
 		for j, n := range wr.Nodes {
 			if n == nil {
-				return zero, fmt.Errorf("invalid connection blob: region %d node %d is null", i, j)
+				return zero, fmt.Errorf("invalid tailcat address: region %d node %d is null", i, j)
 			}
 		}
 		ci.Region = append(ci.Region, wr.derpRegion())
@@ -944,7 +1167,7 @@ func (c *memDERPMapCache) Put(url string, data []byte, etag string) error {
 //
 // TODO: do a fresh fetch (ignoring cache freshness) if we ever fail
 // to connect to any DERP region afterwards, e.g. if the cached map is
-// so stale that no region answers or the region a token references no
+// so stale that no region answers or the region an address references no
 // longer exists. For now staleness is only bounded by the max age.
 func fetchDERPMap(ctx context.Context, fetchURL, mode string, cache DERPMapCache) (*tailcfg.DERPMap, error) {
 	if cache == nil {
@@ -1108,7 +1331,7 @@ func (ci *ConnInfo) Expand(ctx context.Context, opts ...any) error {
 	}
 	r, ok := dm.Regions[ci.RegionID]
 	if !ok {
-		return fmt.Errorf("connection string said only DERP RegionID %v but no such region in %v", ci.RegionID, dmSrc)
+		return fmt.Errorf("tailcat address specified DERP RegionID %v but no such region exists in %v", ci.RegionID, dmSrc)
 	}
 	ci.Region = append(ci.Region, r)
 	return nil
@@ -1116,25 +1339,31 @@ func (ci *ConnInfo) Expand(ctx context.Context, opts ...any) error {
 
 var allIPv6 = netip.MustParsePrefix("::/0")
 
-// peerAllowedIPs returns the prefixes that the peer with public key k
-// is allowed to originate traffic from. It is the engine's per-peer
+// peerConfig returns the WireGuard config for the peer with public key k.
+// It is the engine's per-peer
 // WireGuard config source (see [wgengine.Engine.SetPeerConfigFunc]).
-func (b *locoBackend) peerAllowedIPs(k key.NodePublic) (allowedIPs []netip.Prefix, ok bool) {
+func (b *locoBackend) peerConfig(k key.NodePublic) (_ wgcfg.PeerConfig, ok bool) {
+	withPSK := func(allowedIPs []netip.Prefix) wgcfg.PeerConfig {
+		return wgcfg.PeerConfig{
+			AllowedIPs:   allowedIPs,
+			PresharedKey: device.NoisePresharedKey(b.presharedKey),
+		}
+	}
 	if !b.serverPub.IsZero() {
 		// We're the client; the server is our only peer and may send
 		// from any address (it can act as an exit node).
 		if k == b.serverPub {
-			return []netip.Prefix{pfxOf(tcAddrForKey(k)), allIPv6}, true
+			return withPSK([]netip.Prefix{pfxOf(tcAddrForKey(k)), allIPv6}), true
 		}
-		return nil, false
+		return wgcfg.PeerConfig{}, false
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	n, ok := b.clients[k]
 	if !ok {
-		return nil, false
+		return wgcfg.PeerConfig{}, false
 	}
-	return n.AllowedIPs, true
+	return withPSK(n.AllowedIPs), true
 }
 
 // peerByIP returns the public key of the peer that outbound packets
@@ -1330,7 +1559,7 @@ func (lb *locoBackend) Start() error {
 	// Install the live per-peer config sources. WireGuard peers are
 	// created lazily from these as traffic arrives; there is no
 	// peer list in wgcfg.Config anymore.
-	e.SetPeerConfigFunc(lb.peerAllowedIPs)
+	e.SetPeerConfigFunc(lb.peerConfig)
 	e.SetPeerByIPPacketFunc(lb.peerByIP)
 	e.SetPeerForIPFunc(lb.peerForIP)
 	e.SetStatusCallback(lb.onEngineStatus)
@@ -1430,6 +1659,19 @@ func (b *locoBackend) Status() *ipnstate.Status {
 	return sb.Status()
 }
 
+// tailcatULASet returns the IP set of Tailscale's ULA range that
+// tcAddrForKey assigns tailcat addresses from, for use as a packet
+// filter's logIPs set.
+var tailcatULASet = sync.OnceValue(func() *netipx.IPSet {
+	var b netipx.IPSetBuilder
+	b.AddPrefix(tsaddr.TailscaleULARange())
+	s, err := b.IPSet()
+	if err != nil {
+		panic(err)
+	}
+	return s
+})
+
 func tcAddrForKey(k key.NodePublic) netip.Addr {
 	var a [16]byte
 	r := k.Raw32()
@@ -1493,15 +1735,15 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 
 // Client connects to a [Server] over a WireGuard tunnel relayed through DERP.
 // Populate Server (the only required field, or use the [NewClient]
-// shorthand), then just dial: [Client.Dial], [Client.DialTCPPort],
-// and [Client.DialTCP] lazily establish the tunnel on first use,
+// shorthand), then just dial: [Client.Dial], the DialTCP methods, and the
+// DialUDP methods lazily establish the tunnel on first use,
 // picking defaults for any unset fields. [Client.Ping] does the same
 // and is useful to test connectivity first or to measure the relay
 // round-trip time.
 type Client struct {
-	// Server is the token identifying the server to connect to.
+	// Server is the tailcat address identifying the server to connect to.
 	// It is required and must be set before the client's first use.
-	Server ConnBlob
+	Server Addr
 
 	// Key is the client's node identity, which servers can allowlist.
 	// If zero, a new ephemeral key is generated at first use.
@@ -1513,7 +1755,7 @@ type Client struct {
 	Logf logger.Logf
 
 	// DERPMapURL, if non-empty, is an alternate URL to fetch the DERP
-	// map from when the token doesn't embed the relay details.
+	// map from when the address doesn't embed the relay details.
 	// If empty, [DefaultDERPMapURL] is used. If set, it must be set
 	// before the client's first use.
 	DERPMapURL string
@@ -1551,10 +1793,10 @@ func (c *Client) nodeKeyLocked() key.NodePrivate {
 }
 
 // NewClient returns a client that will connect to the server
-// identified by the given token. It is shorthand for
+// identified by the given tailcat address. It is shorthand for
 // &Client{Server: server}; see [Client] for the optional fields that
 // may also be set before the client's first use.
-func NewClient(server ConnBlob) *Client {
+func NewClient(server Addr) *Client {
 	return &Client{Server: server}
 }
 
@@ -1570,15 +1812,14 @@ func (c *Client) initLocked() error {
 	if logf == nil {
 		logf = log.Printf
 	}
-	ci, err := ParseConnBlob(c.Server)
+	ci, err := ParseAddr(c.Server)
 	if err != nil {
 		return err
 	}
 	if ci.ServerDiscoPublic.IsZero() {
-		return errors.New("legacy server address lacks a separate disco key; generate a new address with an updated tailcat server")
+		return errors.New("legacy tailcat address lacks a separate disco key; generate a new address with an updated tailcat server")
 	}
-
-	lb := newLocoBackend(c.nodeKeyLocked())
+	lb := newLocoBackend(c.nodeKeyLocked(), ci.PresharedKey)
 	lb.logf = logf
 	lb.dm = &tailcfg.DERPMap{}
 	lb.serverPub = ci.ServerPublic.NodePublic
@@ -1646,7 +1887,7 @@ func (c *Client) initLocked() error {
 	localNets := new(netipx.IPSetBuilder)
 	localNets.AddPrefix(lb.addrPrefix)
 	local, _ := localNets.IPSet()
-	e.SetFilter(filter.New(nil, nil, local, nil, nil, logf))
+	e.SetFilter(filter.New(nil, nil, local, tailcatULASet(), nil, logf))
 	dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		_, ok := lb.peerByIP(ip)
 		return ok
@@ -1655,7 +1896,11 @@ func (c *Client) initLocked() error {
 		return ns.DialContextTCP(ctx, dst)
 	}
 	dialer.NetstackDialUDP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
-		panic("unreachable from tailcat") // but required by Dialer currently
+		udpConn, err := ns.DialContextUDPWithBind(ctx, lb.addr, dst)
+		if err != nil {
+			return nil, err
+		}
+		return udpConn, nil
 	}
 	sys.Tun.Get().Start()
 
@@ -1692,9 +1937,9 @@ type PingResult struct {
 }
 
 // ensureStarted brings up the client's network stack on first use:
-// it resolves the server's DERP region if the ConnBlob didn't embed
+// it resolves the server's DERP region if the Addr didn't embed
 // it (possibly fetching the DERP map over the network, bounded by
-// ctx; see [ConnBlob.Resolve] to do that step earlier), connects to
+// ctx; see [Addr.Resolve] to do that step earlier), connects to
 // the DERP relay, and configures WireGuard. Failed attempts are
 // retried on the next call.
 func (c *Client) ensureStarted(ctx context.Context) error {
@@ -1717,7 +1962,7 @@ func (c *Client) ensureStarted(ctx context.Context) error {
 		return err
 	}
 	if len(c.ci.Region) == 0 {
-		return errors.New("no DERP regions in ConnBlob")
+		return errors.New("no DERP regions in tailcat address")
 	}
 	for _, r := range c.ci.Region {
 		mak.Set(&c.lb.dm.Regions, r.RegionID, r)
@@ -1743,9 +1988,10 @@ func (c *Client) up(ctx context.Context) error {
 }
 
 // Ping starts the client if needed (see [Client.Dial] for the lazy
-// startup behavior), sends a meow ping to the server via DERP, and
-// waits for the meowed acknowledgment, which also tells the server
-// to add us as a WireGuard peer. Calling it is optional (Dial does
+// startup behavior), sends a meow ping to the server via DERP
+// (resending periodically in case of packet loss), and waits for the
+// meowed acknowledgment, which also tells the server to add us as a
+// WireGuard peer. Calling it is optional (Dial does
 // it implicitly) but useful to test connectivity or measure the
 // relay round-trip time. The internal timeout is 10 seconds
 // regardless of ctx.
@@ -1761,8 +2007,8 @@ func (c *Client) Ping(ctx context.Context) (PingResult, error) {
 	return res, err
 }
 
-// ping sends a single meow ping and waits for the meowed ack. The
-// client must be started.
+// ping sends a meow ping and waits for the meowed ack. The client
+// must be started.
 func (c *Client) ping(ctx context.Context) (PingResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -1775,19 +2021,39 @@ func (c *Client) ping(ctx context.Context) (PingResult, error) {
 	derpRegion := c.lb.derpRegionID()
 	pkt := EncodeMeowPing(c.lb.pub, mc.DiscoPublicKey())
 
-	sent, err := mc.SendDERPPacketTo(dstNode, derpRegion, pkt)
-	if err != nil {
-		return zero, fmt.Errorf("sending meow: %w", err)
+	// DERP delivery is best effort: the relay drops packets sent to a
+	// key that isn't connected yet, so the ping (or its ack) is lost
+	// if either side's relay connection is still coming up. Resend
+	// periodically rather than betting the whole timeout on one
+	// packet. Send failures are retryable for the same reason: a full
+	// relay write queue drops the packet, which is just packet loss
+	// happening early. The server acks every ping, so duplicates are
+	// harmless.
+	send := func() error {
+		sent, err := mc.SendDERPPacketTo(dstNode, derpRegion, pkt)
+		if err != nil {
+			return fmt.Errorf("sending meow: %w", err)
+		}
+		if !sent {
+			return errors.New("meow not sent")
+		}
+		return nil
 	}
-	if !sent {
-		return zero, fmt.Errorf("meow not sent")
-	}
-
-	select {
-	case <-c.meowWait:
-		return PingResult{time.Since(t0)}, nil
-	case <-ctx.Done():
-		return zero, ctx.Err()
+	lastSendErr := send()
+	resend := time.NewTicker(time.Second)
+	defer resend.Stop()
+	for {
+		select {
+		case <-c.meowWait:
+			return PingResult{time.Since(t0)}, nil
+		case <-ctx.Done():
+			if lastSendErr != nil {
+				return zero, fmt.Errorf("%w (last send error: %v)", ctx.Err(), lastSendErr)
+			}
+			return zero, ctx.Err()
+		case <-resend.C:
+			lastSendErr = send()
+		}
 	}
 }
 
@@ -1845,7 +2111,7 @@ func (c *Client) DiscoPing(ctx context.Context) (*ipnstate.PingResult, error) {
 //
 // On a Client's first use (any Dial method or [Client.Ping]), the
 // client lazily brings up its network stack, resolving the server's
-// DERP region over the network if the ConnBlob didn't embed it, and
+// DERP region over the network if the Addr didn't embed it, and
 // registers itself with the server.
 func (c *Client) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if err := c.up(ctx); err != nil {
@@ -1886,6 +2152,42 @@ func (c *Client) DialTCP(ctx context.Context, ap netip.AddrPort) (net.Conn, erro
 	return c.lb.ns.DialContextTCP(ctx, ap)
 }
 
+// DialUDPPort opens a connected UDP packet connection to the given port on the
+// server. Each Write sends one datagram and each Read receives one datagram.
+// See [Client.Dial] for the lazy startup behavior.
+func (c *Client) DialUDPPort(ctx context.Context, port uint16) (ConnPacketConn, error) {
+	if err := c.up(ctx); err != nil {
+		return nil, err
+	}
+	return c.dialUDP(ctx, netip.AddrPortFrom(c.serverAddr, port))
+}
+
+// DialUDP opens a connected UDP packet connection to an arbitrary IP:port
+// through the server, which must be configured to forward UDP (see
+// [Server.OnUDPForward]). IPv4 addresses are mapped into the NAT64 prefix for
+// transport over the IPv6-only WireGuard tunnel.
+// See [Client.Dial] for the lazy startup behavior.
+func (c *Client) DialUDP(ctx context.Context, ap netip.AddrPort) (ConnPacketConn, error) {
+	if err := c.up(ctx); err != nil {
+		return nil, err
+	}
+	if ap.Addr().Is4() {
+		a := nat64PrefixBytes
+		a4 := ap.Addr().As4()
+		copy(a[12:], a4[:])
+		ap = netip.AddrPortFrom(netip.AddrFrom16(a), ap.Port())
+	}
+	return c.dialUDP(ctx, ap)
+}
+
+func (c *Client) dialUDP(ctx context.Context, ap netip.AddrPort) (ConnPacketConn, error) {
+	udpConn, err := c.lb.ns.DialContextUDPWithBind(ctx, c.lb.addr, ap)
+	if err != nil {
+		return nil, err
+	}
+	return udpConn, nil
+}
+
 func pfxOf(a netip.Addr) netip.Prefix {
 	return netip.PrefixFrom(a, a.BitLen())
 }
@@ -1921,8 +2223,195 @@ func ProxyConns(a, b net.Conn) {
 	go cp(a, b)
 	go cp(b, a)
 	wg.Wait()
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		closeProxyConn(a)
+	}()
+	go func() {
+		defer wg.Done()
+		closeProxyConn(b)
+	}()
+	wg.Wait()
+}
+
+const proxyConnDrainTimeout = 5 * time.Second
+
+// closeProxyConn waits up to proxyConnDrainTimeout for a gVisor TCP connection
+// whose peer has already closed to acknowledge our FIN, then closes it.
+// Calling Close immediately after CloseWrite can race gVisor's protocol
+// teardown and lose the FIN if its first transmission is dropped. Other
+// connections can be closed immediately.
+func closeProxyConn(c net.Conn) {
+	closeProxyConnTimeout(c, proxyConnDrainTimeout)
+}
+
+func closeProxyConnTimeout(c net.Conn, timeout time.Duration) {
+	if c, ok := c.(*gonet.TCPConn); ok {
+		ep, wq := gonetTCPConnInternals(c)
+		e, ch := waiter.NewChannelEntry(waiter.EventHUp)
+		wq.EventRegister(&e)
+		// Check after registering so a concurrent state transition cannot be
+		// missed between observing the state and subscribing to its event.
+		timer := time.NewTimer(timeout)
+		for {
+			switch tcp.EndpointState(ep.State()) {
+			case tcp.StateClosing, tcp.StateLastAck:
+			default:
+				timer.Stop()
+				wq.EventUnregister(&e)
+				c.Close()
+				return
+			}
+			select {
+			case <-ch:
+			case <-timer.C:
+				wq.EventUnregister(&e)
+				c.Close()
+				return
+			}
+		}
+	}
+	c.Close()
+}
+
+type tcpStateEndpoint interface {
+	State() uint32
+}
+
+// gonetTCPConnInternals returns c's unexported gVisor TCP endpoint and waiter
+// queue.
+//
+// TODO(bradfitz): add an exported accessor upstream and delete this
+// reflect+unsafe cheat.
+func gonetTCPConnInternals(c *gonet.TCPConn) (ep tcpStateEndpoint, wq *waiter.Queue) {
+	cv := reflect.ValueOf(c).Elem()
+	epv := cv.FieldByName("ep")
+	wqv := cv.FieldByName("wq")
+	if !epv.IsValid() || !wqv.IsValid() {
+		panic("gonet.TCPConn internals changed in gVisor dependency")
+	}
+	ep = reflect.NewAt(epv.Type(), unsafe.Pointer(epv.UnsafeAddr())).Elem().Interface().(tcpStateEndpoint)
+	wq = reflect.NewAt(wqv.Type(), unsafe.Pointer(wqv.UnsafeAddr())).Elem().Interface().(*waiter.Queue)
+	return ep, wq
+}
+
+// ProxyPacketConns copies whole datagrams between a and b until either socket
+// fails or is closed, then closes both sockets. The maximum-size UDP buffer
+// avoids turning a large datagram into multiple writes or truncating it.
+func ProxyPacketConns(a, b ConnPacketConn) {
+	done := make(chan struct{}, 2)
+	pump := func(dst, src ConnPacketConn) {
+		buf := make([]byte, 65535)
+		for {
+			n, err := src.Read(buf)
+			if err != nil {
+				break
+			}
+			if _, err := dst.Write(buf[:n]); err != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}
+	go pump(a, b)
+	go pump(b, a)
+	<-done
 	a.Close()
 	b.Close()
+	<-done
+}
+
+// idlePacketConn closes c after timeout without a successful read or write.
+// It is used for server-side UDP flows, which do not otherwise have a natural
+// close signal from the peer.
+type idlePacketConn struct {
+	ConnPacketConn
+	timeout  time.Duration
+	timer    *time.Timer
+	deadline time.Time
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func newIdlePacketConn(c ConnPacketConn, timeout time.Duration) *idlePacketConn {
+	ic := &idlePacketConn{ConnPacketConn: c, timeout: timeout, deadline: time.Now().Add(timeout)}
+	ic.timer = time.AfterFunc(timeout, ic.checkIdle)
+	return ic
+}
+
+// checkIdle closes the flow if the deadline has passed. If activity extended
+// the deadline while the timer was firing, it reschedules instead of closing,
+// so a concurrent touch cannot be followed by a spurious close.
+func (c *idlePacketConn) checkIdle() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	if remaining := time.Until(c.deadline); remaining > 0 {
+		c.timer.Reset(remaining)
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.mu.Unlock()
+	c.ConnPacketConn.Close()
+}
+
+func (c *idlePacketConn) touch() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return
+	}
+	c.deadline = time.Now().Add(c.timeout)
+	c.timer.Reset(c.timeout)
+}
+
+func (c *idlePacketConn) Read(b []byte) (int, error) {
+	n, err := c.ConnPacketConn.Read(b)
+	if err == nil {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *idlePacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.ConnPacketConn.ReadFrom(b)
+	if err == nil {
+		c.touch()
+	}
+	return n, addr, err
+}
+
+func (c *idlePacketConn) Write(b []byte) (int, error) {
+	n, err := c.ConnPacketConn.Write(b)
+	if err == nil {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *idlePacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	n, err := c.ConnPacketConn.WriteTo(b, addr)
+	if err == nil {
+		c.touch()
+	}
+	return n, err
+}
+
+func (c *idlePacketConn) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return net.ErrClosed
+	}
+	c.closed = true
+	c.timer.Stop()
+	c.mu.Unlock()
+	return c.ConnPacketConn.Close()
 }
 
 // Status returns the current WireGuard and DERP connection status.

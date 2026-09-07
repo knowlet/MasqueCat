@@ -61,6 +61,11 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			pk = tailcat.NewPrivateKey()
 			pk.Public.RegionID = -1
 		}
+		if pk.Public.PresharedKey.IsZero() {
+			// Migrate private keys saved by versions predating WireGuard PSKs.
+			// The returned privateKeyJSON persists the new address capability.
+			pk.Public.PresharedKey = tailcat.NewPresharedKey()
+		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -72,13 +77,13 @@ func tailcatListen(this js.Value, args []js.Value) any {
 		if keyJSON == "" {
 			pk.Public.RegionID = reg.RegionID
 		}
-		blob := pk.Public.ConnBlob()
+		addr := pk.Public.Addr()
 		keyOut, err := json.Marshal(pk)
 		if err != nil {
 			return nil, err
 		}
 
-		srv := &tailcat.Server{Key: pk.Private, Logf: logf, Region: reg}
+		srv := &tailcat.Server{Key: pk.Private, PresharedKey: pk.Public.PresharedKey, Logf: logf, Region: reg}
 		srv.OnTCP = func(port uint16) (handler func(net.Conn)) {
 			return func(c net.Conn) { onConnection.Invoke(makeJSConn(c, port, nil)) }
 		}
@@ -87,7 +92,7 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			return nil, fmt.Errorf("Server.Start: %w", err)
 		}
 		return map[string]any{
-			"addr":           string(blob),
+			"addr":           string(addr),
 			"privateKeyJSON": string(keyOut),
 			"close": js.FuncOf(func(this js.Value, args []js.Value) any {
 				srv.Close()
@@ -144,7 +149,7 @@ func tailcatDial(this js.Value, args []js.Value) any {
 		}
 
 		cl := &tailcat.Client{
-			Server:     tailcat.ConnBlob(addr),
+			Server:     tailcat.Addr(addr),
 			Key:        priv,
 			Logf:       logf,
 			DERPMapURL: derpMapURL,
