@@ -3,9 +3,13 @@
 package tailcat
 
 import (
+	"context"
+	"crypto/tls"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"tailscale.com/types/key"
 )
@@ -57,4 +61,44 @@ func TestMasqueRelayH2RequestRestoresAuthorityForTemplateMatch(t *testing.T) {
 	if req.URL.Host != "" {
 		t.Fatalf("handler mutated original request URL host to %q", req.URL.Host)
 	}
+}
+
+func TestMasqueRelayH2AuthenticatedConnectEndToEnd(t *testing.T) {
+	seed := httptest.NewTLSServer(http.NotFoundHandler())
+	cert := seed.TLS.Certificates[0]
+	seed.Close()
+
+	relay := &MasqueRelay{}
+	srv, err := newMasqueHTTP2Server(&tls.Config{Certificates: []tls.Certificate{cert}}, relay.Handler())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ln.Close() }()
+	go func() { _ = srv.Serve(tls.NewListener(ln, srv.TLSConfig)) }()
+	defer func() { _ = srv.Close() }()
+
+	tmpl, err := masqueTemplateFor("https://" + ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	local := key.NewNode()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pc, err := dialMasqueH2PacketConnRFC8441(
+		ctx,
+		tmpl,
+		local.Public(),
+		local,
+		masqueModeRelay,
+		&tls.Config{InsecureSkipVerify: true}, // test-only ephemeral certificate
+	)
+	if err != nil {
+		t.Fatalf("authenticated HTTP/2 CONNECT-UDP dial failed: %v", err)
+	}
+	defer func() { _ = pc.Close() }()
 }
