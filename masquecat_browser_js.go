@@ -41,18 +41,19 @@ import (
 )
 
 const (
-	browserMasqueMTU                  = 1000
-	browserMasqueQueueSize            = 512
-	browserMasqueNIC     tcpip.NICID  = 1
-	browserMasquePingPort uint16       = 65535
-	browserMasquePacketVersion         = byte(1)
-	browserNodePublicTextPrefix        = "nodekey:"
-	browserWebTransportPath            = "/.well-known/masquecat/webtransport"
-	browserControlMax                  = 8 << 10
-	browserProtocolVersion             = 1
-	browserFragmentHeaderLen           = 20
-	browserFragmentMaxSize             = 64 << 10
-	browserFragmentChunkSize           = 1000
+	browserMasqueMTU                    = 1000
+	browserMasqueQueueSize              = 512
+	browserMasqueNIC       tcpip.NICID  = 1
+	browserMasquePingPort  uint16       = 65535
+	browserMasquePacketVersion          = byte(1)
+	browserNodePublicTextPrefix          = "nodekey:"
+	browserWebTransportRoute            = "/.well-known/masquecat/webtransport"
+	browserControlMax                    = 8 << 10
+	browserProtocolVersion               = 1
+	browserFragmentHeaderLen             = 20
+	browserFragmentMaxSize               = 64 << 10
+	browserFragmentChunkSize             = 1000
+	browserFragmentMaxIncompleteSets     = 64
 )
 
 var (
@@ -136,6 +137,9 @@ func (r *browserReassembler) Push(src key.NodePublic, payload []byte) ([]byte, b
 	k := browserFragmentKey{src: src, id: id}
 	set := r.sets[k]
 	if set == nil {
+		if len(r.sets) >= browserFragmentMaxIncompleteSets {
+			return nil, false, errors.New("masquecat: too many incomplete browser WireGuard fragments")
+		}
 		set = &browserFragmentSet{count: count, total: total, parts: make([][]byte, count)}
 		r.sets[k] = set
 	}
@@ -230,6 +234,7 @@ func (b *browserBind) Close() error {
 	}
 	return nil
 }
+
 func (*browserBind) SetMark(uint32) error { return nil }
 func (*browserBind) BatchSize() int       { return 1 }
 
@@ -275,8 +280,10 @@ func (b *browserBind) SetPath(peer key.NodePublic, path browserPacketForwarder) 
 
 func (b *browserBind) Inject(src key.NodePublic, payload []byte) error {
 	reassembled, ready, err := b.frag.Push(src, payload)
+	// Match the native carrier's behavior: malformed or incomplete fragment
+	// traffic is dropped rather than tearing down the entire WebTransport path.
 	if err != nil || !ready {
-		return err
+		return nil
 	}
 	b.mu.RLock()
 	if !b.open || b.recv == nil || b.close == nil {
@@ -306,15 +313,17 @@ func newBrowserTun(link *channel.Endpoint) *browserTun {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &browserTun{ctx: ctx, cancel: cancel, link: link, events: make(chan tun.Event)}
 }
-func (*browserTun) File() *os.File               { return nil }
-func (*browserTun) MTU() (int, error)            { return browserMasqueMTU, nil }
-func (*browserTun) Name() (string, error)        { return "masquecat-browser", nil }
-func (t *browserTun) Events() <-chan tun.Event   { return t.events }
-func (*browserTun) BatchSize() int               { return 1 }
+
+func (*browserTun) File() *os.File             { return nil }
+func (*browserTun) MTU() (int, error)          { return browserMasqueMTU, nil }
+func (*browserTun) Name() (string, error)      { return "masquecat-browser", nil }
+func (t *browserTun) Events() <-chan tun.Event { return t.events }
+func (*browserTun) BatchSize() int             { return 1 }
 func (t *browserTun) Close() error {
 	t.once.Do(func() { t.cancel(); close(t.events) })
 	return nil
 }
+
 func (t *browserTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	pkt := t.link.ReadContext(t.ctx)
 	if pkt == nil {
@@ -329,6 +338,7 @@ func (t *browserTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	sizes[0] = len(raw)
 	return 1, nil
 }
+
 func (t *browserTun) Write(bufs [][]byte, offset int) (int, error) {
 	written := 0
 	for _, buf := range bufs {
@@ -373,13 +383,16 @@ func newBrowserCore(priv key.NodePrivate, server key.NodePublic, path browserPac
 	})
 	link := channel.New(browserMasqueQueueSize, browserMasqueMTU, "")
 	if err := st.CreateNIC(browserMasqueNIC, link); err != nil {
-		st.Close(); return nil, fmt.Errorf("masquecat: create browser NIC: %v", err)
+		st.Close()
+		return nil, fmt.Errorf("masquecat: create browser NIC: %v", err)
 	}
 	if err := st.SetPromiscuousMode(browserMasqueNIC, true); err != nil {
-		st.Close(); return nil, fmt.Errorf("masquecat: browser promiscuous mode: %v", err)
+		st.Close()
+		return nil, fmt.Errorf("masquecat: browser promiscuous mode: %v", err)
 	}
 	if err := st.SetSpoofing(browserMasqueNIC, true); err != nil {
-		st.Close(); return nil, fmt.Errorf("masquecat: browser spoofing mode: %v", err)
+		st.Close()
+		return nil, fmt.Errorf("masquecat: browser spoofing mode: %v", err)
 	}
 	v4, _ := tcpip.NewSubnet(tcpip.AddrFromSlice(make([]byte, 4)), tcpip.MaskFromBytes(make([]byte, 4)))
 	v6, _ := tcpip.NewSubnet(tcpip.AddrFromSlice(make([]byte, 16)), tcpip.MaskFromBytes(make([]byte, 16)))
@@ -389,53 +402,83 @@ func newBrowserCore(priv key.NodePrivate, server key.NodePublic, path browserPac
 	addr := tcAddrForKey(pub)
 	if err := st.AddProtocolAddress(browserMasqueNIC, tcpip.ProtocolAddress{
 		Protocol: ipv6.ProtocolNumber,
-		AddressWithPrefix: tcpip.AddressWithPrefix{Address: tcpip.AddrFromSlice(addr.AsSlice()), PrefixLen: addr.BitLen()},
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFromSlice(addr.AsSlice()),
+			PrefixLen: addr.BitLen(),
+		},
 	}, stack.AddressProperties{}); err != nil {
-		st.Close(); return nil, fmt.Errorf("masquecat: add browser address: %v", err)
+		st.Close()
+		return nil, fmt.Errorf("masquecat: add browser address: %v", err)
 	}
 
 	btun := newBrowserTun(link)
 	bind := &browserBind{local: pub}
 	bind.SetPath(server, path)
-	wglog := &device.Logger{Verbosef: device.DiscardLogf, Errorf: func(format string, args ...any) { logf("wireguard: "+format, args...) }}
+	wglog := &device.Logger{
+		Verbosef: device.DiscardLogf,
+		Errorf:   func(format string, args ...any) { logf("wireguard: "+format, args...) },
+	}
 	wg := device.NewDevice(btun, bind, wglog)
 	privRaw := priv.Raw32()
 	if err := wg.IpcSet("private_key=" + hex.EncodeToString(privRaw[:]) + "\n\n"); err != nil {
-		wg.Close(); st.Close(); return nil, err
+		wg.Close()
+		st.Close()
+		return nil, err
 	}
 	serverRaw := server.AppendTo(nil)
 	conf := "public_key=" + hex.EncodeToString(serverRaw) + "\n" +
 		"endpoint=" + hex.EncodeToString(serverRaw) + "\n" +
 		"replace_allowed_ips=true\nallowed_ip=::/0\n\n"
 	if err := wg.IpcSet(conf); err != nil {
-		wg.Close(); st.Close(); return nil, err
+		wg.Close()
+		st.Close()
+		return nil, err
 	}
 	if err := wg.Up(); err != nil {
-		wg.Close(); st.Close(); return nil, err
+		wg.Close()
+		st.Close()
+		return nil, err
 	}
 	return &browserCore{pub: pub, stack: st, link: link, tun: btun, bind: bind, wg: wg}, nil
 }
 
-func (c *browserCore) Inject(src key.NodePublic, payload []byte) error { return c.bind.Inject(src, payload) }
+func (c *browserCore) Inject(src key.NodePublic, payload []byte) error {
+	return c.bind.Inject(src, payload)
+}
+
 func (c *browserCore) DialTCP(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 	return gonet.DialContextTCP(ctx, c.stack, tcpip.FullAddress{
-		NIC: browserMasqueNIC, Addr: tcpip.AddrFromSlice(dst.Addr().AsSlice()), Port: dst.Port(),
+		NIC:  browserMasqueNIC,
+		Addr: tcpip.AddrFromSlice(dst.Addr().AsSlice()),
+		Port: dst.Port(),
 	}, ipv6.ProtocolNumber)
 }
+
 func (c *browserCore) DialTCPPort(ctx context.Context, server key.NodePublic, port uint16) (net.Conn, error) {
 	return c.DialTCP(ctx, netip.AddrPortFrom(tcAddrForKey(server), port))
 }
+
 func (c *browserCore) Ping(ctx context.Context) (PingResult, error) {
 	start := time.Now()
 	conn, err := c.DialTCP(ctx, netip.AddrPortFrom(browserMasquePingAddr, browserMasquePingPort))
-	if err != nil { return PingResult{}, err }
+	if err != nil {
+		return PingResult{}, err
+	}
 	_ = conn.Close()
 	return PingResult{Latency: time.Since(start)}, nil
 }
+
 func (c *browserCore) Close() error {
-	if c.wg != nil { c.wg.Close() }
-	if c.link != nil { c.link.Close() }
-	if c.stack != nil { c.stack.Close(); c.stack.Wait() }
+	if c.wg != nil {
+		c.wg.Close()
+	}
+	if c.link != nil {
+		c.link.Close()
+	}
+	if c.stack != nil {
+		c.stack.Close()
+		c.stack.Wait()
+	}
 	return nil
 }
 
@@ -456,7 +499,9 @@ type jsPromiseResult struct {
 
 func jsError(v js.Value) error {
 	if v.Type() == js.TypeObject {
-		if m := v.Get("message"); m.Type() == js.TypeString { return errors.New(m.String()) }
+		if m := v.Get("message"); m.Type() == js.TypeString {
+			return errors.New(m.String())
+		}
 	}
 	return errors.New(js.Global().Get("String").Invoke(v).String())
 }
@@ -464,19 +509,33 @@ func jsError(v js.Value) error {
 func awaitJSPromise(ctx context.Context, promise js.Value) (js.Value, error) {
 	ch := make(chan jsPromiseResult, 1)
 	then := js.FuncOf(func(this js.Value, args []js.Value) any {
-		v := js.Undefined(); if len(args) != 0 { v = args[0] }
-		select { case ch <- jsPromiseResult{value: v}: default: }
+		v := js.Undefined()
+		if len(args) != 0 {
+			v = args[0]
+		}
+		select {
+		case ch <- jsPromiseResult{value: v}:
+		default:
+		}
 		return nil
 	})
 	catch := js.FuncOf(func(this js.Value, args []js.Value) any {
-		err := errors.New("JavaScript promise rejected"); if len(args) != 0 { err = jsError(args[0]) }
-		select { case ch <- jsPromiseResult{err: err}: default: }
+		err := errors.New("JavaScript promise rejected")
+		if len(args) != 0 {
+			err = jsError(args[0])
+		}
+		select {
+		case ch <- jsPromiseResult{err: err}:
+		default:
+		}
 		return nil
 	})
 	promise.Call("then", then).Call("catch", catch)
 	select {
 	case r := <-ch:
-		then.Release(); catch.Release(); return r.value, r.err
+		then.Release()
+		catch.Release()
+		return r.value, r.err
 	case <-ctx.Done():
 		// Keep callbacks alive: the underlying browser Promise is not cancelable
 		// and may settle after the Go operation context has expired.
@@ -507,10 +566,16 @@ func (r *jsLineReader) readLine(ctx context.Context) ([]byte, error) {
 			r.pending = append([]byte(nil), r.pending[i+1:]...)
 			return line, nil
 		}
-		if len(r.pending) > browserControlMax { return nil, errors.New("masquecat: browser control message too large") }
+		if len(r.pending) > browserControlMax {
+			return nil, errors.New("masquecat: browser control message too large")
+		}
 		res, err := awaitJSPromise(ctx, r.reader.Call("read"))
-		if err != nil { return nil, err }
-		if res.Get("done").Bool() { return nil, io.EOF }
+		if err != nil {
+			return nil, err
+		}
+		if res.Get("done").Bool() {
+			return nil, io.EOF
+		}
 		v := res.Get("value")
 		chunk := make([]byte, v.Get("byteLength").Int())
 		js.CopyBytesToGo(chunk, v)
@@ -519,81 +584,118 @@ func (r *jsLineReader) readLine(ctx context.Context) ([]byte, error) {
 }
 
 type browserWebTransportPath struct {
-	local    key.NodePublic
-	wt       js.Value
-	writer   js.Value
-	reader   js.Value
-	writeMu  sync.Mutex
+	local     key.NodePublic
+	wt        js.Value
+	writer    js.Value
+	reader    js.Value
+	writeMu   sync.Mutex
 	closeOnce sync.Once
 }
 
 func browserWebTransportURL(relayURL string) (string, error) {
 	u, err := url.Parse(relayURL)
-	if err != nil { return "", err }
-	if u.Scheme != "https" || u.Host == "" { return "", errors.New("MasqueCat browser relay must be an https URL") }
+	if err != nil {
+		return "", err
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return "", errors.New("MasqueCat browser relay must be an https URL")
+	}
 	u.RawQuery, u.Fragment = "", ""
-	u.Path = strings.TrimSuffix(u.Path, "/") + browserWebTransportPath
+	u.Path = strings.TrimSuffix(u.Path, "/") + browserWebTransportRoute
 	return u.String(), nil
 }
 
 func newBrowserWebTransportPath(ctx context.Context, relayURL string, local key.NodePrivate) (*browserWebTransportPath, error) {
 	ctor := js.Global().Get("WebTransport")
-	if ctor.Type() != js.TypeFunction { return nil, errors.New("this browser does not support WebTransport") }
+	if ctor.Type() != js.TypeFunction {
+		return nil, errors.New("this browser does not support WebTransport")
+	}
 	wtURL, err := browserWebTransportURL(relayURL)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	wt := ctor.New(wtURL)
-	if _, err := awaitJSPromise(ctx, wt.Get("ready")); err != nil { return nil, fmt.Errorf("WebTransport ready: %w", err) }
+	if _, err := awaitJSPromise(ctx, wt.Get("ready")); err != nil {
+		return nil, fmt.Errorf("WebTransport ready: %w", err)
+	}
 	stream, err := awaitJSPromise(ctx, wt.Call("createBidirectionalStream"))
-	if err != nil { wt.Call("close"); return nil, fmt.Errorf("WebTransport control stream: %w", err) }
+	if err != nil {
+		wt.Call("close")
+		return nil, fmt.Errorf("WebTransport control stream: %w", err)
+	}
 	controlWriter := stream.Get("writable").Call("getWriter")
 	controlReader := &jsLineReader{reader: stream.Get("readable").Call("getReader")}
 
 	sendControl := func(msg browserControl) error {
-		b, err := json.Marshal(msg); if err != nil { return err }
+		b, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
 		b = append(b, '\n')
 		return writeJSBytes(ctx, controlWriter, b)
 	}
 	readControl := func() (browserControl, error) {
 		var msg browserControl
-		b, err := controlReader.readLine(ctx); if err != nil { return msg, err }
-		if err := json.Unmarshal(b, &msg); err != nil { return msg, err }
-		if msg.Type == "error" { return msg, errors.New(msg.Error) }
+		b, err := controlReader.readLine(ctx)
+		if err != nil {
+			return msg, err
+		}
+		if err := json.Unmarshal(b, &msg); err != nil {
+			return msg, err
+		}
+		if msg.Type == "error" {
+			return msg, errors.New(msg.Error)
+		}
 		return msg, nil
 	}
 
 	if err := sendControl(browserControl{Type: "hello", Version: browserProtocolVersion, Source: local.Public().String()}); err != nil {
-		wt.Call("close"); return nil, err
+		wt.Call("close")
+		return nil, err
 	}
 	challenge, err := readControl()
-	if err != nil { wt.Call("close"); return nil, err }
+	if err != nil {
+		wt.Call("close")
+		return nil, err
+	}
 	if challenge.Type != "challenge" || challenge.Challenge == "" || challenge.Verifier == "" {
-		wt.Call("close"); return nil, errors.New("invalid MasqueCat browser challenge")
+		wt.Call("close")
+		return nil, errors.New("invalid MasqueCat browser challenge")
 	}
 	var verifier key.NodePublic
 	if err := verifier.UnmarshalText([]byte(challenge.Verifier)); err != nil || verifier.IsZero() {
-		wt.Call("close"); return nil, errors.New("invalid MasqueCat browser verifier")
+		wt.Call("close")
+		return nil, errors.New("invalid MasqueCat browser verifier")
 	}
 	sealed := local.SealTo(verifier, []byte(challenge.Challenge))
 	proof := base64.RawURLEncoding.EncodeToString(sealed)
 	if err := sendControl(browserControl{Type: "proof", Proof: proof}); err != nil {
-		wt.Call("close"); return nil, err
+		wt.Call("close")
+		return nil, err
 	}
 	ready, err := readControl()
-	if err != nil { wt.Call("close"); return nil, err }
+	if err != nil {
+		wt.Call("close")
+		return nil, err
+	}
 	if ready.Type != "ready" || ready.Version != browserProtocolVersion {
-		wt.Call("close"); return nil, errors.New("MasqueCat browser relay did not become ready")
+		wt.Call("close")
+		return nil, errors.New("MasqueCat browser relay did not become ready")
 	}
 
 	datagrams := wt.Get("datagrams")
 	return &browserWebTransportPath{
-		local: local.Public(), wt: wt,
+		local:  local.Public(),
+		wt:     wt,
 		writer: datagrams.Get("writable").Call("getWriter"),
 		reader: datagrams.Get("readable").Call("getReader"),
 	}, nil
 }
 
 func (p *browserWebTransportPath) ForwardPacket(src, dst key.NodePublic, payload []byte) error {
-	if bytes.HasPrefix(payload, browserDiscoMagic) { return nil }
+	if bytes.HasPrefix(payload, browserDiscoMagic) {
+		return nil
+	}
 	b := encodeBrowserMasquePacket(src, dst, payload)
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
@@ -604,22 +706,36 @@ func (p *browserWebTransportPath) ForwardPacket(src, dst key.NodePublic, payload
 func (p *browserWebTransportPath) run(ctx context.Context, local key.NodePublic, onPacket func(key.NodePublic, []byte) error) error {
 	for {
 		res, err := awaitJSPromise(ctx, p.reader.Call("read"))
-		if err != nil { return err }
-		if res.Get("done").Bool() { return io.EOF }
+		if err != nil {
+			return err
+		}
+		if res.Get("done").Bool() {
+			return io.EOF
+		}
 		v := res.Get("value")
 		b := make([]byte, v.Get("byteLength").Int())
 		js.CopyBytesToGo(b, v)
 		pkt, err := decodeBrowserMasquePacket(b)
-		if err != nil || pkt.dst != local || bytes.HasPrefix(pkt.payload, browserDiscoMagic) { continue }
-		if err := onPacket(pkt.src, pkt.payload); err != nil { return err }
+		if err != nil || pkt.dst != local || bytes.HasPrefix(pkt.payload, browserDiscoMagic) {
+			continue
+		}
+		if err := onPacket(pkt.src, pkt.payload); err != nil {
+			return err
+		}
 	}
 }
 
 func (p *browserWebTransportPath) Close() error {
 	p.closeOnce.Do(func() {
-		if p.reader.Truthy() { p.reader.Call("cancel") }
-		if p.writer.Truthy() { p.writer.Call("close") }
-		if p.wt.Truthy() { p.wt.Call("close") }
+		if p.reader.Truthy() {
+			p.reader.Call("cancel")
+		}
+		if p.writer.Truthy() {
+			p.writer.Call("close")
+		}
+		if p.wt.Truthy() {
+			p.wt.Call("close")
+		}
 	})
 	return nil
 }
@@ -649,21 +765,39 @@ func NewBrowserMasqueClient(server MasqueConnBlob, priv key.NodePrivate, logf lo
 func (c *BrowserMasqueClient) ensureStarted(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.started { return nil }
+	if c.started {
+		return nil
+	}
 	ci, err := ParseMasqueConnBlob(c.Server)
-	if err != nil { return err }
-	if ci.RelayURL == "" { return errors.New("MasqueCat browser client currently requires an mc... token with a relay URL") }
-	if c.Key.IsZero() { c.Key = key.NewNode() }
-	logf := c.Logf; if logf == nil { logf = logger.Discard }
+	if err != nil {
+		return err
+	}
+	if ci.RelayURL == "" {
+		return errors.New("MasqueCat browser client currently requires an mc... token with a relay URL")
+	}
+	if c.Key.IsZero() {
+		c.Key = key.NewNode()
+	}
+	logf := c.Logf
+	if logf == nil {
+		logf = logger.Discard
+	}
 	path, err := newBrowserWebTransportPath(ctx, ci.RelayURL, c.Key)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	core, err := newBrowserCore(c.Key, ci.ServerPublic, path, logf)
-	if err != nil { _ = path.Close(); return err }
+	if err != nil {
+		_ = path.Close()
+		return err
+	}
 	child, cancel := context.WithCancel(context.Background())
 	c.serverPublic, c.path, c.core, c.ctx, c.cancel, c.started = ci.ServerPublic, path, core, child, cancel, true
 	go func() {
 		_ = path.run(child, c.Key.Public(), func(src key.NodePublic, payload []byte) error {
-			if src != ci.ServerPublic { return nil }
+			if src != ci.ServerPublic {
+				return nil
+			}
 			return core.Inject(src, payload)
 		})
 	}()
@@ -671,23 +805,40 @@ func (c *BrowserMasqueClient) ensureStarted(ctx context.Context) error {
 }
 
 func (c *BrowserMasqueClient) Ping(ctx context.Context) (PingResult, error) {
-	if err := c.ensureStarted(ctx); err != nil { return PingResult{}, err }
-	c.mu.Lock(); core := c.core; c.mu.Unlock()
+	if err := c.ensureStarted(ctx); err != nil {
+		return PingResult{}, err
+	}
+	c.mu.Lock()
+	core := c.core
+	c.mu.Unlock()
 	return core.Ping(ctx)
 }
 
 func (c *BrowserMasqueClient) DialTCPPort(ctx context.Context, port uint16) (net.Conn, error) {
-	if err := c.ensureStarted(ctx); err != nil { return nil, err }
-	c.mu.Lock(); core, server := c.core, c.serverPublic; c.mu.Unlock()
+	if err := c.ensureStarted(ctx); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	core, server := c.core, c.serverPublic
+	c.mu.Unlock()
 	return core.DialTCPPort(ctx, server, port)
 }
 
 func (c *BrowserMasqueClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.cancel != nil { c.cancel(); c.cancel = nil }
-	if c.path != nil { _ = c.path.Close(); c.path = nil }
-	if c.core != nil { _ = c.core.Close(); c.core = nil }
+	if c.cancel != nil {
+		c.cancel()
+		c.cancel = nil
+	}
+	if c.path != nil {
+		_ = c.path.Close()
+		c.path = nil
+	}
+	if c.core != nil {
+		_ = c.core.Close()
+		c.core = nil
+	}
 	c.started = false
 	return nil
 }
