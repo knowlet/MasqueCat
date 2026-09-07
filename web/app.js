@@ -1,4 +1,4 @@
-// tailcat web app. Plain JavaScript, no build step. The Go side
+// MasqueCat / tailcat web app. Plain JavaScript, no build step. The Go side
 // (main_js.go) exposes globals tailcatListen and tailcatDial.
 
 const CHUNK = 64 * 1024;
@@ -28,18 +28,14 @@ window.addEventListener("unhandledrejection", (e) => window.tcTest.errors.push(S
 const $ = (id) => document.getElementById(id);
 const setStatus = (msg) => { $("status").textContent = msg; };
 
-// pickDERPMapURL returns the explicitly configured DERP map URL, or a
-// same-origin map served by cmd/tailcat-web / an embedding application.
-// There is intentionally no hosted-service fallback.
+// A DERP map is only required by the legacy tc... path. mc... MasqueCat
+// clients use the relay URL embedded in the connection token and WebTransport.
 async function pickDERPMapURL() {
   if (params.get("derpmap")) {
     return new URL(params.get("derpmap"), location.href).toString();
   }
   const sameOrigin = new URL("derpmap.json", location.href).toString();
   try {
-    // Probe with GET, not HEAD: embedding applications commonly expose a
-    // GET-only JSON route. Cancel the probe body once the route is confirmed;
-    // the Go client will fetch and validate the map when it is actually used.
     const resp = await fetch(sameOrigin, { method: "GET" });
     if (resp.ok) {
       if (resp.body) {
@@ -48,7 +44,7 @@ async function pickDERPMapURL() {
       return sameOrigin;
     }
   } catch (e) {}
-  throw new Error("No DERP map configured; provide ?derpmap=https://... or serve /derpmap.json on the same origin");
+  throw new Error("No DERP map configured; legacy tc... mode needs ?derpmap=https://... or /derpmap.json");
 }
 
 let derpMapURL = null;
@@ -57,8 +53,6 @@ try {
   derpMapURL = await pickDERPMapURL();
 } catch (err) {
   derpMapError = err instanceof Error ? err : new Error(String(err));
-  window.tcTest.errors.push(String(derpMapError));
-  setStatus("Configuration error: " + derpMapError.message);
 }
 
 function configuredDERPMapURL() {
@@ -66,6 +60,14 @@ function configuredDERPMapURL() {
     return derpMapURL;
   }
   throw derpMapError || new Error("No DERP map configured");
+}
+
+function dialOptions(addr) {
+  const options = { addr, verbose };
+  if (!addr.startsWith("mc")) {
+    options.derpMapURL = configuredDERPMapURL();
+  }
+  return options;
 }
 
 async function hex(digest) {
@@ -76,9 +78,6 @@ async function sha256Hex(bytes) {
   return hex(await crypto.subtle.digest("SHA-256", bytes));
 }
 
-// countProgress wraps a stream, updating the page's progress bar and
-// status line as bytes pass through: loaded/total drives the bar,
-// wireBytes is the transfer size shown to the user.
 function countProgress(stream, total, wireBytes) {
   const ofMB = wireBytes > 0 ? ` of ${(wireBytes / (1 << 20)).toFixed(1)} MB` : "";
   const bar = $("load-progress");
@@ -98,18 +97,9 @@ function countProgress(stream, total, wireBytes) {
   }));
 }
 
-// fetchWasm fetches the wasm with load progress. Static hosts like
-// GitHub Pages can't do Content-Encoding negotiation (and don't
-// compress wasm), so they serve only the pre-gzipped main.wasm.gz,
-// fetched raw here and decompressed in the page. Servers that
-// negotiate (the webdemo package) don't serve that name; on 404 the
-// plain main.wasm fetch below gets the negotiated encoding, which the
-// browser decompresses itself.
 async function fetchWasm() {
   const gz = await fetch("main.wasm.gz");
   if (gz.ok) {
-    // The counted stream sees compressed bytes, so progress runs
-    // against the compressed size on the wire.
     const size = Number(gz.headers.get("Content-Length")) || 0;
     const wasm = countProgress(gz.body, size, size)
       .pipeThrough(new DecompressionStream("gzip"));
@@ -120,9 +110,6 @@ async function fetchWasm() {
   if (!resp.ok) {
     throw new Error(`fetching main.wasm: ${resp.status}`);
   }
-  // The body stream yields decompressed bytes, so progress is
-  // tracked against the uncompressed size, but the size shown to the
-  // user is what actually crosses the wire.
   const total = Number(resp.headers.get("X-Uncompressed-Size")) ||
     Number(resp.headers.get("Content-Length")) || 0;
   const wireBytes = Number(resp.headers.get("X-Compressed-Size")) ||
@@ -131,8 +118,6 @@ async function fetchWasm() {
   return new Response(counted, { headers: { "Content-Type": "application/wasm" } });
 }
 
-// Boot the wasm module even if DERP-map discovery failed. That keeps the UI
-// alive and lets button handlers surface the configuration error explicitly.
 const ready = new Promise((resolve) => { globalThis.onTailcatReady = resolve; });
 const go = new Go();
 let wasmReady = false;
@@ -151,20 +136,20 @@ if (wasmReady) {
   window.tcTest.ready = true;
   $("load-progress").remove();
   if (derpMapError) {
-    setStatus("Configuration error: " + derpMapError.message);
+    setStatus("Ready for mc… MasqueCat. Legacy tc… listen/send needs a DERP map.");
   } else {
-    setStatus("Ready.");
+    setStatus("Ready. mc… uses MasqueCat/WebTransport; tc… uses legacy DERP.");
   }
   $("listen-btn").disabled = false;
   $("send-btn").disabled = false;
   $("send-text-btn").disabled = false;
 }
 
-// --- Receive side ---
+// --- Receive side (legacy tc... listener for now) ---
 
 async function startListener() {
   $("listen-btn").disabled = true;
-  setStatus("Starting listener…");
+  setStatus("Starting legacy browser listener…");
   const persist = $("persist-key").checked;
   const privateKey = persist ? (localStorage.getItem(KEY_STORAGE) || "") : "";
   try {
@@ -207,9 +192,6 @@ function onConnection(conn) {
   btn.onclick = async () => {
     chose();
     try {
-      // Stream to disk. The pull-based conn.read means the sender
-      // stalls on TCP backpressure while the user picks a file, and
-      // while the disk keeps up; nothing is buffered in memory.
       const handle = await showSaveFilePicker({ suggestedName: "tailcat-download" });
       const w = await handle.createWritable();
       let n = 0;
@@ -229,8 +211,6 @@ function onConnection(conn) {
   };
 }
 
-// receiveText reads the whole incoming stream into memory and shows
-// it as copyable text under the connection's list item.
 async function receiveText(conn, li, progress) {
   try {
     const chunks = [];
@@ -263,9 +243,6 @@ async function receiveText(conn, li, progress) {
   }
 }
 
-// hashSink is the test-mode receiver: instead of the file picker
-// (which needs a user gesture that headless Chrome can't provide), it
-// counts and hashes the received bytes into tcTest.
 async function hashSink(conn) {
   const chunks = [];
   let n = 0;
@@ -288,10 +265,10 @@ async function hashSink(conn) {
 $("listen-btn").onclick = startListener;
 $("copy-addr").onclick = () => navigator.clipboard.writeText($("listen-addr").textContent);
 
-// --- Send side ---
+// --- Send side: mc... => WebTransport/MasqueCat, tc... => legacy DERP ---
 
 async function sendStream(addr, size, readChunk, progressEl) {
-  const conn = await tailcatDial({ addr, derpMapURL: configuredDERPMapURL(), verbose });
+  const conn = await tailcatDial(dialOptions(addr));
   let off = 0;
   while (off < size) {
     const chunk = await readChunk(off, Math.min(CHUNK, size - off));
@@ -300,8 +277,6 @@ async function sendStream(addr, size, readChunk, progressEl) {
     progressEl.textContent = `${off} / ${size} bytes`;
   }
   await conn.closeWrite();
-  // Wait for the receiver's close: like the CLI, the peer's EOF is
-  // the confirmation that everything we sent was delivered.
   while ((await conn.read()) !== null) {}
   conn.close();
   window.tcTest.sentBytes = off;
@@ -317,7 +292,7 @@ $("send-btn").onclick = async () => {
     return;
   }
   $("send-btn").disabled = true;
-  setStatus("Connecting…");
+  setStatus(addr.startsWith("mc") ? "Connecting over MasqueCat WebTransport…" : "Connecting over legacy DERP…");
   try {
     await sendStream(addr, file.size,
       async (off, n) => new Uint8Array(await file.slice(off, off + n).arrayBuffer()),
@@ -338,7 +313,7 @@ $("send-text-btn").onclick = async () => {
     return;
   }
   $("send-text-btn").disabled = true;
-  setStatus("Connecting…");
+  setStatus(addr.startsWith("mc") ? "Connecting over MasqueCat WebTransport…" : "Connecting over legacy DERP…");
   try {
     const data = new TextEncoder().encode(text);
     await sendStream(addr, data.length,
@@ -360,7 +335,6 @@ if (params.get("mode") === "listen") {
   const addr = params.get("addr");
   const size = parseInt(params.get("bytes"), 10);
   const data = new Uint8Array(size);
-  // crypto.getRandomValues caps each call at 64 KiB.
   for (let off = 0; off < size; off += CHUNK) {
     crypto.getRandomValues(data.subarray(off, Math.min(off + CHUNK, size)));
   }
