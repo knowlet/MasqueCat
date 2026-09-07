@@ -50,7 +50,7 @@ func directMasqueCoreHandler(localPriv key.NodePrivate, core *masqueCore, logf l
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		req, ok := parseConnectUDPRequestAny(w, r, tmpl)
+		proxyReq, ok := parseConnectUDPRequestAny(w, masqueProxyRequestForParser(r), tmpl)
 		if !ok {
 			return
 		}
@@ -58,7 +58,7 @@ func directMasqueCoreHandler(localPriv key.NodePrivate, core *masqueCore, logf l
 			http.Error(w, "expected direct MasqueCat path", http.StatusBadRequest)
 			return
 		}
-		target, err := parseMasqueTarget(req.Target)
+		target, err := parseMasqueTarget(proxyReq.Target)
 		if err != nil || target != local {
 			http.Error(w, "CONNECT-UDP target is not this MasqueCat peer", http.StatusNotFound)
 			return
