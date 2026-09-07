@@ -58,7 +58,7 @@ func (r *MasqueRelay) Handler() http.Handler {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		proxyReq, ok := parseConnectUDPRequestAny(w, req, tmpl)
+		proxyReq, ok := parseConnectUDPRequestAny(w, masqueProxyRequestForParser(req), tmpl)
 		if !ok {
 			return
 		}
