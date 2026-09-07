@@ -15,7 +15,7 @@ require (
 	github.com/quic-go/quic-go v0.60.0
 	github.com/quic-go/webtransport-go v0.11.1
 	github.com/tailscale/gliderssh v0.3.4-0.20260716005906-1a0f895faf28
-	github.com/tailscale/wireguard-go v0.0.0-20260821191448-23d18d66172c
+	github.com/tailscale/wireguard-go v0.0.0-20260904023712-e855235c55a2
 	github.com/u-root/u-root v0.14.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
