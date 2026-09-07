@@ -16,10 +16,10 @@ import (
 	"tailscale.com/types/logger"
 )
 
-// masquePacketForwarder is the relay's carrier-neutral outbound side. Native
+// relayPacketForwarder is the relay's carrier-neutral outbound side. Native
 // CONNECT-UDP peers use streamForwarder; browser peers use a WebTransport
 // forwarder. Both carry the same opaque MasqueCat packet framing.
-type masquePacketForwarder interface {
+type relayPacketForwarder interface {
 	ForwardPacket(src, dst key.NodePublic, payload []byte) error
 	String() string
 }
@@ -39,7 +39,7 @@ type MasqueRelay struct {
 
 type relayPeer struct {
 	key key.NodePublic
-	fwd masquePacketForwarder
+	fwd relayPacketForwarder
 }
 
 func (r *MasqueRelay) logf() logger.Logf {
@@ -160,7 +160,7 @@ func (r *MasqueRelay) reserve(k key.NodePublic) (*relayPeer, bool) {
 
 // activate publishes a successfully accepted carrier for a previously reserved
 // peer. Reserved peers with a nil forwarder remain invisible to lookup.
-func (r *MasqueRelay) activate(p *relayPeer, fwd masquePacketForwarder) bool {
+func (r *MasqueRelay) activate(p *relayPeer, fwd relayPacketForwarder) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if p == nil || fwd == nil || r.peers[p.key] != p || p.fwd != nil {
