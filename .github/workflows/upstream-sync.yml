@@ -1,0 +1,38 @@
+name: Upstream sync
+
+on:
+  push:
+    branches:
+      - chore/sync-upstream-20260907
+    paths:
+      - .github/workflows/upstream-sync.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Merge tailscale/tailcat main
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/tailscale/tailcat.git
+          git fetch upstream main
+          git merge --no-edit -X ours upstream/main
+          git push origin HEAD:chore/sync-upstream-20260907
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test merged tree
+        run: go test ./...
+      - name: Vet merged tree
+        run: go vet ./...
+      - name: Build browser demo
+        run: go run ./cmd/tailcat-webdist -o /tmp/masquecat-webdist
