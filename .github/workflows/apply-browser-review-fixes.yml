@@ -1,0 +1,377 @@
+name: apply-browser-review-fixes
+
+on:
+  push:
+    branches: [fix/webdemo-pages-opt-in]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/webdemo-pages-opt-in
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: apply review fixes
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path('masquecat_browser_js.go')
+          s = p.read_text()
+          s = s.replace('\t"sync"\n\t"syscall/js"', '\t"sync"\n\t"sync/atomic"\n\t"syscall/js"')
+          s = s.replace(
+              '\tbrowserFragmentMaxIncompleteSets     = 64\n',
+              '\tbrowserFragmentTTL                   = 30 * time.Second\n'
+              '\tbrowserFragmentMaxIncompleteSets     = 256\n'
+              '\tbrowserFragmentMaxIncompletePerSource = 32\n'
+          )
+          s = s.replace(
+              "\tbrowserFragmentMagic  = [4]byte{'M', 'C', 'F', 1}\n",
+              "\tbrowserFragmentMagic  = [4]byte{'M', 'C', 'F', 1}\n\tbrowserFragmentSeq    atomic.Uint64\n"
+          )
+          s = s.replace(
+              '\treceived int\n}',
+              '\treceived int\n\tupdated  time.Time\n}',
+              1,
+          )
+          marker = '''type browserReassembler struct {
+\tmu   sync.Mutex
+\tsets map[browserFragmentKey]*browserFragmentSet
+}
+'''
+          insert = marker + '''
+func nextBrowserFragmentID() uint64 {
+\treturn uint64(time.Now().UnixNano()) + browserFragmentSeq.Add(1)
+}
+
+func fragmentBrowserWireGuardPacket(payload []byte) ([][]byte, error) {
+\tif len(payload) <= browserFragmentChunkSize {
+\t\treturn nil, nil
+\t}
+\tif len(payload) > browserFragmentMaxSize {
+\t\treturn nil, fmt.Errorf("masquecat: browser WireGuard packet too large to fragment: %d bytes", len(payload))
+\t}
+\tcount := (len(payload) + browserFragmentChunkSize - 1) / browserFragmentChunkSize
+\tif count > int(^uint16(0)) {
+\t\treturn nil, fmt.Errorf("masquecat: browser WireGuard packet needs too many fragments: %d", count)
+\t}
+\tid := nextBrowserFragmentID()
+\tfragments := make([][]byte, 0, count)
+\tfor i, off := 0, 0; off < len(payload); i, off = i+1, off+browserFragmentChunkSize {
+\t\tend := off + browserFragmentChunkSize
+\t\tif end > len(payload) {
+\t\t\tend = len(payload)
+\t\t}
+\t\tfragment := make([]byte, browserFragmentHeaderLen+end-off)
+\t\tcopy(fragment[:4], browserFragmentMagic[:])
+\t\tbinary.BigEndian.PutUint64(fragment[4:12], id)
+\t\tbinary.BigEndian.PutUint16(fragment[12:14], uint16(i))
+\t\tbinary.BigEndian.PutUint16(fragment[14:16], uint16(count))
+\t\tbinary.BigEndian.PutUint32(fragment[16:20], uint32(len(payload)))
+\t\tcopy(fragment[browserFragmentHeaderLen:], payload[off:end])
+\t\tfragments = append(fragments, fragment)
+\t}
+\treturn fragments, nil
+}
+
+func (r *browserReassembler) cleanupLocked(now time.Time) {
+\tfor k, set := range r.sets {
+\t\tif now.Sub(set.updated) >= browserFragmentTTL {
+\t\t\tdelete(r.sets, k)
+\t\t}
+\t}
+}
+
+func (r *browserReassembler) sourceAssemblyCountLocked(src key.NodePublic) int {
+\tcount := 0
+\tfor k := range r.sets {
+\t\tif k.src == src {
+\t\t\tcount++
+\t\t}
+\t}
+\treturn count
+}
+'''
+          if marker not in s:
+              raise SystemExit('browser reassembler marker not found')
+          s = s.replace(marker, insert, 1)
+
+          old = '''\tr.mu.Lock()
+\tdefer r.mu.Unlock()
+\tif r.sets == nil {
+\t\tr.sets = make(map[browserFragmentKey]*browserFragmentSet)
+\t}
+\tk := browserFragmentKey{src: src, id: id}
+\tset := r.sets[k]
+\tif set == nil {
+\t\tif len(r.sets) >= browserFragmentMaxIncompleteSets {
+\t\t\treturn nil, false, errors.New("masquecat: too many incomplete browser WireGuard fragments")
+\t\t}
+\t\tset = &browserFragmentSet{count: count, total: total, parts: make([][]byte, count)}
+\t\tr.sets[k] = set
+\t}
+\tif set.count != count || set.total != total {
+\t\tdelete(r.sets, k)
+\t\treturn nil, false, errors.New("masquecat: inconsistent browser WireGuard fragment metadata")
+\t}
+\tif set.parts[index] == nil {
+\t\tset.parts[index] = append([]byte(nil), chunk...)
+\t\tset.received++
+\t}
+'''
+          new = '''\tnow := time.Now()
+\tr.mu.Lock()
+\tdefer r.mu.Unlock()
+\tif r.sets == nil {
+\t\tr.sets = make(map[browserFragmentKey]*browserFragmentSet)
+\t}
+\tr.cleanupLocked(now)
+\tk := browserFragmentKey{src: src, id: id}
+\tset := r.sets[k]
+\tif set == nil {
+\t\tif r.sourceAssemblyCountLocked(src) >= browserFragmentMaxIncompletePerSource {
+\t\t\treturn nil, false, errors.New("masquecat: too many incomplete browser WireGuard fragments for source")
+\t\t}
+\t\tif len(r.sets) >= browserFragmentMaxIncompleteSets {
+\t\t\treturn nil, false, errors.New("masquecat: too many incomplete browser WireGuard fragments")
+\t\t}
+\t\tset = &browserFragmentSet{count: count, total: total, parts: make([][]byte, count), updated: now}
+\t\tr.sets[k] = set
+\t}
+\tif set.count != count || set.total != total {
+\t\tdelete(r.sets, k)
+\t\treturn nil, false, errors.New("masquecat: inconsistent browser WireGuard fragment metadata")
+\t}
+\texpectedChunkLen := browserFragmentChunkSize
+\tif int(index) == expectedCount-1 {
+\t\texpectedChunkLen = int(total) - (expectedCount-1)*browserFragmentChunkSize
+\t}
+\tif len(chunk) != expectedChunkLen {
+\t\tdelete(r.sets, k)
+\t\treturn nil, false, errors.New("masquecat: invalid browser WireGuard fragment length")
+\t}
+\tif old := set.parts[index]; old != nil {
+\t\tif bytes.Equal(old, chunk) {
+\t\t\treturn nil, false, nil
+\t\t}
+\t\tdelete(r.sets, k)
+\t\treturn nil, false, errors.New("masquecat: conflicting duplicate browser WireGuard fragment")
+\t}
+\tset.parts[index] = append([]byte(nil), chunk...)
+\tset.received++
+\tset.updated = now
+'''
+          if old not in s:
+              raise SystemExit('browser reassembly block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\tfor _, buf := range bufs {
+\t\tif offset < 0 || offset > len(buf) {
+\t\t\treturn errors.New("masquecat: invalid browser WireGuard packet offset")
+\t\t}
+\t\tif err := path.ForwardPacket(b.local, peer, buf[offset:]); err != nil {
+\t\t\treturn err
+\t\t}
+\t}
+'''
+          new = '''\tfor _, buf := range bufs {
+\t\tif offset < 0 || offset > len(buf) {
+\t\t\treturn errors.New("masquecat: invalid browser WireGuard packet offset")
+\t\t}
+\t\tpayload := buf[offset:]
+\t\tfragments, err := fragmentBrowserWireGuardPacket(payload)
+\t\tif err != nil {
+\t\t\treturn err
+\t\t}
+\t\tif len(fragments) == 0 {
+\t\t\tif err := path.ForwardPacket(b.local, peer, payload); err != nil {
+\t\t\t\treturn err
+\t\t\t}
+\t\t\tcontinue
+\t\t}
+\t\tfor _, fragment := range fragments {
+\t\t\tif err := path.ForwardPacket(b.local, peer, fragment); err != nil {
+\t\t\t\treturn err
+\t\t\t}
+\t\t}
+\t}
+'''
+          if old not in s:
+              raise SystemExit('browser send block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\tcase <-ctx.Done():
+\t\t// Keep callbacks alive: the underlying browser Promise is not cancelable
+\t\t// and may settle after the Go operation context has expired.
+\t\treturn js.Undefined(), ctx.Err()
+'''
+          new = '''\tcase <-ctx.Done():
+\t\t// The browser Promise itself is not cancelable. Keep the callbacks alive
+\t\t// until it eventually settles, then release both JS functions so repeated
+\t\t// timed-out attempts don't retain Go channels and callback closures.
+\t\tgo func() {
+\t\t\t<-ch
+\t\t\tthen.Release()
+\t\t\tcatch.Release()
+\t\t}()
+\t\treturn js.Undefined(), ctx.Err()
+'''
+          if old not in s:
+              raise SystemExit('await promise timeout block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''\tchild, cancel := context.WithCancel(context.Background())
+\tc.serverPublic, c.path, c.core, c.ctx, c.cancel, c.started = ci.ServerPublic, path, core, child, cancel, true
+\tgo func() {
+\t\t_ = path.run(child, c.Key.Public(), func(src key.NodePublic, payload []byte) error {
+\t\t\tif src != ci.ServerPublic {
+\t\t\t\treturn nil
+\t\t\t}
+\t\t\treturn core.Inject(src, payload)
+\t\t})
+\t}()
+'''
+          new = '''\tchild, cancel := context.WithCancel(context.Background())
+\tlocalPublic := c.Key.Public()
+\tc.serverPublic, c.path, c.core, c.ctx, c.cancel, c.started = ci.ServerPublic, path, core, child, cancel, true
+\tgo func() {
+\t\terr := path.run(child, localPublic, func(src key.NodePublic, payload []byte) error {
+\t\t\tif src != ci.ServerPublic {
+\t\t\t\treturn nil
+\t\t\t}
+\t\t\treturn core.Inject(src, payload)
+\t\t})
+\t\tif err != nil && !errors.Is(err, context.Canceled) {
+\t\t\tlogf("MasqueCat browser WebTransport receive loop ended: %v", err)
+\t\t}
+\t\tc.mu.Lock()
+\t\tif c.path != path || c.core != core {
+\t\t\tc.mu.Unlock()
+\t\t\treturn
+\t\t}
+\t\tc.started = false
+\t\tc.serverPublic = key.NodePublic{}
+\t\tc.path = nil
+\t\tc.core = nil
+\t\tc.ctx = nil
+\t\tc.cancel = nil
+\t\tc.mu.Unlock()
+\t\tcancel()
+\t\t_ = path.Close()
+\t\t_ = core.Close()
+\t}()
+'''
+          if old not in s:
+              raise SystemExit('browser receive loop block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''func (c *BrowserMasqueClient) Close() error {
+\tc.mu.Lock()
+\tdefer c.mu.Unlock()
+\tif c.cancel != nil {
+\t\tc.cancel()
+\t\tc.cancel = nil
+\t}
+\tif c.path != nil {
+\t\t_ = c.path.Close()
+\t\tc.path = nil
+\t}
+\tif c.core != nil {
+\t\t_ = c.core.Close()
+\t\tc.core = nil
+\t}
+\tc.started = false
+\treturn nil
+}
+'''
+          new = '''func (c *BrowserMasqueClient) Close() error {
+\tc.mu.Lock()
+\tcancel, path, core := c.cancel, c.path, c.core
+\tc.started = false
+\tc.serverPublic = key.NodePublic{}
+\tc.cancel = nil
+\tc.path = nil
+\tc.core = nil
+\tc.ctx = nil
+\tc.mu.Unlock()
+\tif cancel != nil {
+\t\tcancel()
+\t}
+\tif path != nil {
+\t\t_ = path.Close()
+\t}
+\tif core != nil {
+\t\t_ = core.Close()
+\t}
+\treturn nil
+}
+'''
+          if old not in s:
+              raise SystemExit('browser close block not found')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          p = Path('masquecat_webtransport.go')
+          s = p.read_text()
+          old = '''\tu, err := url.Parse(origin)
+\treturn err == nil && strings.EqualFold(u.Host, req.Host)
+'''
+          new = '''\tu, err := url.Parse(origin)
+\treturn err == nil && strings.EqualFold(u.Scheme, "https") && strings.EqualFold(u.Host, req.Host)
+'''
+          if old not in s:
+              raise SystemExit('same-origin block not found')
+          p.write_text(s.replace(old, new, 1))
+
+          p = Path('web/main_js.go')
+          s = p.read_text()
+          old = '''\t\tif derpMapURL == "" {
+\t\t\treturn nil, errors.New("derpMapURL is required for legacy tc... addresses")
+\t\t}
+'''
+          if old not in s:
+              raise SystemExit('legacy DERP guard not found')
+          p.write_text(s.replace(old, '', 1))
+
+          doc_note = '''
+## Browser WebTransport origin
+
+Browser MasqueCat peers connect through WebTransport and browsers send an `Origin` header. By default the relay accepts only HTTPS same-origin requests. If the demo is hosted on a different origin, start the relay with the exact demo origin, for example:
+
+```sh
+masquecat-relay -listen :443 -cert cert.pem -key key.pem -web-origin https://demo.example.com
+```
+
+`-web-origin '*'` disables the Origin allowlist and permits any website to initiate a WebTransport handshake. Node-key challenge/response authentication still applies, but `*` should only be used when cross-site access is intentionally required.
+'''
+          for name in ['cmd/masquecat-relay/README.md', 'docs/masquecat-relay-deployment.md']:
+              p = Path(name)
+              s = p.read_text()
+              if '## Browser WebTransport origin' not in s:
+                  s = s.rstrip() + '\n' + doc_note
+              p.write_text(s)
+          PY
+          gofmt -w masquecat_browser_js.go masquecat_webtransport.go web/main_js.go
+      - name: refresh generated module metadata
+        run: make tidy
+      - name: smoke compile
+        run: |
+          go build ./...
+          GOOS=js GOARCH=wasm go build -o /tmp/tailcat-web.wasm ./web
+      - name: commit fixes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add masquecat_browser_js.go masquecat_webtransport.go web/main_js.go cmd/masquecat-relay/README.md docs/masquecat-relay-deployment.md flake.nix flakehashes.json go.mod go.sum
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'fix(web): address browser transport review'
+          git push origin HEAD:fix/webdemo-pages-opt-in
