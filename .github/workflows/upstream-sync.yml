@@ -17,6 +17,159 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Repair CLI merge seams
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git remote add upstream https://github.com/tailscale/tailcat.git
+          git fetch upstream main
+          git show upstream/main:cmd/tailcat/cp.go > cmd/tailcat/cp.go
+          git show upstream/main:cmd/tailcat/ssh.go > cmd/tailcat/ssh.go
+          git show upstream/main:cmd/tailcat/ls.go > cmd/tailcat/ls.go
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text()
+              if s.count(old) != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, got {s.count(old)}: {old!r}")
+              p.write_text(s.replace(old, new, 1))
+
+          # Keep upstream's shell-safe ProxyCommand construction, and add the
+          # MasqueCat development TLS flag as one more properly quoted argv.
+          replace_once(
+              "cmd/tailcat/ssh.go",
+              '\tif derpMapURL != tailcat.DefaultDERPMapURL {\n\t\targs = append(args, "--derpmap-url="+derpMapURL)\n\t}\n\targs = append(args, addr, portOrIPPort)\n',
+              '\tif derpMapURL != tailcat.DefaultDERPMapURL {\n\t\targs = append(args, "--derpmap-url="+derpMapURL)\n\t}\n\tif flagMasqueInsecureSkipVerify != nil && *flagMasqueInsecureSkipVerify {\n\t\targs = append(args, "--insecure-skip-verify")\n\t}\n\targs = append(args, addr, portOrIPPort)\n',
+          )
+
+          # ls only needs TCP, so retain MasqueCat's transport-neutral client.
+          replace_once(
+              "cmd/tailcat/ls.go",
+              '\tcl := newClient(logf, tailcatAddrArg(host), clientKey())\n\tdefer cl.Close()\n',
+              '\tcl := newCLITCPClient(logf, tailcatAddrArg(host), clientKey())\n\tdefer closeCLITCPClient(cl)\n',
+          )
+
+          p = Path("cmd/tailcat/tailcat.go")
+          s = p.read_text()
+
+          # The first merge kept half of the old addrBlobArg body inside the
+          # new upstream tailcatAddrArg helper. Restore upstream's classifier,
+          # extended to validate mc... tokens and protect them from DNS leaks.
+          start = s.index('// tailcatAddrArg interprets')
+          end = s.index('// validateDNSName validates', start)
+          helper = r'''// tailcatAddrArg interprets a CLI destination argument as either a
+          // "tc"/"mc"-prefixed tailcat address or a DNS name whose "tailcat=" TXT
+          // record holds one. It exits the process on failure.
+          func tailcatAddrArg(arg string) tailcat.Addr {
+          	addr, dnsName, err := classifyTailcatAddrArg(arg)
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	if dnsName != "" {
+          		var r net.Resolver
+          		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+          		defer cancel()
+          		txts, err := r.LookupTXT(ctx, dnsName)
+          		if err != nil {
+          			log.Fatalf("looking up TXT record for %q: %v", dnsName, err)
+          		}
+          		for _, txt := range txts {
+          			if suf, ok := strings.CutPrefix(txt, "tailcat="); ok {
+          				return tailcat.Addr(strings.TrimSpace(suf))
+          			}
+          		}
+          		log.Fatalf("no \"tailcat=\" TXT record found for %q", dnsName)
+          	}
+          	return addr
+          }
+
+          // addrBlobArg is the pre-Addr-rename compatibility name used by the
+          // MasqueCat dispatch seams. ConnBlob is now an upstream alias of Addr.
+          func addrBlobArg(arg string) tailcat.Addr { return tailcatAddrArg(arg) }
+
+          // classifyTailcatAddrArg classifies arg without performing a DNS lookup.
+          func classifyTailcatAddrArg(arg string) (addr tailcat.Addr, dnsName string, err error) {
+          	if isMasqueBlob(arg) {
+          		if _, err := tailcat.ParseMasqueConnBlob(tailcat.MasqueConnBlob(arg)); err != nil {
+          			return "", "", fmt.Errorf("invalid MasqueCat address %q: %w", arg, err)
+          		}
+          		return tailcat.Addr(arg), "", nil
+          	}
+          	addr = tailcat.Addr(arg)
+          	if _, err := tailcat.ParseAddr(addr); err == nil {
+          		return addr, "", nil
+          	}
+          	if !strings.Contains(arg, ".") {
+          		return "", "", fmt.Errorf("argument %q is neither a valid tailcat address nor a DNS name", arg)
+          	}
+
+          	name := strings.TrimSuffix(arg, ".")
+          	for label := range strings.SplitSeq(name, ".") {
+          		if _, err := tailcat.ParseAddr(tailcat.Addr(label)); err == nil {
+          			return "", "", errors.New("argument contains a valid tailcat address as a DNS label; refusing DNS lookup")
+          		}
+          		if isMasqueBlob(label) {
+          			if _, err := tailcat.ParseMasqueConnBlob(tailcat.MasqueConnBlob(label)); err == nil {
+          				return "", "", errors.New("argument contains a valid MasqueCat address as a DNS label; refusing DNS lookup")
+          			}
+          		}
+          	}
+          	if err := validateDNSName(name); err != nil {
+          		return "", "", fmt.Errorf("invalid DNS name %q: %w", arg, err)
+          	}
+          	return "", arg, nil
+          }
+
+          '''
+          # De-indent the raw block's presentation indentation.
+          helper = re.sub(r'(?m)^          ', '', helper)
+          s = s[:start] + helper + s[end:]
+
+          if 'func splitExecArgs(args []string)' not in s:
+              marker = 'func server(logf logger.Logf, serveSpec string) {'
+              split = r'''// splitExecArgs separates the positional arguments ff left over
+          // into those before and after a "--" separator, the latter being the
+          // command for the exec service and the SSH services' forced command.
+          func splitExecArgs(args []string) (positional, execArgs []string) {
+          	i := slices.Index(os.Args, "--")
+          	if i < 0 {
+          		return args, nil
+          	}
+          	execArgs = os.Args[i+1:]
+          	positional = args[:len(args)-len(execArgs)]
+          	if n := len(positional); n > 0 && positional[n-1] == "--" {
+          		positional = positional[:n-1]
+          	}
+          	return positional, execArgs
+          }
+
+          '''
+              split = re.sub(r'(?m)^          ', '', split)
+              if marker not in s:
+                  raise SystemExit('server signature marker not found')
+              s = s.replace(marker, split + 'func server(logf logger.Logf, serveSpec string, execArgs []string) {', 1)
+          else:
+              s = s.replace('func server(logf logger.Logf, serveSpec string) {', 'func server(logf logger.Logf, serveSpec string, execArgs []string) {', 1)
+          s = s.replace('masqueServer(logf, serveSpec)', 'masqueServer(logf, serveSpec, execArgs)', 1)
+          p.write_text(s)
+
+          replace_once(
+              "cmd/tailcat/masquecat_cli.go",
+              'func masqueServer(logf logger.Logf, serveSpec string) error {',
+              'func masqueServer(logf logger.Logf, serveSpec string, execArgs []string) error {',
+          )
+          PY
+          gofmt -w cmd/tailcat/cp.go cmd/tailcat/ssh.go cmd/tailcat/ls.go cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cmd/tailcat/cp.go cmd/tailcat/ssh.go cmd/tailcat/ls.go cmd/tailcat/tailcat.go cmd/tailcat/masquecat_cli.go
+          if ! git diff --cached --quiet; then
+            git commit -m "fix(cli): reconcile upstream command changes with MASQUE transport"
+            git push origin HEAD:chore/sync-upstream-20260907
+          fi
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -33,7 +186,7 @@ jobs:
             git push origin HEAD:chore/sync-upstream-20260907
           fi
       - name: Test merged tree
-        run: go test ./...
+        run: go test -count=1 -timeout 600s ./...
       - name: Vet merged tree
         run: go vet ./...
       - name: Build browser demo
