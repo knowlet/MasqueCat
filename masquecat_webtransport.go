@@ -17,8 +17,8 @@ import (
 	"sync"
 	"time"
 
-	webtransport "github.com/quic-go/webtransport-go"
 	"github.com/quic-go/quic-go/http3"
+	webtransport "github.com/quic-go/webtransport-go"
 	"tailscale.com/types/key"
 )
 
@@ -197,7 +197,7 @@ func sameOriginBrowserRequest(req *http.Request) bool {
 		return true
 	}
 	u, err := url.Parse(origin)
-	return err == nil && strings.EqualFold(u.Host, req.Host)
+	return err == nil && strings.EqualFold(u.Scheme, "https") && strings.EqualFold(u.Host, req.Host)
 }
 
 func browserOriginChecker(allowedOrigin string) func(*http.Request) bool {

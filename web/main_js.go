@@ -143,9 +143,6 @@ func tailcatDial(this js.Value, args []js.Value) any {
 			return makeJSConn(c, port, func() { _ = cl.Close() }), nil
 		}
 
-		if derpMapURL == "" {
-			return nil, errors.New("derpMapURL is required for legacy tc... addresses")
-		}
 		cl := &tailcat.Client{
 			Server:     tailcat.ConnBlob(addr),
 			Key:        priv,

@@ -505,3 +505,13 @@ Before calling a relay deployment production-ready, at minimum require:
 - [`cmd/masquecat-relay/README.md`](../cmd/masquecat-relay/README.md) — command quick start and flags.
 - [`masquecat.md`](./masquecat.md) — overall MasqueCat architecture and Go API.
 - [`benchmarks.md`](./benchmarks.md) — framing benchmark scope and results.
+
+## Browser WebTransport origin
+
+Browser MasqueCat peers connect through WebTransport and browsers send an `Origin` header. By default the relay accepts only HTTPS same-origin requests. If the demo is hosted on a different origin, start the relay with the exact demo origin, for example:
+
+```sh
+masquecat-relay -listen :443 -cert cert.pem -key key.pem -web-origin https://demo.example.com
+```
+
+`-web-origin '*'` disables the Origin allowlist and permits any website to initiate a WebTransport handshake. Node-key challenge/response authentication still applies, but `*` should only be used when cross-site access is intentionally required.

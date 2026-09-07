@@ -18,6 +18,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall/js"
 	"time"
 
@@ -41,25 +42,28 @@ import (
 )
 
 const (
-	browserMasqueMTU                    = 1000
-	browserMasqueQueueSize              = 512
-	browserMasqueNIC       tcpip.NICID  = 1
-	browserMasquePingPort  uint16       = 65535
-	browserMasquePacketVersion          = byte(1)
-	browserNodePublicTextPrefix          = "nodekey:"
-	browserWebTransportRoute            = "/.well-known/masquecat/webtransport"
-	browserControlMax                    = 8 << 10
-	browserProtocolVersion               = 1
-	browserFragmentHeaderLen             = 20
-	browserFragmentMaxSize               = 64 << 10
-	browserFragmentChunkSize             = 1000
-	browserFragmentMaxIncompleteSets     = 64
+	browserMasqueMTU                                  = 1000
+	browserMasqueQueueSize                            = 512
+	browserMasqueNIC                      tcpip.NICID = 1
+	browserMasquePingPort                 uint16      = 65535
+	browserMasquePacketVersion                        = byte(1)
+	browserNodePublicTextPrefix                       = "nodekey:"
+	browserWebTransportRoute                          = "/.well-known/masquecat/webtransport"
+	browserControlMax                                 = 8 << 10
+	browserProtocolVersion                            = 1
+	browserFragmentHeaderLen                          = 20
+	browserFragmentMaxSize                            = 64 << 10
+	browserFragmentChunkSize                          = 1000
+	browserFragmentTTL                                = 30 * time.Second
+	browserFragmentMaxIncompleteSets                  = 256
+	browserFragmentMaxIncompletePerSource             = 32
 )
 
 var (
 	browserMasquePingAddr = netip.MustParseAddr("fd00:7461:696c:6361:7400:7069:6e67:1")
 	browserDiscoMagic     = []byte(disco.Magic)
 	browserFragmentMagic  = [4]byte{'M', 'C', 'F', 1}
+	browserFragmentSeq    atomic.Uint64
 )
 
 type browserMasquePacket struct {
@@ -102,11 +106,64 @@ type browserFragmentSet struct {
 	total    uint32
 	parts    [][]byte
 	received int
+	updated  time.Time
 }
 
 type browserReassembler struct {
 	mu   sync.Mutex
 	sets map[browserFragmentKey]*browserFragmentSet
+}
+
+func nextBrowserFragmentID() uint64 {
+	return uint64(time.Now().UnixNano()) + browserFragmentSeq.Add(1)
+}
+
+func fragmentBrowserWireGuardPacket(payload []byte) ([][]byte, error) {
+	if len(payload) <= browserFragmentChunkSize {
+		return nil, nil
+	}
+	if len(payload) > browserFragmentMaxSize {
+		return nil, fmt.Errorf("masquecat: browser WireGuard packet too large to fragment: %d bytes", len(payload))
+	}
+	count := (len(payload) + browserFragmentChunkSize - 1) / browserFragmentChunkSize
+	if count > int(^uint16(0)) {
+		return nil, fmt.Errorf("masquecat: browser WireGuard packet needs too many fragments: %d", count)
+	}
+	id := nextBrowserFragmentID()
+	fragments := make([][]byte, 0, count)
+	for i, off := 0, 0; off < len(payload); i, off = i+1, off+browserFragmentChunkSize {
+		end := off + browserFragmentChunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		fragment := make([]byte, browserFragmentHeaderLen+end-off)
+		copy(fragment[:4], browserFragmentMagic[:])
+		binary.BigEndian.PutUint64(fragment[4:12], id)
+		binary.BigEndian.PutUint16(fragment[12:14], uint16(i))
+		binary.BigEndian.PutUint16(fragment[14:16], uint16(count))
+		binary.BigEndian.PutUint32(fragment[16:20], uint32(len(payload)))
+		copy(fragment[browserFragmentHeaderLen:], payload[off:end])
+		fragments = append(fragments, fragment)
+	}
+	return fragments, nil
+}
+
+func (r *browserReassembler) cleanupLocked(now time.Time) {
+	for k, set := range r.sets {
+		if now.Sub(set.updated) >= browserFragmentTTL {
+			delete(r.sets, k)
+		}
+	}
+}
+
+func (r *browserReassembler) sourceAssemblyCountLocked(src key.NodePublic) int {
+	count := 0
+	for k := range r.sets {
+		if k.src == src {
+			count++
+		}
+	}
+	return count
 }
 
 func (r *browserReassembler) Push(src key.NodePublic, payload []byte) ([]byte, bool, error) {
@@ -129,28 +186,47 @@ func (r *browserReassembler) Push(src key.NodePublic, payload []byte) ([]byte, b
 		return nil, false, errors.New("masquecat: inconsistent browser WireGuard fragment count")
 	}
 
+	now := time.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.sets == nil {
 		r.sets = make(map[browserFragmentKey]*browserFragmentSet)
 	}
+	r.cleanupLocked(now)
 	k := browserFragmentKey{src: src, id: id}
 	set := r.sets[k]
 	if set == nil {
+		if r.sourceAssemblyCountLocked(src) >= browserFragmentMaxIncompletePerSource {
+			return nil, false, errors.New("masquecat: too many incomplete browser WireGuard fragments for source")
+		}
 		if len(r.sets) >= browserFragmentMaxIncompleteSets {
 			return nil, false, errors.New("masquecat: too many incomplete browser WireGuard fragments")
 		}
-		set = &browserFragmentSet{count: count, total: total, parts: make([][]byte, count)}
+		set = &browserFragmentSet{count: count, total: total, parts: make([][]byte, count), updated: now}
 		r.sets[k] = set
 	}
 	if set.count != count || set.total != total {
 		delete(r.sets, k)
 		return nil, false, errors.New("masquecat: inconsistent browser WireGuard fragment metadata")
 	}
-	if set.parts[index] == nil {
-		set.parts[index] = append([]byte(nil), chunk...)
-		set.received++
+	expectedChunkLen := browserFragmentChunkSize
+	if int(index) == expectedCount-1 {
+		expectedChunkLen = int(total) - (expectedCount-1)*browserFragmentChunkSize
 	}
+	if len(chunk) != expectedChunkLen {
+		delete(r.sets, k)
+		return nil, false, errors.New("masquecat: invalid browser WireGuard fragment length")
+	}
+	if old := set.parts[index]; old != nil {
+		if bytes.Equal(old, chunk) {
+			return nil, false, nil
+		}
+		delete(r.sets, k)
+		return nil, false, errors.New("masquecat: conflicting duplicate browser WireGuard fragment")
+	}
+	set.parts[index] = append([]byte(nil), chunk...)
+	set.received++
+	set.updated = now
 	if set.received != int(count) {
 		return nil, false, nil
 	}
@@ -265,8 +341,21 @@ func (b *browserBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 		if offset < 0 || offset > len(buf) {
 			return errors.New("masquecat: invalid browser WireGuard packet offset")
 		}
-		if err := path.ForwardPacket(b.local, peer, buf[offset:]); err != nil {
+		payload := buf[offset:]
+		fragments, err := fragmentBrowserWireGuardPacket(payload)
+		if err != nil {
 			return err
+		}
+		if len(fragments) == 0 {
+			if err := path.ForwardPacket(b.local, peer, payload); err != nil {
+				return err
+			}
+			continue
+		}
+		for _, fragment := range fragments {
+			if err := path.ForwardPacket(b.local, peer, fragment); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -537,8 +626,14 @@ func awaitJSPromise(ctx context.Context, promise js.Value) (js.Value, error) {
 		catch.Release()
 		return r.value, r.err
 	case <-ctx.Done():
-		// Keep callbacks alive: the underlying browser Promise is not cancelable
-		// and may settle after the Go operation context has expired.
+		// The browser Promise itself is not cancelable. Keep the callbacks alive
+		// until it eventually settles, then release both JS functions so repeated
+		// timed-out attempts don't retain Go channels and callback closures.
+		go func() {
+			<-ch
+			then.Release()
+			catch.Release()
+		}()
 		return js.Undefined(), ctx.Err()
 	}
 }
@@ -792,14 +887,33 @@ func (c *BrowserMasqueClient) ensureStarted(ctx context.Context) error {
 		return err
 	}
 	child, cancel := context.WithCancel(context.Background())
+	localPublic := c.Key.Public()
 	c.serverPublic, c.path, c.core, c.ctx, c.cancel, c.started = ci.ServerPublic, path, core, child, cancel, true
 	go func() {
-		_ = path.run(child, c.Key.Public(), func(src key.NodePublic, payload []byte) error {
+		err := path.run(child, localPublic, func(src key.NodePublic, payload []byte) error {
 			if src != ci.ServerPublic {
 				return nil
 			}
 			return core.Inject(src, payload)
 		})
+		if err != nil && !errors.Is(err, context.Canceled) {
+			logf("MasqueCat browser WebTransport receive loop ended: %v", err)
+		}
+		c.mu.Lock()
+		if c.path != path || c.core != core {
+			c.mu.Unlock()
+			return
+		}
+		c.started = false
+		c.serverPublic = key.NodePublic{}
+		c.path = nil
+		c.core = nil
+		c.ctx = nil
+		c.cancel = nil
+		c.mu.Unlock()
+		cancel()
+		_ = path.Close()
+		_ = core.Close()
 	}()
 	return nil
 }
@@ -826,19 +940,22 @@ func (c *BrowserMasqueClient) DialTCPPort(ctx context.Context, port uint16) (net
 
 func (c *BrowserMasqueClient) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.cancel != nil {
-		c.cancel()
-		c.cancel = nil
-	}
-	if c.path != nil {
-		_ = c.path.Close()
-		c.path = nil
-	}
-	if c.core != nil {
-		_ = c.core.Close()
-		c.core = nil
-	}
+	cancel, path, core := c.cancel, c.path, c.core
 	c.started = false
+	c.serverPublic = key.NodePublic{}
+	c.cancel = nil
+	c.path = nil
+	c.core = nil
+	c.ctx = nil
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if path != nil {
+		_ = path.Close()
+	}
+	if core != nil {
+		_ = core.Close()
+	}
 	return nil
 }

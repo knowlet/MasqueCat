@@ -265,3 +265,13 @@ routing identities are authenticated.
 See [`docs/masquecat-relay-deployment.md`](../../docs/masquecat-relay-deployment.md)
 for DNS, firewall, systemd, container, load-balancer, troubleshooting, trust
 model, and production-readiness notes.
+
+## Browser WebTransport origin
+
+Browser MasqueCat peers connect through WebTransport and browsers send an `Origin` header. By default the relay accepts only HTTPS same-origin requests. If the demo is hosted on a different origin, start the relay with the exact demo origin, for example:
+
+```sh
+masquecat-relay -listen :443 -cert cert.pem -key key.pem -web-origin https://demo.example.com
+```
+
+`-web-origin '*'` disables the Origin allowlist and permits any website to initiate a WebTransport handshake. Node-key challenge/response authentication still applies, but `*` should only be used when cross-site access is intentionally required.
