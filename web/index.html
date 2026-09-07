@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>tailcat</title>
+<title>MasqueCat Web</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
   body { font-family: system-ui, sans-serif; max-width: 40rem; margin: 2rem auto; padding: 0 1rem; }
@@ -20,23 +20,23 @@
 </style>
 </head>
 <body>
-<h1>tailcat</h1>
-<p class="notice">This is an experimental demo of
-<a href="https://github.com/tailscale/tailcat/">tailcat</a> in the
-browser. Unlike the normal CLI and non-JS library versions, all of
-its traffic is relayed through DERP
-servers; browsers can't make tailcat's direct peer-to-peer
-connections without WebRTC support
-(<a href="https://github.com/tailscale/tailcat/issues/4">issue #4</a>).</p>
+<h1>MasqueCat Web</h1>
+<p class="notice"><strong>Experimental browser client.</strong>
+Paste an <code>mc…</code> token containing a relay URL to send through
+<strong>WebTransport → MasqueCat relay → WireGuard/gVisor</strong>. The browser
+cannot originate arbitrary HTTP/3 CONNECT-UDP, so WebTransport is the browser
+entry into the same MasqueCat relay peer registry. Legacy <code>tc…</code>
+DERP/WebSocket remains available for compatibility.</p>
 <p id="status">Loading WebAssembly…</p>
 <progress id="load-progress" max="1" value="0"></progress>
 
 <section id="receive">
-  <h2>Receive</h2>
-  <p>Create a listener, share its address out of band, then the other
-  side sends with this page or the CLI: <code>tailcat &lt;addr&gt; &lt; file</code></p>
+  <h2>Receive (legacy tc…)</h2>
+  <p>Browser-side MasqueCat listener mode is not implemented yet. This listener
+  keeps the upstream Tailcat DERP/WebSocket path for regression testing and
+  compatibility.</p>
   <label><input type="checkbox" id="persist-key"> Reuse a persistent address (stored in this browser)</label>
-  <p><button id="listen-btn" disabled>Create listener</button></p>
+  <p><button id="listen-btn" disabled>Create legacy listener</button></p>
   <div id="listen-info" class="hidden">
     Share this address:
     <span id="listen-addr"></span>
@@ -47,9 +47,9 @@ connections without WebRTC support
 
 <section id="send">
   <h2>Send</h2>
-  <p>Paste the receiver's address. The receiver can be this page on
-  another machine, or the CLI: <code>tailcat &gt; file</code></p>
-  <p><input type="text" id="send-addr" size="40" placeholder="tc…"></p>
+  <p>Paste a MasqueCat <code>mc…</code> token to use WebTransport, or a legacy
+  Tailcat <code>tc…</code> address to use DERP.</p>
+  <p><input type="text" id="send-addr" size="40" placeholder="mc… or tc…"></p>
   <p><input type="file" id="send-file">
   <button id="send-btn" disabled>Send file</button></p>
   <p><textarea id="send-text" rows="4" placeholder="…or type text to send"></textarea></p>
