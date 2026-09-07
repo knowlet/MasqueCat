@@ -1,4 +1,4 @@
-name: Upstream sync
+name: Upstream sync verify
 
 on:
   push:
@@ -11,33 +11,27 @@ permissions:
   contents: write
 
 jobs:
-  sync:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - name: Merge tailscale/tailcat main
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/tailscale/tailcat.git
-          git fetch upstream main
-          git merge --no-edit -X ours upstream/main
-          # The repository token used by Actions cannot create/update workflow
-          # files. Carry every upstream change in the merge commit except the
-          # newly-added Nix workflow; the connector adds that exact file back
-          # in a follow-up commit after this merge is pushed.
-          if git ls-files --error-unmatch .github/workflows/nix.yml >/dev/null 2>&1; then
-            git rm .github/workflows/nix.yml
-            git commit --amend --no-edit
-          fi
-          git push origin HEAD:chore/sync-upstream-20260907
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      - name: Normalize merged Go modules
+        shell: bash
+        run: |
+          set -euxo pipefail
+          go mod tidy
+          if ! git diff --quiet -- go.mod go.sum; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add go.mod go.sum
+            git commit -m "fix(deps): tidy modules after upstream sync"
+            git push origin HEAD:chore/sync-upstream-20260907
+          fi
       - name: Test merged tree
         run: go test ./...
       - name: Vet merged tree
