@@ -1,12 +1,10 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-// The tailcat web app is the WebAssembly (js/wasm) build of tailcat
-// for browsers. It exposes two global JavaScript functions,
-// tailcatListen and tailcatDial, that app.js uses to implement
-// file sharing. The browser reaches DERP relays over WebSockets,
-// which tailscale.com's derphttp package does automatically under
-// GOOS=js.
+// The tailcat web app is the WebAssembly (js/wasm) build used by the browser
+// demo. Legacy tc... addresses still use DERP over WebSockets. MasqueCat mc...
+// addresses use BrowserMasqueClient: WebTransport to a MasqueCat relay with the
+// same userspace WireGuard + gVisor application data plane as native peers.
 package main
 
 import (
@@ -17,6 +15,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"syscall/js"
 	"time"
 
@@ -34,24 +33,9 @@ func main() {
 	select {}
 }
 
-// tailcatListen starts a tailcat server in the browser.
-//
-// It takes one options object argument:
-//
-//	{
-//	  derpMapURL: string,      // absolute URL of the JSON DERP map (required)
-//	  privateKey: string,      // optional tailcat.PrivateKey JSON; ephemeral if empty
-//	  verbose: bool,           // optional; log to the console
-//	  onConnection: (conn) => {}, // called with a conn object per incoming connection
-//	}
-//
-// It returns a Promise that resolves to:
-//
-//	{
-//	  addr: string,           // the "tc..." address to share
-//	  privateKeyJSON: string, // the key (with its DERP region pinned), for persistence
-//	  close: () => {},
-//	}
+// tailcatListen starts the legacy Tailcat server in the browser. Browser-side
+// MasqueCat listen/server mode is not implemented yet; mc... support currently
+// covers the client/send path through a WebTransport-capable MasqueCat relay.
 func tailcatListen(this js.Value, args []js.Value) any {
 	if len(args) != 1 || args[0].Type() != js.TypeObject {
 		return rejectedPromise(errors.New("tailcatListen requires an options object"))
@@ -66,7 +50,7 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			return nil, errors.New("onConnection function is required")
 		}
 		if derpMapURL == "" {
-			return nil, errors.New("derpMapURL is required")
+			return nil, errors.New("derpMapURL is required for legacy browser listener mode")
 		}
 		pk := &tailcat.PrivateKey{}
 		if keyJSON != "" {
@@ -75,7 +59,7 @@ func tailcatListen(this js.Value, args []js.Value) any {
 			}
 		} else {
 			pk = tailcat.NewPrivateKey()
-			pk.Public.RegionID = -1 // auto-select
+			pk.Public.RegionID = -1
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -86,8 +70,6 @@ func tailcatListen(this js.Value, args []js.Value) any {
 		}
 		reg := ci.Region[0]
 		if keyJSON == "" {
-			// Pin the picked region so a persisted key keeps the
-			// same address across page loads.
 			pk.Public.RegionID = reg.RegionID
 		}
 		blob := pk.Public.ConnBlob()
@@ -98,11 +80,7 @@ func tailcatListen(this js.Value, args []js.Value) any {
 
 		srv := &tailcat.Server{Key: pk.Private, Logf: logf, Region: reg}
 		srv.OnTCP = func(port uint16) (handler func(net.Conn)) {
-			// Like the CLI's default mode, accept a connection on
-			// any port and hand it to the page.
-			return func(c net.Conn) {
-				onConnection.Invoke(makeJSConn(c, port, nil))
-			}
+			return func(c net.Conn) { onConnection.Invoke(makeJSConn(c, port, nil)) }
 		}
 		if err := srv.Start(); err != nil {
 			srv.Close()
@@ -119,20 +97,10 @@ func tailcatListen(this js.Value, args []js.Value) any {
 	})
 }
 
-// tailcatDial connects to a tailcat server and dials one TCP stream
-// over the tunnel.
-//
-// It takes one options object argument:
-//
-//	{
-//	  addr: string,       // the server's "tc..." address (required)
-//	  derpMapURL: string, // optional absolute URL of the JSON DERP map
-//	  privateKey: string, // optional tailcat.PrivateKey JSON; ephemeral if empty
-//	  port: number,       // optional TCP port; defaults to 1 like the CLI
-//	  verbose: bool,
-//	}
-//
-// It returns a Promise that resolves to a conn object (see makeJSConn).
+// tailcatDial accepts both legacy tc... and MasqueCat mc... addresses. mc...
+// addresses require a relay URL in the token because browsers cannot originate
+// arbitrary CONNECT-UDP requests; the relay exposes an authenticated
+// WebTransport ingress for browser peers.
 func tailcatDial(this js.Value, args []js.Value) any {
 	if len(args) != 1 || args[0].Type() != js.TypeObject {
 		return rejectedPromise(errors.New("tailcatDial requires an options object"))
@@ -158,15 +126,30 @@ func tailcatDial(this js.Value, args []js.Value) any {
 			}
 			priv = pk.Private
 		}
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+
+		if strings.HasPrefix(addr, "mc") {
+			cl := tailcat.NewBrowserMasqueClient(tailcat.MasqueConnBlob(addr), priv, logf)
+			if err := pingUntil(ctx, cl.Ping); err != nil {
+				cl.Close()
+				return nil, err
+			}
+			c, err := cl.DialTCPPort(ctx, port)
+			if err != nil {
+				cl.Close()
+				return nil, fmt.Errorf("MasqueCat DialTCPPort: %w", err)
+			}
+			return makeJSConn(c, port, func() { _ = cl.Close() }), nil
+		}
+
 		cl := &tailcat.Client{
 			Server:     tailcat.ConnBlob(addr),
 			Key:        priv,
 			Logf:       logf,
 			DERPMapURL: derpMapURL,
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-		if err := pingUntil(ctx, cl); err != nil {
+		if err := pingUntil(ctx, cl.Ping); err != nil {
 			cl.Close()
 			return nil, err
 		}
@@ -179,13 +162,10 @@ func tailcatDial(this js.Value, args []js.Value) any {
 	})
 }
 
-// pingUntil retries the meow/meowed handshake until it succeeds or
-// ctx expires. The first pings can be lost while either side's DERP
-// connection is still coming up.
-func pingUntil(ctx context.Context, cl *tailcat.Client) error {
+func pingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResult, error)) error {
 	for {
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := cl.Ping(pctx)
+		_, err := ping(pctx)
 		cancel()
 		if err == nil {
 			return nil
@@ -196,19 +176,6 @@ func pingUntil(ctx context.Context, cl *tailcat.Client) error {
 	}
 }
 
-// makeJSConn wraps a tunneled TCP connection as a JavaScript object:
-//
-//	{
-//	  port: number,
-//	  read: () => Promise<Uint8Array|null>, // null on EOF; no concurrent calls
-//	  write: (Uint8Array) => Promise,
-//	  closeWrite: () => Promise, // half-close, netcat style
-//	  close: () => {},
-//	}
-//
-// read is pull-based: the browser only reads from netstack when the
-// page asks for more, so a fast sender stalls on TCP backpressure
-// rather than filling browser memory.
 func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 	buf := make([]byte, 64<<10)
 	return js.ValueOf(map[string]any{
@@ -276,9 +243,6 @@ func optLogf(v js.Value) logger.Logf {
 	return logger.Discard
 }
 
-// makePromise runs f on a new goroutine and returns a JavaScript
-// Promise of its result, rejected with a JavaScript Error if f
-// returns an error.
 func makePromise(f func() (any, error)) js.Value {
 	handler := js.FuncOf(func(this js.Value, args []js.Value) any {
 		resolve, reject := args[0], args[1]

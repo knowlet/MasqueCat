@@ -16,9 +16,17 @@ import (
 	"tailscale.com/types/logger"
 )
 
-// MasqueRelay is a paired CONNECT-UDP relay. It only forwards opaque
-// MasqueCat datagrams between registered node keys; it is intentionally not a
-// generic UDP proxy.
+// relayPacketForwarder is the relay's carrier-neutral outbound side. Native
+// CONNECT-UDP peers use streamForwarder; browser peers use a WebTransport
+// forwarder. Both carry the same opaque MasqueCat packet framing.
+type relayPacketForwarder interface {
+	ForwardPacket(src, dst key.NodePublic, payload []byte) error
+	String() string
+}
+
+// MasqueRelay is a paired CONNECT-UDP/WebTransport relay. It only forwards
+// opaque MasqueCat datagrams between registered node keys; it is intentionally
+// not a generic UDP proxy.
 type MasqueRelay struct {
 	Logf logger.Logf
 
@@ -31,7 +39,7 @@ type MasqueRelay struct {
 
 type relayPeer struct {
 	key key.NodePublic
-	fwd *streamForwarder
+	fwd relayPacketForwarder
 }
 
 func (r *MasqueRelay) logf() logger.Logf {
@@ -49,7 +57,7 @@ func (r *MasqueRelay) authenticator() *masqueAuthenticator {
 }
 
 // Handler returns the HTTP handler for a MasqueCat relay. The same handler is
-// used by both the preferred HTTP/3 carrier and the HTTP/2 fallback.
+// used by both the preferred HTTP/3 CONNECT-UDP carrier and the HTTP/2 fallback.
 func (r *MasqueRelay) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		logf := r.logf()
@@ -128,7 +136,7 @@ func (r *MasqueRelay) Handler() http.Handler {
 				continue
 			}
 			if err := dst.fwd.ForwardPacket(pkt.src, pkt.dst, pkt.payload); err != nil {
-				logf("relay %v -> %v: %v", pkt.src.ShortString(), pkt.dst.ShortString(), err)
+				logf("relay %v -> %v via %s: %v", pkt.src.ShortString(), pkt.dst.ShortString(), dst.fwd.String(), err)
 			}
 		}
 	})
@@ -150,9 +158,9 @@ func (r *MasqueRelay) reserve(k key.NodePublic) (*relayPeer, bool) {
 	return p, true
 }
 
-// activate publishes a successfully accepted stream for a previously reserved
+// activate publishes a successfully accepted carrier for a previously reserved
 // peer. Reserved peers with a nil forwarder remain invisible to lookup.
-func (r *MasqueRelay) activate(p *relayPeer, fwd *streamForwarder) bool {
+func (r *MasqueRelay) activate(p *relayPeer, fwd relayPacketForwarder) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if p == nil || fwd == nil || r.peers[p.key] != p || p.fwd != nil {

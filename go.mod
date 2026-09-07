@@ -13,6 +13,7 @@ require (
 	github.com/pkg/sftp v1.13.6
 	github.com/quic-go/masque-go v0.4.0
 	github.com/quic-go/quic-go v0.60.0
+	github.com/quic-go/webtransport-go v0.11.1
 	github.com/tailscale/gliderssh v0.3.4-0.20260716005906-1a0f895faf28
 	github.com/tailscale/wireguard-go v0.0.0-20260821191448-23d18d66172c
 	github.com/u-root/u-root v0.14.0

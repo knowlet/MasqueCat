@@ -1,25 +1,35 @@
-# Publishes the tailcat web demo (the js/wasm build of tailcat, from
-# web/) to GitHub Pages at https://tailscale.github.io/tailcat/.
+# Builds the browser WebAssembly demo from web/.
 #
-# GitHub Pages is a static host: it can't negotiate Content-Encoding
-# and won't compress application/wasm itself, so instead of the raw
-# ~27 MB main.wasm this publishes only the pre-gzipped main.wasm.gz,
-# which app.js fetches and decompresses via DecompressionStream. The
-# page fetches its DERP map cross-origin from tailcat.dev, which
-# allows CORS requests to /derpmap.json.
+# Pushes to main only verify that the static demo can still be built. Publishing
+# to GitHub Pages is intentionally opt-in via workflow_dispatch so repositories
+# that have not enabled Pages do not fail unrelated main-branch CI.
+#
+# The demo supports the legacy tc... DERP/WebSocket path and is gaining an
+# mc... browser client path carried by WebTransport into a MasqueCat relay.
 
 name: webdemo-pages
 
 on:
   push:
     branches: [main]
+    paths:
+      - "web/**"
+      - "webdemo/**"
+      - "internal/wasmbuild/**"
+      - "internal/buildtags/**"
+      - "cmd/tailcat-web/**"
+      - "cmd/tailcat-webdist/**"
+      - "*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/webdemo-pages.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: pages
+  group: webdemo-pages-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -34,12 +44,18 @@ jobs:
         run: go run ./cmd/tailcat-webdist -o dist
       - name: keep only the gzipped wasm
         run: rm dist/main.wasm dist/main.wasm.zst
-      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: verify static demo output
+        run: |
+          test -s dist/index.html
+          test -s dist/app.js
+          test -s dist/wasm_exec.js
+          test -s dist/main.wasm.gz
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: dist
 
   deploy:
+    if: github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -49,5 +65,8 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      # Pages must be enabled once in repository Settings with GitHub Actions as
+      # the publishing source. configure-pages then resolves the site metadata.
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
