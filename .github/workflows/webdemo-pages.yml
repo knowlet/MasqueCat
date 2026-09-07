@@ -4,9 +4,8 @@
 # to GitHub Pages is intentionally opt-in via workflow_dispatch so repositories
 # that have not enabled Pages do not fail unrelated main-branch CI.
 #
-# The current browser demo is the legacy Tailcat DERP/WebSocket transport. It is
-# still useful as a js/wasm integration target while MasqueCat-specific browser
-# transport support is developed.
+# The demo supports the legacy tc... DERP/WebSocket path and is gaining an
+# mc... browser client path carried by WebTransport into a MasqueCat relay.
 
 name: webdemo-pages
 
@@ -17,8 +16,10 @@ on:
       - "web/**"
       - "webdemo/**"
       - "internal/wasmbuild/**"
+      - "internal/buildtags/**"
       - "cmd/tailcat-web/**"
       - "cmd/tailcat-webdist/**"
+      - "*.go"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/webdemo-pages.yml"
