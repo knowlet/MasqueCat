@@ -1,11 +1,10 @@
-# Builds the browser WebAssembly demo from web/.
+# Builds and publishes the browser WebAssembly demo from web/.
 #
-# Pushes to main only verify that the static demo can still be built. Publishing
-# to GitHub Pages is intentionally opt-in via workflow_dispatch so repositories
-# that have not enabled Pages do not fail unrelated main-branch CI.
+# Every relevant push to main publishes the verified static output to GitHub
+# Pages. workflow_dispatch remains available for an explicit redeploy of main.
 #
-# The demo supports the legacy tc... DERP/WebSocket path and is gaining an
-# mc... browser client path carried by WebTransport into a MasqueCat relay.
+# The demo supports the legacy tc... DERP/WebSocket path and the mc... browser
+# client path carried by WebTransport into a MasqueCat relay.
 
 name: webdemo-pages
 
@@ -29,8 +28,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: webdemo-pages-${{ github.ref }}
-  cancel-in-progress: true
+  group: pages
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -55,7 +54,7 @@ jobs:
           path: dist
 
   deploy:
-    if: github.event_name == 'workflow_dispatch'
+    if: github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -65,8 +64,6 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # Pages must be enabled once in repository Settings with GitHub Actions as
-      # the publishing source. configure-pages then resolves the site metadata.
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
