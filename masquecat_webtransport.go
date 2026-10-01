@@ -171,7 +171,7 @@ func (r *MasqueRelay) serveBrowserWebTransport(w http.ResponseWriter, req *http.
 		}
 		pkt, err := decodeMasquePacket(b)
 		if err != nil {
-			logf("dropping malformed browser MasqueCat datagram: %v", err)
+			logf("dropping malformed browser MasqueCat datagram: %v (len=%d)", err, len(b))
 			continue
 		}
 		if pkt.src != src {
@@ -183,6 +183,7 @@ func (r *MasqueRelay) serveBrowserWebTransport(w http.ResponseWriter, req *http.
 		}
 		dst := r.lookup(pkt.dst)
 		if dst == nil {
+			logf("browser relay: no route for dst %v (src %v, payload %d bytes)", pkt.dst.ShortString(), pkt.src.ShortString(), len(pkt.payload))
 			continue
 		}
 		if err := dst.fwd.ForwardPacket(pkt.src, pkt.dst, pkt.payload); err != nil {

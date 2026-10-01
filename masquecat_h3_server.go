@@ -133,6 +133,7 @@ func (r *MasqueRelay) Handler() http.Handler {
 			}
 			dst := r.lookup(pkt.dst)
 			if dst == nil {
+				logf("relay: no route for dst %v (src %v, payload %d bytes)", pkt.dst.ShortString(), pkt.src.ShortString(), len(pkt.payload))
 				continue
 			}
 			if err := dst.fwd.ForwardPacket(pkt.src, pkt.dst, pkt.payload); err != nil {
