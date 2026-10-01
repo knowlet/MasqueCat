@@ -170,6 +170,7 @@ func pingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResu
 		if err == nil {
 			return nil
 		}
+		log.Printf("ping attempt failed: %v", err)
 		if ctx.Err() != nil {
 			return fmt.Errorf("ping: %w", err)
 		}

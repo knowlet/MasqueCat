@@ -42,21 +42,18 @@ import (
 )
 
 const (
-	browserMasqueMTU                                  = 1000
-	browserMasqueQueueSize                            = 512
-	browserMasqueNIC                      tcpip.NICID = 1
-	browserMasquePingPort                 uint16      = 65535
-	browserMasquePacketVersion                        = byte(1)
-	browserNodePublicTextPrefix                       = "nodekey:"
-	browserWebTransportRoute                          = "/.well-known/masquecat/webtransport"
-	browserControlMax                                 = 8 << 10
-	browserProtocolVersion                            = 1
-	browserFragmentHeaderLen                          = 20
-	browserFragmentMaxSize                            = 64 << 10
-	browserFragmentChunkSize                          = 1000
-	browserFragmentTTL                                = 30 * time.Second
-	browserFragmentMaxIncompleteSets                  = 256
-	browserFragmentMaxIncompletePerSource             = 32
+	browserMasquePingPort                 uint16 = 65535
+	browserMasquePacketVersion                   = byte(1)
+	browserNodePublicTextPrefix                  = "nodekey:"
+	browserWebTransportRoute                     = "/.well-known/masquecat/webtransport"
+	browserControlMax                            = 8 << 10
+	browserProtocolVersion                       = 1
+	browserFragmentHeaderLen                     = 20
+	browserFragmentMaxSize                       = 64 << 10
+	browserFragmentChunkSize                     = 1000
+	browserFragmentTTL                           = 30 * time.Second
+	browserFragmentMaxIncompleteSets             = 256
+	browserFragmentMaxIncompletePerSource        = 32
 )
 
 var (
