@@ -75,7 +75,7 @@ func TestBrowserStackEmitsIPv6(t *testing.T) {
 		Port: 65535,
 	}, ipv6.ProtocolNumber)
 	if err == nil {
-		conn.Close()
+		_ = conn.Close()
 	}
 	s := st.Stats()
 	t.Logf("dial err=%v ipSent=%d ipOutErr=%d tcpSegsSent=%d tcpSegSendErr=%d",
