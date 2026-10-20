@@ -7,6 +7,7 @@ package tailcat
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -22,8 +23,17 @@ import (
 // nil error) if the netcheck report contained no usable region
 // latencies.
 func PickBestRegion(ctx context.Context, dm *tailcfg.DERPMap) (regionID tailcfg.DERPRegionID, err error) {
+	return pickBestRegion(ctx, dm, netmon.NewStatic())
+}
+
+func pickBestRegion(ctx context.Context, dm *tailcfg.DERPMap, monitor *netmon.Monitor) (regionID tailcfg.DERPRegionID, err error) {
+	// NewStatic intentionally hides interface enumeration errors. Never pass a
+	// missing snapshot to netcheck, whose probe planner dereferences it.
+	if monitor == nil || monitor.InterfaceState() == nil {
+		return 0, errors.New("network interface state unavailable; cannot select a DERP region")
+	}
 	nc := &netcheck.Client{
-		NetMon:  netmon.NewStatic(),
+		NetMon:  monitor,
 		Verbose: Verbose,
 		Logf:    logger.Discard,
 	}
