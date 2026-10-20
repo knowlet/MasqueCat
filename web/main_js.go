@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"github.com/tailscale/tailcat/web/internal/browserdial"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -118,7 +119,7 @@ func tailcatDial(this js.Value, args []js.Value) any {
 		if addr == "" {
 			return nil, errors.New("addr is required")
 		}
-		if err := validateBrowserAddress(addr); err != nil {
+		if err := browserdial.ValidateAddress(addr); err != nil {
 			return nil, err
 		}
 		priv := key.NewNode()
@@ -134,7 +135,7 @@ func tailcatDial(this js.Value, args []js.Value) any {
 
 		if strings.HasPrefix(addr, "mc") {
 			cl := tailcat.NewBrowserMasqueClient(tailcat.MasqueConnBlob(addr), priv, logf)
-			if err := pingUntil(ctx, cl.Ping); err != nil {
+			if err := browserdial.PingUntil(ctx, cl.Ping); err != nil {
 				cl.Close()
 				return nil, err
 			}
@@ -152,7 +153,7 @@ func tailcatDial(this js.Value, args []js.Value) any {
 			Logf:       logf,
 			DERPMapURL: derpMapURL,
 		}
-		if err := pingUntil(ctx, cl.Ping); err != nil {
+		if err := browserdial.PingUntil(ctx, cl.Ping); err != nil {
 			cl.Close()
 			return nil, err
 		}

@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-package main
+package browserdial
 
 import (
 	"context"
@@ -14,7 +14,8 @@ import (
 	"github.com/tailscale/tailcat"
 )
 
-func pingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResult, error)) error {
+// PingUntil retries failed probes without starving the browser event loop.
+func PingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResult, error)) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("ping: %w", err)
@@ -36,9 +37,9 @@ func pingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResu
 	}
 }
 
-// Reject malformed tokens before starting retryable network work. Permanent
+// ValidateAddress rejects malformed tokens before retryable network work. Permanent
 // parse errors cannot improve on a retry and must not monopolize the WASM loop.
-func validateBrowserAddress(addr string) error {
+func ValidateAddress(addr string) error {
 	if !strings.HasPrefix(addr, "mc") {
 		return nil
 	}

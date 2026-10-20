@@ -1,4 +1,4 @@
-package main
+package browserdial
 
 import (
 	"context"
@@ -15,7 +15,7 @@ func TestPingUntilImmediateFailureIsRateLimited(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 	defer cancel()
 	calls := 0
-	err := pingUntil(ctx, func(context.Context) (tailcat.PingResult, error) {
+	err := PingUntil(ctx, func(context.Context) (tailcat.PingResult, error) {
 		calls++
 		return tailcat.PingResult{}, errors.New("synthetic failure")
 	})
@@ -30,26 +30,26 @@ func TestPingUntilCancelledDoesNotStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	calls := 0
-	err := pingUntil(ctx, func(context.Context) (tailcat.PingResult, error) { calls++; return tailcat.PingResult{}, nil })
+	err := PingUntil(ctx, func(context.Context) (tailcat.PingResult, error) { calls++; return tailcat.PingResult{}, nil })
 	if !errors.Is(err, context.Canceled) || calls != 0 {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}
 }
 func TestPingUntilSuccess(t *testing.T) {
 	calls := 0
-	err := pingUntil(context.Background(), func(context.Context) (tailcat.PingResult, error) { calls++; return tailcat.PingResult{}, nil })
+	err := PingUntil(context.Background(), func(context.Context) (tailcat.PingResult, error) { calls++; return tailcat.PingResult{}, nil })
 	if err != nil || calls != 1 {
 		t.Fatalf("err=%v calls=%d", err, calls)
 	}
 }
 
 func TestInvalidMasqueTokenIsRejected(t *testing.T) {
-	if err := validateBrowserAddress("mc!"); err == nil {
+	if err := ValidateAddress("mc!"); err == nil {
 		t.Fatal("invalid token accepted")
 	}
 }
 func TestLegacyAddressIsNotParsedAsMasque(t *testing.T) {
-	if err := validateBrowserAddress("tc-synthetic"); err != nil {
+	if err := ValidateAddress("tc-synthetic"); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -58,7 +58,7 @@ func TestPingUntilRetriesTransientFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	calls := 0
-	err := pingUntil(ctx, func(context.Context) (tailcat.PingResult, error) {
+	err := PingUntil(ctx, func(context.Context) (tailcat.PingResult, error) {
 		calls++
 		if calls == 1 {
 			return tailcat.PingResult{}, errors.New("transient")
@@ -76,7 +76,7 @@ func TestBrowserAddressRequiresRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateBrowserAddress(string(blob)); err == nil {
+	if err := ValidateAddress(string(blob)); err == nil {
 		t.Fatal("direct-only token accepted")
 	}
 	ci.RelayURL = "https://127.0.0.1:4434"
@@ -84,7 +84,7 @@ func TestBrowserAddressRequiresRelay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateBrowserAddress(string(blob)); err != nil {
+	if err := ValidateAddress(string(blob)); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -92,7 +92,7 @@ func TestBrowserAddressRequiresRelay(t *testing.T) {
 func TestInvalidMasqueTokenDoesNotEchoPayload(t *testing.T) {
 	payload := `{"v":1,"k":"not-a-key-sensitive-marker"}`
 	blob := "mc" + base64.RawURLEncoding.EncodeToString([]byte(payload))
-	if err := validateBrowserAddress(blob); err == nil || err.Error() != "invalid MasqueCat token" {
+	if err := ValidateAddress(blob); err == nil || err.Error() != "invalid MasqueCat token" {
 		t.Fatalf("unexpected validation result: %v", err)
 	}
 }
