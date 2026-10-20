@@ -118,6 +118,9 @@ func tailcatDial(this js.Value, args []js.Value) any {
 		if addr == "" {
 			return nil, errors.New("addr is required")
 		}
+		if err := validateBrowserAddress(addr); err != nil {
+			return nil, err
+		}
 		priv := key.NewNode()
 		if keyJSON != "" {
 			var pk tailcat.PrivateKey
@@ -160,21 +163,6 @@ func tailcatDial(this js.Value, args []js.Value) any {
 		}
 		return makeJSConn(c, port, func() { cl.Close() }), nil
 	})
-}
-
-func pingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResult, error)) error {
-	for {
-		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := ping(pctx)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		log.Printf("ping attempt failed: %v", err)
-		if ctx.Err() != nil {
-			return fmt.Errorf("ping: %w", err)
-		}
-	}
 }
 
 func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
