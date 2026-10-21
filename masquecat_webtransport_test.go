@@ -66,7 +66,7 @@ func authenticateBrowserTestSession(t *testing.T, s *webtransport.Session, priv 
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer stream.Close()
+	defer func() { _ = stream.Close() }()
 	_ = stream.SetDeadline(time.Now().Add(5 * time.Second))
 	r, w := bufio.NewReader(stream), bufio.NewWriter(stream)
 	if err := writeMasqueBrowserControl(w, masqueBrowserControl{Type: "hello", Version: masqueBrowserProtocolVersion, Source: priv.Public().String()}); err != nil {
@@ -152,7 +152,7 @@ func TestMasqueBrowserWebTransportAuthDeadline(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer stream.Close()
+			defer func() { _ = stream.Close() }()
 			if stage == "partial-proof" {
 				w := bufio.NewWriter(stream)
 				if err := writeMasqueBrowserControl(w, masqueBrowserControl{Type: "hello", Version: masqueBrowserProtocolVersion, Source: key.NewNode().Public().String()}); err != nil {
