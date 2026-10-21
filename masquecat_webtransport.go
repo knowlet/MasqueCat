@@ -112,6 +112,13 @@ func (r *MasqueRelay) serveBrowserWebTransport(w http.ResponseWriter, req *http.
 		return
 	}
 	defer func() { _ = stream.Close() }()
+	// AcceptStream only bounds waiting for the stream, not subsequent control
+	// reads or writes. Keep partial hello/proof messages within the same auth
+	// budget; this deadline does not affect the session datagram transport.
+	deadline, _ := authCtx.Deadline()
+	if err := stream.SetDeadline(deadline); err != nil {
+		return
+	}
 	br := bufio.NewReaderSize(stream, masqueBrowserControlMax)
 	bw := bufio.NewWriterSize(stream, 1024)
 
@@ -159,6 +166,10 @@ func (r *MasqueRelay) serveBrowserWebTransport(w http.ResponseWriter, req *http.
 	if err := writeMasqueBrowserControl(bw, masqueBrowserControl{Type: "ready", Version: masqueBrowserProtocolVersion}); err != nil {
 		return
 	}
+	if err := stream.SetDeadline(time.Time{}); err != nil {
+		return
+	}
+	cancel() // The authenticated session is governed by session.Context().
 	logf("MasqueCat browser peer registered over WebTransport: %v", src.ShortString())
 
 	for {

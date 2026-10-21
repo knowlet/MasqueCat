@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"github.com/tailscale/tailcat/web/internal/browserdial"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -118,6 +119,9 @@ func tailcatDial(this js.Value, args []js.Value) any {
 		if addr == "" {
 			return nil, errors.New("addr is required")
 		}
+		if err := browserdial.ValidateAddress(addr); err != nil {
+			return nil, err
+		}
 		priv := key.NewNode()
 		if keyJSON != "" {
 			var pk tailcat.PrivateKey
@@ -131,7 +135,7 @@ func tailcatDial(this js.Value, args []js.Value) any {
 
 		if strings.HasPrefix(addr, "mc") {
 			cl := tailcat.NewBrowserMasqueClient(tailcat.MasqueConnBlob(addr), priv, logf)
-			if err := pingUntil(ctx, cl.Ping); err != nil {
+			if err := browserdial.PingUntil(ctx, cl.Ping); err != nil {
 				cl.Close()
 				return nil, err
 			}
@@ -149,7 +153,7 @@ func tailcatDial(this js.Value, args []js.Value) any {
 			Logf:       logf,
 			DERPMapURL: derpMapURL,
 		}
-		if err := pingUntil(ctx, cl.Ping); err != nil {
+		if err := browserdial.PingUntil(ctx, cl.Ping); err != nil {
 			cl.Close()
 			return nil, err
 		}
@@ -160,21 +164,6 @@ func tailcatDial(this js.Value, args []js.Value) any {
 		}
 		return makeJSConn(c, port, func() { cl.Close() }), nil
 	})
-}
-
-func pingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResult, error)) error {
-	for {
-		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := ping(pctx)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		log.Printf("ping attempt failed: %v", err)
-		if ctx.Err() != nil {
-			return fmt.Errorf("ping: %w", err)
-		}
-	}
 }
 
 func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
