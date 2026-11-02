@@ -169,9 +169,16 @@ func TestMasqueBrowserWebTransportAuthDeadline(t *testing.T) {
 			if _, err := stream.Write([]byte("{")); err != nil {
 				t.Fatal(err)
 			}
+			// A partial message must be allowed time to finish, rather than
+			// passing this test by rejecting the client immediately.
 			select {
 			case <-s.Context().Done():
-			case <-time.After(masqueBrowserAuthTimeout + 3*time.Second):
+				t.Fatal("partial control message closed before the auth budget elapsed")
+			case <-time.After(time.Second):
+			}
+			select {
+			case <-s.Context().Done():
+			case <-time.After(masqueBrowserAuthTimeout + 2*time.Second):
 				t.Fatal("unauthenticated partial control message outlived authentication deadline")
 			}
 		})

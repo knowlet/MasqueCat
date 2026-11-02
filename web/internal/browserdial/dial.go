@@ -16,9 +16,10 @@ import (
 
 // PingUntil retries failed probes without starving the browser event loop.
 func PingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResult, error)) error {
+	var lastErr error
 	for {
 		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("ping: %w", err)
+			return fmt.Errorf("ping: %w", errors.Join(err, lastErr))
 		}
 		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		_, err := ping(pctx)
@@ -26,12 +27,13 @@ func PingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResu
 		if err == nil {
 			return nil
 		}
+		lastErr = err
 		log.Printf("ping attempt failed: %v", err)
 		timer := time.NewTimer(250 * time.Millisecond)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return fmt.Errorf("ping: %w", ctx.Err())
+			return fmt.Errorf("ping: %w", errors.Join(ctx.Err(), lastErr))
 		case <-timer.C:
 		}
 	}
@@ -41,6 +43,9 @@ func PingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResu
 // parse errors cannot improve on a retry and must not monopolize the WASM loop.
 func ValidateAddress(addr string) error {
 	if !strings.HasPrefix(addr, "mc") {
+		if _, err := tailcat.ParseConnBlob(tailcat.ConnBlob(addr)); err != nil {
+			return errors.New("invalid Tailcat token")
+		}
 		return nil
 	}
 	ci, err := tailcat.ParseMasqueConnBlob(tailcat.MasqueConnBlob(addr))

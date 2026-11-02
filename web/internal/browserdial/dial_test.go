@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/tailscale/tailcat"
@@ -49,7 +50,8 @@ func TestInvalidMasqueTokenIsRejected(t *testing.T) {
 	}
 }
 func TestLegacyAddressIsNotParsedAsMasque(t *testing.T) {
-	if err := ValidateAddress("tc-synthetic"); err != nil {
+	ci := &tailcat.ConnInfo{ServerPublic: tailcat.NodePublic{NodePublic: key.NewNode().Public()}}
+	if err := ValidateAddress(string(ci.ConnBlob())); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -95,4 +97,35 @@ func TestInvalidMasqueTokenDoesNotEchoPayload(t *testing.T) {
 	if err := ValidateAddress(blob); err == nil || err.Error() != "invalid MasqueCat token" {
 		t.Fatalf("unexpected validation result: %v", err)
 	}
+}
+
+func TestInvalidLegacyAndUnknownAddressesAreRejected(t *testing.T) {
+	for _, addr := range []string{"tc!", "tc-synthetic", "unknown", ""} {
+		if err := ValidateAddress(addr); err == nil || err.Error() != "invalid Tailcat token" {
+			t.Errorf("ValidateAddress(%q) = %v", addr, err)
+		}
+	}
+}
+
+func TestPingUntilCancellationDuringBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		cause := errors.New("synthetic transport failure")
+		done := make(chan error, 1)
+		go func() {
+			done <- PingUntil(ctx, func(context.Context) (tailcat.PingResult, error) { return tailcat.PingResult{}, cause })
+		}()
+		synctest.Wait() // PingUntil is now durably blocked in its backoff.
+		cancel()
+		synctest.Wait()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) || !errors.Is(err, cause) {
+				t.Fatalf("lost cancellation or transport cause: %v", err)
+			}
+		default:
+			t.Fatal("cancellation did not interrupt the backoff")
+		}
+	})
 }
