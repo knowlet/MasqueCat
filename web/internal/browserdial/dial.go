@@ -43,7 +43,8 @@ func PingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResu
 // parse errors cannot improve on a retry and must not monopolize the WASM loop.
 func ValidateAddress(addr string) error {
 	if !strings.HasPrefix(addr, "mc") {
-		if _, err := tailcat.ParseConnBlob(tailcat.ConnBlob(addr)); err != nil {
+		ci, err := tailcat.ParseConnBlob(tailcat.ConnBlob(addr))
+		if err != nil || ci.ServerDiscoPublic.IsZero() {
 			return errors.New("invalid Tailcat token")
 		}
 		return nil

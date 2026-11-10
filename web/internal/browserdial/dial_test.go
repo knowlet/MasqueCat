@@ -50,9 +50,28 @@ func TestInvalidMasqueTokenIsRejected(t *testing.T) {
 	}
 }
 func TestLegacyAddressIsNotParsedAsMasque(t *testing.T) {
-	ci := &tailcat.ConnInfo{ServerPublic: tailcat.NodePublic{NodePublic: key.NewNode().Public()}}
+	priv := key.NewNode()
+	ci := &tailcat.ConnInfo{
+		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
+		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
+	}
 	if err := ValidateAddress(string(ci.ConnBlob())); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLegacyAddressWithoutDiscoKeyIsRejected(t *testing.T) {
+	ci := &tailcat.ConnInfo{ServerPublic: tailcat.NodePublic{NodePublic: key.NewNode().Public()}}
+	blob := ci.ConnBlob()
+	parsed, err := tailcat.ParseConnBlob(blob)
+	if err != nil {
+		t.Fatalf("legacy token must remain parseable: %v", err)
+	}
+	if !parsed.ServerDiscoPublic.IsZero() {
+		t.Fatal("fixture unexpectedly contains a disco key")
+	}
+	if err := ValidateAddress(string(blob)); err == nil || err.Error() != "invalid Tailcat token" {
+		t.Fatalf("unexpected validation result: %v", err)
 	}
 }
 
