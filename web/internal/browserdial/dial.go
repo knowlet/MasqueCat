@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,6 +58,17 @@ func ValidateAddress(addr string) error {
 	}
 	if ci.RelayURL == "" {
 		return errors.New("MasqueCat browser connections require a relay URL")
+	}
+	relayURL, err := url.Parse(ci.RelayURL)
+	if err != nil {
+		return errors.New("invalid MasqueCat token")
+	}
+	// net/url accepts numeric ports above 65535, but the WebTransport
+	// constructor throws for them instead of returning a rejected promise.
+	if port := relayURL.Port(); port != "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return errors.New("invalid MasqueCat token")
+		}
 	}
 	return nil
 }
