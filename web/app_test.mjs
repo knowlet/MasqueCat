@@ -15,7 +15,7 @@ const makeSendStream = new Function(
 
 function fixture(failure) {
   const error = new Error(`fixture ${failure} failure`);
-  const calls = { close: 0, write: 0, closeWrite: 0, read: 0 };
+  const calls = { close: 0, abort: 0, write: 0, closeWrite: 0, read: 0 };
   const state = { tcTest: { sendDone: false, sentBytes: 0 } };
   const progress = { textContent: "" };
   const conn = {
@@ -33,6 +33,7 @@ function fixture(failure) {
       return null;
     },
     close() { calls.close++; },
+    abort() { calls.abort++; },
   };
   const send = makeSendStream(
     async () => {
@@ -52,7 +53,8 @@ for (const failure of ["readChunk", "write", "closeWrite", "read"]) {
   test(`sendStream closes after ${failure} fails without claiming success`, async () => {
     const f = fixture(failure);
     await assert.rejects(f.run, (err) => err === f.error);
-    assert.equal(f.calls.close, 1);
+    assert.equal(f.calls.abort, 1);
+    assert.equal(f.calls.close, 0);
     assert.equal(f.state.tcTest.sendDone, false);
     assert.equal(f.state.tcTest.sentBytes, 0);
     assert.doesNotMatch(f.progress.textContent, /^sent /);
@@ -62,7 +64,7 @@ for (const failure of ["readChunk", "write", "closeWrite", "read"]) {
 test("sendStream closes once and reports bytes after successful EOF", async () => {
   const f = fixture(null);
   await f.run();
-  assert.deepEqual(f.calls, { close: 1, write: 1, closeWrite: 1, read: 1 });
+  assert.deepEqual(f.calls, { close: 1, abort: 0, write: 1, closeWrite: 1, read: 1 });
   assert.equal(f.state.tcTest.sendDone, true);
   assert.equal(f.state.tcTest.sentBytes, 3);
   assert.equal(f.progress.textContent, "sent 3 bytes");
@@ -71,7 +73,7 @@ test("sendStream closes once and reports bytes after successful EOF", async () =
 test("sendStream preserves dial failure without accessing a missing connection", async () => {
   const f = fixture("dial");
   await assert.rejects(f.run, (err) => err === f.error);
-  assert.deepEqual(f.calls, { close: 0, write: 0, closeWrite: 0, read: 0 });
+  assert.deepEqual(f.calls, { close: 0, abort: 0, write: 0, closeWrite: 0, read: 0 });
   assert.equal(f.state.tcTest.sendDone, false);
 });
 

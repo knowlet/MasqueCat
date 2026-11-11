@@ -29,9 +29,10 @@ const (
 	// /masquecat/.well-known/masquecat/webtransport.
 	masqueBrowserWebTransportPath = "/.well-known/masquecat/webtransport"
 	masqueBrowserControlMax       = 8 << 10
-	masqueBrowserAuthTimeout      = 15 * time.Second
 	masqueBrowserProtocolVersion  = 1
 )
+
+var masqueBrowserAuthTimeout = 15 * time.Second
 
 type masqueBrowserControl struct {
 	Type      string `json:"type"`

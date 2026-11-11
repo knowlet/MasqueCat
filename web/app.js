@@ -273,6 +273,7 @@ async function sendStream(addr, size, readChunk, progressEl) {
   progressEl.textContent = "";
   const conn = await tailcatDial(dialOptions(addr));
   let off = 0;
+  let complete = false;
   try {
     while (off < size) {
       const chunk = await readChunk(off, Math.min(CHUNK, size - off));
@@ -282,8 +283,15 @@ async function sendStream(addr, size, readChunk, progressEl) {
     }
     await conn.closeWrite();
     while ((await conn.read()) !== null) {}
+    complete = true;
   } finally {
-    conn.close();
+    if (complete) {
+      conn.close();
+    } else if (conn.abort) {
+      conn.abort();
+    } else {
+      conn.close();
+    }
   }
   window.tcTest.sentBytes = off;
   window.tcTest.sendDone = true;

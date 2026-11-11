@@ -97,7 +97,9 @@ func authenticateBrowserTestSession(t *testing.T, s *webtransport.Session, priv 
 }
 
 func TestMasqueBrowserWebTransportAuthenticatedDatagrams(t *testing.T) {
-	t.Parallel()
+	old := masqueBrowserAuthTimeout
+	masqueBrowserAuthTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { masqueBrowserAuthTimeout = old })
 	d, url, relay := browserRelayTestClient(t)
 	a, b := dialBrowserTestSession(t, d, url), dialBrowserTestSession(t, d, url)
 	ka, kb := key.NewNode(), key.NewNode()
@@ -143,7 +145,6 @@ func TestMasqueBrowserWebTransportAuthenticatedDatagrams(t *testing.T) {
 func TestMasqueBrowserWebTransportAuthDeadline(t *testing.T) {
 	for _, stage := range []string{"partial-hello", "partial-proof"} {
 		t.Run(stage, func(t *testing.T) {
-			t.Parallel()
 			d, url, _ := browserRelayTestClient(t)
 			s := dialBrowserTestSession(t, d, url)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

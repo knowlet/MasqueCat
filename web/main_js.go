@@ -216,6 +216,15 @@ func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 			}
 			return nil
 		}),
+		// abort tears down the underlying client without a graceful TCP FIN so
+		// receivers cannot mistake a failed partial send for a complete stream.
+		"abort": js.FuncOf(func(this js.Value, args []js.Value) any {
+			if onClose != nil {
+				onClose()
+			}
+			_ = c.Close()
+			return nil
+		}),
 	})
 }
 
