@@ -1,0 +1,74 @@
+// Copyright (c) Tailscale Inc & contributors
+// SPDX-License-Identifier: BSD-3-Clause
+
+package browserdial
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/tailscale/tailcat"
+)
+
+// PingUntil retries failed probes without starving the browser event loop.
+func PingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResult, error)) error {
+	var lastErr error
+	for {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("ping: %w", errors.Join(err, lastErr))
+		}
+		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		_, err := ping(pctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("ping attempt failed: %v", err)
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return fmt.Errorf("ping: %w", errors.Join(ctx.Err(), lastErr))
+		case <-timer.C:
+		}
+	}
+}
+
+// ValidateAddress rejects malformed tokens before retryable network work. Permanent
+// parse errors cannot improve on a retry and must not monopolize the WASM loop.
+func ValidateAddress(addr string) error {
+	if !strings.HasPrefix(addr, "mc") {
+		ci, err := tailcat.ParseConnBlob(tailcat.ConnBlob(addr))
+		if err != nil || ci.ServerDiscoPublic.IsZero() {
+			return errors.New("invalid Tailcat token")
+		}
+		return nil
+	}
+	ci, err := tailcat.ParseMasqueConnBlob(tailcat.MasqueConnBlob(addr))
+	if err != nil {
+		// Parser errors can contain endpoint URLs; do not echo token payloads.
+		return errors.New("invalid MasqueCat token")
+	}
+	if ci.RelayURL == "" {
+		return errors.New("MasqueCat browser connections require a relay URL")
+	}
+	relayURL, err := url.Parse(ci.RelayURL)
+	if err != nil {
+		return errors.New("invalid MasqueCat token")
+	}
+	// net/url accepts numeric ports above 65535, but the WebTransport
+	// constructor throws for them instead of returning a rejected promise.
+	if port := relayURL.Port(); port != "" {
+		if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+			return errors.New("invalid MasqueCat token")
+		}
+	}
+	return nil
+}

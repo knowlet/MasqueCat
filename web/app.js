@@ -268,17 +268,31 @@ $("copy-addr").onclick = () => navigator.clipboard.writeText($("listen-addr").te
 // --- Send side: mc... => WebTransport/MasqueCat, tc... => legacy DERP ---
 
 async function sendStream(addr, size, readChunk, progressEl) {
+  window.tcTest.sendDone = false;
+  window.tcTest.sentBytes = 0;
+  progressEl.textContent = "";
   const conn = await tailcatDial(dialOptions(addr));
   let off = 0;
-  while (off < size) {
-    const chunk = await readChunk(off, Math.min(CHUNK, size - off));
-    await conn.write(chunk);
-    off += chunk.length;
-    progressEl.textContent = `${off} / ${size} bytes`;
+  let complete = false;
+  try {
+    while (off < size) {
+      const chunk = await readChunk(off, Math.min(CHUNK, size - off));
+      await conn.write(chunk);
+      off += chunk.length;
+      progressEl.textContent = `${off} / ${size} bytes`;
+    }
+    await conn.closeWrite();
+    while ((await conn.read()) !== null) {}
+    complete = true;
+  } finally {
+    if (complete) {
+      conn.close();
+    } else if (conn.abort) {
+      conn.abort();
+    } else {
+      conn.close();
+    }
   }
-  await conn.closeWrite();
-  while ((await conn.read()) !== null) {}
-  conn.close();
   window.tcTest.sentBytes = off;
   window.tcTest.sendDone = true;
   progressEl.textContent = `sent ${off} bytes`;
