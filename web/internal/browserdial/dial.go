@@ -44,7 +44,9 @@ func PingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResu
 func ValidateAddress(addr string) error {
 	if !strings.HasPrefix(addr, "mc") {
 		ci, err := tailcat.ParseConnBlob(tailcat.ConnBlob(addr))
-		if err != nil || ci.ServerDiscoPublic.IsZero() {
+		// Both keys are required: the node key identifies the peer and the
+		// disco key is needed to reach it. Without either, retries cannot help.
+		if err != nil || ci.ServerPublic.IsZero() || ci.ServerDiscoPublic.IsZero() {
 			return errors.New("invalid Tailcat token")
 		}
 		return nil

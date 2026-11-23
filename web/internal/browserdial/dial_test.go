@@ -76,6 +76,22 @@ func TestLegacyAddressWithoutDiscoKeyIsRejected(t *testing.T) {
 	}
 }
 
+func TestLegacyAddressWithoutNodeKeyIsRejected(t *testing.T) {
+	priv := key.NewNode()
+	ci := &tailcat.ConnInfo{ServerDiscoPublic: tailcat.DiscoPublicForNode(priv)}
+	blob := ci.ConnBlob()
+	parsed, err := tailcat.ParseConnBlob(blob)
+	if err != nil {
+		t.Fatalf("legacy token must remain parseable: %v", err)
+	}
+	if !parsed.ServerPublic.IsZero() || parsed.ServerDiscoPublic.IsZero() {
+		t.Fatal("fixture must carry only a disco key")
+	}
+	if err := ValidateAddress(string(blob)); err == nil || err.Error() != "invalid Tailcat token" {
+		t.Fatalf("unexpected validation result: %v", err)
+	}
+}
+
 func TestPingUntilRetriesTransientFailure(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -127,6 +143,8 @@ func TestBrowserRelayPortValidation(t *testing.T) {
 		{name: "out of range port", relay: "https://example.com:99999/private-relay-marker", wantErr: true},
 		{name: "integer overflow", relay: "https://example.com:18446744073709551616", wantErr: true},
 		{name: "IPv6 invalid port", relay: "https://[::1]:65536", wantErr: true},
+		{name: "IPv6 literal host", relay: "https://[2001:db8::1]:443"},
+		{name: "IPv6 zone", relay: "https://[fe80::1%25eth0]:443", wantErr: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			ci := tailcat.MasqueConnInfo{

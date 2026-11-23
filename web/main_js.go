@@ -16,6 +16,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"syscall/js"
 	"time"
 
@@ -168,9 +169,26 @@ func tailcatDial(this js.Value, args []js.Value) any {
 
 func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 	buf := make([]byte, 64<<10)
+	// Every js.Func stays registered (with the conn and client it captures)
+	// until released. close and abort are the terminal calls, so the first of
+	// them releases all of this connection's callbacks.
+	var funcs []js.Func
+	fn := func(f func(this js.Value, args []js.Value) any) js.Func {
+		jf := js.FuncOf(f)
+		funcs = append(funcs, jf)
+		return jf
+	}
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			for _, f := range funcs {
+				f.Release()
+			}
+		})
+	}
 	return js.ValueOf(map[string]any{
 		"port": int(port),
-		"read": js.FuncOf(func(this js.Value, args []js.Value) any {
+		"read": fn(func(this js.Value, args []js.Value) any {
 			return makePromise(func() (any, error) {
 				n, err := c.Read(buf)
 				if n > 0 {
@@ -184,7 +202,7 @@ func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 				return nil, err
 			})
 		}),
-		"write": js.FuncOf(func(this js.Value, args []js.Value) any {
+		"write": fn(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
 				return rejectedPromise(errors.New("write requires a Uint8Array"))
 			}
@@ -197,7 +215,7 @@ func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 				return js.Undefined(), nil
 			})
 		}),
-		"closeWrite": js.FuncOf(func(this js.Value, args []js.Value) any {
+		"closeWrite": fn(func(this js.Value, args []js.Value) any {
 			return makePromise(func() (any, error) {
 				cw, ok := c.(interface{ CloseWrite() error })
 				if !ok {
@@ -209,20 +227,22 @@ func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 				return js.Undefined(), nil
 			})
 		}),
-		"close": js.FuncOf(func(this js.Value, args []js.Value) any {
+		"close": fn(func(this js.Value, args []js.Value) any {
 			c.Close()
 			if onClose != nil {
 				onClose()
 			}
+			release()
 			return nil
 		}),
 		// abort tears down the underlying client without a graceful TCP FIN so
 		// receivers cannot mistake a failed partial send for a complete stream.
-		"abort": js.FuncOf(func(this js.Value, args []js.Value) any {
+		"abort": fn(func(this js.Value, args []js.Value) any {
 			if onClose != nil {
 				onClose()
 			}
 			_ = c.Close()
+			release()
 			return nil
 		}),
 	})
@@ -254,6 +274,9 @@ func makePromise(f func() (any, error)) js.Value {
 		}()
 		return nil
 	})
+	// The Promise constructor runs the executor synchronously, so the handler
+	// is never called again once New returns.
+	defer handler.Release()
 	return js.Global().Get("Promise").New(handler)
 }
 
