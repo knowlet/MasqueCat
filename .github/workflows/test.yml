@@ -105,6 +105,11 @@ jobs:
         env:
           GOOS: js
           GOARCH: wasm
+      - name: js/wasm unit tests under Node
+        run: PATH="$PATH:$(go env GOROOT)/lib/wasm" go test -count=1 -run '^TestJS' . ./web/
+        env:
+          GOOS: js
+          GOARCH: wasm
       - name: verify Google Chrome is available
         run: |
           which google-chrome
