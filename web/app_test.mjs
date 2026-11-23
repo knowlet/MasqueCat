@@ -13,7 +13,7 @@ const makeSendStream = new Function(
   `${source.slice(start, end)}\nreturn sendStream;`,
 );
 
-function fixture(failure) {
+function fixture(failure, teardown) {
   const error = new Error(`fixture ${failure} failure`);
   const calls = { close: 0, abort: 0, write: 0, closeWrite: 0, read: 0 };
   const state = { tcTest: { sendDone: false, sentBytes: 0 } };
@@ -32,8 +32,8 @@ function fixture(failure) {
       if (failure === "read") throw error;
       return null;
     },
-    close() { calls.close++; },
-    abort() { calls.abort++; },
+    close() { calls.close++; return teardown?.promise; },
+    abort() { calls.abort++; return teardown?.promise; },
   };
   const send = makeSendStream(
     async () => {
@@ -86,4 +86,41 @@ test("a failed retry cannot retain a previous transfer's success", async () => {
   assert.equal(f.state.tcTest.sendDone, false);
   assert.equal(f.state.tcTest.sentBytes, 0);
   assert.equal(f.progress.textContent, "");
+});
+
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
+const pending = Symbol("pending");
+const settledWithin = (promise) =>
+  Promise.race([promise.then(() => "settled", () => "settled"),
+    new Promise((resolve) => setTimeout(() => resolve(pending), 20))]);
+
+for (const failure of [null, "write"]) {
+  test(`sendStream waits for ${failure ? "abort" : "close"} teardown before finishing`, async () => {
+    const teardown = deferred();
+    const f = fixture(failure, teardown);
+    const sending = f.run();
+    sending.catch(() => {});
+    assert.equal(await settledWithin(sending), pending);
+    assert.equal(f.state.tcTest.sendDone, false);
+    teardown.resolve();
+    if (failure) {
+      await assert.rejects(sending, (err) => err === f.error);
+    } else {
+      await sending;
+      assert.equal(f.state.tcTest.sendDone, true);
+    }
+  });
+}
+
+test("a teardown failure does not replace the transfer error", async () => {
+  const teardown = deferred();
+  const f = fixture("read", teardown);
+  teardown.reject(new Error("teardown failed"));
+  await assert.rejects(f.run, (err) => err === f.error);
+  assert.equal(f.calls.abort, 1);
 });

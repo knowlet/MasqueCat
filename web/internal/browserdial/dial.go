@@ -49,6 +49,12 @@ func ValidateAddress(addr string) error {
 		if err != nil || ci.ServerPublic.IsZero() || ci.ServerDiscoPublic.IsZero() {
 			return errors.New("invalid Tailcat token")
 		}
+		// A token must name a DERP region (inline or by ID). With neither,
+		// Expand resolves nothing and every ping fails until the retry
+		// budget runs out.
+		if len(ci.Region) == 0 && ci.RegionID == 0 {
+			return errors.New("invalid Tailcat token")
+		}
 		return nil
 	}
 	ci, err := tailcat.ParseMasqueConnBlob(tailcat.MasqueConnBlob(addr))

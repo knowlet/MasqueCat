@@ -55,9 +55,29 @@ func TestLegacyAddressIsNotParsedAsMasque(t *testing.T) {
 	ci := &tailcat.ConnInfo{
 		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
 		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
+		RegionID:          1,
 	}
 	if err := ValidateAddress(string(ci.ConnBlob())); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLegacyAddressWithoutDERPRegionIsRejected(t *testing.T) {
+	priv := key.NewNode()
+	ci := &tailcat.ConnInfo{
+		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
+		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
+	}
+	blob := ci.ConnBlob()
+	parsed, err := tailcat.ParseConnBlob(blob)
+	if err != nil {
+		t.Fatalf("legacy token must remain parseable: %v", err)
+	}
+	if len(parsed.Region) != 0 || parsed.RegionID != 0 {
+		t.Fatal("fixture unexpectedly names a DERP region")
+	}
+	if err := ValidateAddress(string(blob)); err == nil || err.Error() != "invalid Tailcat token" {
+		t.Fatalf("unexpected validation result: %v", err)
 	}
 }
 

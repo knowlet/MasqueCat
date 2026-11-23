@@ -285,12 +285,15 @@ async function sendStream(addr, size, readChunk, progressEl) {
     while ((await conn.read()) !== null) {}
     complete = true;
   } finally {
+    // close and abort return promises that settle when teardown finishes.
+    // Wait for them so completion (and a retry) is never reported while the
+    // previous client is still shutting down. A cleanup failure must not
+    // replace the error that ended an incomplete transfer.
+    const teardown = complete ? conn.close() : conn.abort ? conn.abort() : conn.close();
     if (complete) {
-      conn.close();
-    } else if (conn.abort) {
-      conn.abort();
+      await teardown;
     } else {
-      conn.close();
+      await Promise.resolve(teardown).catch(() => {});
     }
   }
   window.tcTest.sentBytes = off;
