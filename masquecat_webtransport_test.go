@@ -98,12 +98,16 @@ func authenticateBrowserTestSession(t *testing.T, s *webtransport.Session, priv 
 
 func TestMasqueBrowserWebTransportAuthenticatedDatagrams(t *testing.T) {
 	old := masqueBrowserAuthTimeout
-	masqueBrowserAuthTimeout = 300 * time.Millisecond
+	// Long enough for a slow CI dial plus handshake; the test still sleeps
+	// past it below to prove expiry cannot end an authenticated session.
+	masqueBrowserAuthTimeout = time.Second
 	t.Cleanup(func() { masqueBrowserAuthTimeout = old })
 	d, url, relay := browserRelayTestClient(t)
-	a, b := dialBrowserTestSession(t, d, url), dialBrowserTestSession(t, d, url)
 	ka, kb := key.NewNode(), key.NewNode()
+	// Each session's auth deadline starts at dial; authenticate before the next.
+	a := dialBrowserTestSession(t, d, url)
 	authenticateBrowserTestSession(t, a, ka)
+	b := dialBrowserTestSession(t, d, url)
 	authenticateBrowserTestSession(t, b, kb)
 	for i, direction := range []struct {
 		from, to *webtransport.Session

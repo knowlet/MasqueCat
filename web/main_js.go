@@ -227,23 +227,32 @@ func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 				return js.Undefined(), nil
 			})
 		}),
+		// close and abort are terminal. Their teardown can block (client
+		// shutdown waits for a WireGuard send that awaits a JavaScript
+		// promise), and a blocked JavaScript callback stops the event loop
+		// that would settle that promise. So both return a promise and tear
+		// down on a goroutine, then release this connection's callbacks.
 		"close": fn(func(this js.Value, args []js.Value) any {
-			c.Close()
-			if onClose != nil {
-				onClose()
-			}
-			release()
-			return nil
+			return makePromise(func() (any, error) {
+				c.Close()
+				if onClose != nil {
+					onClose()
+				}
+				release()
+				return js.Undefined(), nil
+			})
 		}),
 		// abort tears down the underlying client without a graceful TCP FIN so
 		// receivers cannot mistake a failed partial send for a complete stream.
 		"abort": fn(func(this js.Value, args []js.Value) any {
-			if onClose != nil {
-				onClose()
-			}
-			_ = c.Close()
-			release()
-			return nil
+			return makePromise(func() (any, error) {
+				if onClose != nil {
+					onClose()
+				}
+				_ = c.Close()
+				release()
+				return js.Undefined(), nil
+			})
 		}),
 	})
 }
