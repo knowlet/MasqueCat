@@ -603,3 +603,21 @@ The intent is not to replace normal Tailcat for every environment. Tailcat's
 STUN/disco behavior provides better automatic NAT traversal. MasqueCat trades
 that automatic path discovery for a smaller, explicit set of externally visible
 transport behaviors and a deployment model controlled by the operator.
+
+### WebTransport relay regression checks
+
+Run `go test -race . -run 'TestMasqueBrowserWebTransport' -count=1 -timeout=90s`
+for real loopback QUIC/WebTransport coverage. The tests use a client-local
+certificate pool containing the test server certificate; hostname and TLS
+certificate verification remain enabled, with no system trust-store changes.
+They cover authenticated datagrams in both directions, continued transmission
+after the authentication deadline, unregister on disconnect, and bounded
+partial hello/proof reads. The authentication budget covers the entire control
+handshake, not only opening its stream.
+
+These are Go WebTransport client/server integration tests, not browser/WASM,
+WireGuard/TCP file-transfer, public-relay, or NAT traversal acceptance tests.
+A browser-to-native transfer against a trusted HTTPS relay remains a separate
+acceptance requirement; compare the transferred file hash and verify cleanup
+and retry after a mid-transfer disconnect. Do not bypass browser certificate
+warnings to treat that requirement as passed.

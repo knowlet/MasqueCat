@@ -16,10 +16,12 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"syscall/js"
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"github.com/tailscale/tailcat/web/internal/browserdial"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 )
@@ -118,6 +120,9 @@ func tailcatDial(this js.Value, args []js.Value) any {
 		if addr == "" {
 			return nil, errors.New("addr is required")
 		}
+		if err := browserdial.ValidateAddress(addr); err != nil {
+			return nil, err
+		}
 		priv := key.NewNode()
 		if keyJSON != "" {
 			var pk tailcat.PrivateKey
@@ -131,7 +136,7 @@ func tailcatDial(this js.Value, args []js.Value) any {
 
 		if strings.HasPrefix(addr, "mc") {
 			cl := tailcat.NewBrowserMasqueClient(tailcat.MasqueConnBlob(addr), priv, logf)
-			if err := pingUntil(ctx, cl.Ping); err != nil {
+			if err := browserdial.PingUntil(ctx, cl.Ping); err != nil {
 				cl.Close()
 				return nil, err
 			}
@@ -149,7 +154,7 @@ func tailcatDial(this js.Value, args []js.Value) any {
 			Logf:       logf,
 			DERPMapURL: derpMapURL,
 		}
-		if err := pingUntil(ctx, cl.Ping); err != nil {
+		if err := browserdial.PingUntil(ctx, cl.Ping); err != nil {
 			cl.Close()
 			return nil, err
 		}
@@ -162,26 +167,28 @@ func tailcatDial(this js.Value, args []js.Value) any {
 	})
 }
 
-func pingUntil(ctx context.Context, ping func(context.Context) (tailcat.PingResult, error)) error {
-	for {
-		pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		_, err := ping(pctx)
-		cancel()
-		if err == nil {
-			return nil
-		}
-		log.Printf("ping attempt failed: %v", err)
-		if ctx.Err() != nil {
-			return fmt.Errorf("ping: %w", err)
-		}
-	}
-}
-
 func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 	buf := make([]byte, 64<<10)
+	// Every js.Func stays registered (with the conn and client it captures)
+	// until released. close and abort are the terminal calls, so the first of
+	// them releases all of this connection's callbacks.
+	var funcs []js.Func
+	fn := func(f func(this js.Value, args []js.Value) any) js.Func {
+		jf := js.FuncOf(f)
+		funcs = append(funcs, jf)
+		return jf
+	}
+	var releaseOnce sync.Once
+	release := func() {
+		releaseOnce.Do(func() {
+			for _, f := range funcs {
+				f.Release()
+			}
+		})
+	}
 	return js.ValueOf(map[string]any{
 		"port": int(port),
-		"read": js.FuncOf(func(this js.Value, args []js.Value) any {
+		"read": fn(func(this js.Value, args []js.Value) any {
 			return makePromise(func() (any, error) {
 				n, err := c.Read(buf)
 				if n > 0 {
@@ -195,7 +202,7 @@ func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 				return nil, err
 			})
 		}),
-		"write": js.FuncOf(func(this js.Value, args []js.Value) any {
+		"write": fn(func(this js.Value, args []js.Value) any {
 			if len(args) != 1 {
 				return rejectedPromise(errors.New("write requires a Uint8Array"))
 			}
@@ -208,7 +215,7 @@ func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 				return js.Undefined(), nil
 			})
 		}),
-		"closeWrite": js.FuncOf(func(this js.Value, args []js.Value) any {
+		"closeWrite": fn(func(this js.Value, args []js.Value) any {
 			return makePromise(func() (any, error) {
 				cw, ok := c.(interface{ CloseWrite() error })
 				if !ok {
@@ -220,12 +227,32 @@ func makeJSConn(c net.Conn, port uint16, onClose func()) js.Value {
 				return js.Undefined(), nil
 			})
 		}),
-		"close": js.FuncOf(func(this js.Value, args []js.Value) any {
-			c.Close()
-			if onClose != nil {
-				onClose()
-			}
-			return nil
+		// close and abort are terminal. Their teardown can block (client
+		// shutdown waits for a WireGuard send that awaits a JavaScript
+		// promise), and a blocked JavaScript callback stops the event loop
+		// that would settle that promise. So both return a promise and tear
+		// down on a goroutine, then release this connection's callbacks.
+		"close": fn(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				c.Close()
+				if onClose != nil {
+					onClose()
+				}
+				release()
+				return js.Undefined(), nil
+			})
+		}),
+		// abort tears down the underlying client without a graceful TCP FIN so
+		// receivers cannot mistake a failed partial send for a complete stream.
+		"abort": fn(func(this js.Value, args []js.Value) any {
+			return makePromise(func() (any, error) {
+				if onClose != nil {
+					onClose()
+				}
+				_ = c.Close()
+				release()
+				return js.Undefined(), nil
+			})
 		}),
 	})
 }
@@ -256,6 +283,9 @@ func makePromise(f func() (any, error)) js.Value {
 		}()
 		return nil
 	})
+	// The Promise constructor runs the executor synchronously, so the handler
+	// is never called again once New returns.
+	defer handler.Release()
 	return js.Global().Get("Promise").New(handler)
 }
 

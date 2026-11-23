@@ -697,6 +697,54 @@ func browserWebTransportURL(relayURL string) (string, error) {
 	return u.String(), nil
 }
 
+// browserURLCanParse reports whether the host URL parser accepts raw.
+// URL.canParse is missing in some WebTransport-capable browsers, so fall
+// back to the URL constructor. A missing URL type is not itself a rejection;
+// newWebTransport still recovers if WebTransport throws.
+func browserURLCanParse(raw string) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	ctor := js.Global().Get("URL")
+	if ctor.Type() != js.TypeFunction {
+		return true
+	}
+	if ctor.Get("canParse").Type() == js.TypeFunction {
+		return ctor.Call("canParse", raw).Bool()
+	}
+	ctor.New(raw)
+	return true
+}
+
+// callJSConstructor invokes ctor with JavaScript's new operator. A thrown
+// exception becomes an error so it cannot panic the WASM program.
+func callJSConstructor(ctor js.Value, args ...any) (v js.Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(js.Error); ok {
+				v = js.Value{}
+				err = errors.New("invalid WebTransport URL")
+				return
+			}
+			panic(r)
+		}
+	}()
+	v = ctor.New(args...)
+	return v, nil
+}
+
+// newWebTransport constructs a WebTransport. The constructor throws
+// synchronously for URLs the browser cannot parse; that panic would take
+// down the WASM UI, so parse failures and JS exceptions both return errors.
+func newWebTransport(ctor js.Value, wtURL string) (js.Value, error) {
+	if !browserURLCanParse(wtURL) {
+		return js.Value{}, errors.New("invalid WebTransport URL")
+	}
+	return callJSConstructor(ctor, wtURL)
+}
+
 func newBrowserWebTransportPath(ctx context.Context, relayURL string, local key.NodePrivate) (*browserWebTransportPath, error) {
 	ctor := js.Global().Get("WebTransport")
 	if ctor.Type() != js.TypeFunction {
@@ -706,7 +754,10 @@ func newBrowserWebTransportPath(ctx context.Context, relayURL string, local key.
 	if err != nil {
 		return nil, err
 	}
-	wt := ctor.New(wtURL)
+	wt, err := newWebTransport(ctor, wtURL)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := awaitJSPromise(ctx, wt.Get("ready")); err != nil {
 		return nil, fmt.Errorf("WebTransport ready: %w", err)
 	}
