@@ -49,10 +49,11 @@ func ValidateAddress(addr string) error {
 		if err != nil || ci.ServerPublic.IsZero() || ci.ServerDiscoPublic.IsZero() {
 			return errors.New("invalid Tailcat token")
 		}
-		// A token must name a DERP region (inline or by ID). With neither,
-		// Expand resolves nothing and every ping fails until the retry
-		// budget runs out.
-		if len(ci.Region) == 0 && ci.RegionID == 0 {
+		// A token must name a DERP region by ID, or embed one that has a
+		// node. Expand is a no-op once any inline region is present, so an
+		// empty inline region is never filled in and every ping fails
+		// until the retry budget runs out.
+		if !legacyDERPReachable(ci) {
 			return errors.New("invalid Tailcat token")
 		}
 		return nil
@@ -73,4 +74,19 @@ func ValidateAddress(addr string) error {
 		return errors.New("invalid MasqueCat token")
 	}
 	return nil
+}
+
+// legacyDERPReachable reports whether a parsed legacy token can reach a
+// DERP relay without a retry. A region ID is resolved from the DERP map
+// later. An inline region replaces that lookup, so it has to carry a node.
+func legacyDERPReachable(ci tailcat.ConnInfo) bool {
+	if len(ci.Region) == 0 {
+		return ci.RegionID != 0
+	}
+	for _, region := range ci.Region {
+		if region != nil && len(region.Nodes) > 0 {
+			return true
+		}
+	}
+	return false
 }

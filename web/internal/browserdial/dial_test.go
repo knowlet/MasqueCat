@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 )
 
@@ -78,6 +79,43 @@ func TestLegacyAddressWithoutDERPRegionIsRejected(t *testing.T) {
 	}
 	if err := ValidateAddress(string(blob)); err == nil || err.Error() != "invalid Tailcat token" {
 		t.Fatalf("unexpected validation result: %v", err)
+	}
+}
+
+func TestLegacyAddressWithEmptyInlineDERPRegionIsRejected(t *testing.T) {
+	priv := key.NewNode()
+	ci := &tailcat.ConnInfo{
+		ServerPublic:      tailcat.NodePublic{NodePublic: priv.Public()},
+		ServerDiscoPublic: tailcat.DiscoPublicForNode(priv),
+		RegionID:          9,
+		Region: []*tailcfg.DERPRegion{{
+			RegionID:   9,
+			RegionCode: "empty-region-marker",
+		}},
+	}
+	blob := ci.ConnBlob()
+	parsed, err := tailcat.ParseConnBlob(blob)
+	if err != nil {
+		t.Fatalf("legacy token must remain parseable: %v", err)
+	}
+	if len(parsed.Region) != 1 || len(parsed.Region[0].Nodes) != 0 {
+		t.Fatalf("fixture region nodes = %#v", parsed.Region)
+	}
+	if parsed.RegionID == 0 {
+		t.Fatal("fixture dropped its region ID")
+	}
+	err = ValidateAddress(string(blob))
+	if err == nil || err.Error() != "invalid Tailcat token" || strings.Contains(err.Error(), "empty-region-marker") {
+		t.Fatalf("unexpected validation result: %v", err)
+	}
+
+	ci.Region[0].Nodes = []*tailcfg.DERPNode{{
+		HostName: "derp.example",
+		IPv4:     "192.0.2.1",
+		DERPPort: 443,
+	}}
+	if err := ValidateAddress(string(ci.ConnBlob())); err != nil {
+		t.Fatal(err)
 	}
 }
 
