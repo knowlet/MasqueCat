@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"strings"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -146,6 +147,90 @@ func TestBrowserRelayPortValidation(t *testing.T) {
 			if tt.wantErr {
 				// Keep endpoint URLs and token contents out of the error.
 				if err == nil || err.Error() != "invalid MasqueCat token" {
+					t.Fatalf("unexpected validation result: %v", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestBrowserURLParserRejectsBadHosts(t *testing.T) {
+	for _, raw := range []string{
+		"https://999.999.999.999",
+		"https://999.999.999.999:443",
+		"https://256.1.1.1",
+		"https://[gggg::1]",
+		"https://[:::1]",
+		"https://[1:2:3:4:5:6:7:8:9]",
+		"https://[::1%25eth0]",
+		"https://a\u200cb.example",
+		"https://\ufffd.example",
+		"https://example.com:65536",
+	} {
+		if browserCanParseURL(raw) {
+			t.Errorf("browserCanParseURL(%q) = true", raw)
+		}
+	}
+	for _, raw := range []string{
+		"https://example.com",
+		"https://example.com:443",
+		"https://example.com:65535",
+		"https://example.com:00065535",
+		"https://127.0.0.1:4434",
+		"https://[::1]:65535",
+		"https://[::ffff:192.0.2.1]",
+		"https://bücher.example",
+		"https://1.2.3",
+	} {
+		if !browserCanParseURL(raw) {
+			t.Errorf("browserCanParseURL(%q) = false", raw)
+		}
+	}
+}
+
+func TestBrowserRelayHostValidation(t *testing.T) {
+	priv := key.NewNode()
+	for _, tt := range []struct {
+		name    string
+		relay   string
+		wantErr bool
+	}{
+		{name: "IPv4", relay: "https://127.0.0.1"},
+		{name: "IPv4 with port", relay: "https://127.0.0.1:443"},
+		{name: "compressed IPv4", relay: "https://1.2.3"},
+		{name: "IPv6", relay: "https://[::1]"},
+		{name: "IPv4-mapped IPv6", relay: "https://[::ffff:192.0.2.1]"},
+		{name: "IDN", relay: "https://bücher.example"},
+		{name: "invalid IPv4", relay: "https://999.999.999.999", wantErr: true},
+		{name: "invalid IPv4 with port", relay: "https://999.999.999.999:443/private-relay-marker", wantErr: true},
+		{name: "invalid IPv4 octet", relay: "https://256.1.1.1", wantErr: true},
+		{name: "IPv4-shaped hostname", relay: "https://example.123", wantErr: true},
+		// Go accepts a zone identifier in an IPv6 literal. The browser URL
+		// parser does not, and WebTransport throws before the dial promise.
+		{name: "invalid IPv6 zone", relay: "https://[::1%25eth0]", wantErr: true},
+		{name: "bad IDN joiner", relay: "https://a\u200cb.example", wantErr: true},
+		{name: "bad IDN replacement character", relay: "https://\ufffd.example", wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ci := tailcat.MasqueConnInfo{
+				ServerPublic:      priv.Public(),
+				ServerDiscoPublic: tailcat.DiscoPublicForNode(priv).DiscoPublic,
+				RelayURL:          tt.relay,
+			}
+			blob, err := ci.ConnBlob()
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The shared token parser permits these hosts; the browser URL
+			// parser does not, and WebTransport would throw before dialing.
+			if _, err := tailcat.ParseMasqueConnBlob(blob); err != nil {
+				t.Fatalf("fixture must remain parseable: %v", err)
+			}
+			err = ValidateAddress(string(blob))
+			if tt.wantErr {
+				if err == nil || err.Error() != "invalid MasqueCat token" || strings.Contains(err.Error(), tt.relay) {
 					t.Fatalf("unexpected validation result: %v", err)
 				}
 			} else if err != nil {
